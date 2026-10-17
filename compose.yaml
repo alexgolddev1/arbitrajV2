@@ -1,0 +1,86 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-${MYSQL_DATABASE:-arbitraj}}
+      MYSQL_USER: ${DB_USER:-${MYSQL_USER:-bot}}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-${MYSQL_PASSWORD:-ArbBot_26!x7Qp2L}}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-RootDB_26!v9Ks4N}
+    ports:
+      - "${MYSQL_PORT:-4321}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  app:
+    build: .
+    restart: on-failure
+    volumes:
+      - ./log:/app/log
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: ${DB_HOST:-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-${MYSQL_DATABASE:-arbitraj}}
+      DB_USER: ${DB_USER:-${MYSQL_USER:-bot}}
+      DB_PASSWORD: ${DB_PASSWORD:-${MYSQL_PASSWORD:-ArbBot_26!x7Qp2L}}
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-10}
+      DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-12}
+      DB_RETRY_DELAY_SECONDS: ${DB_RETRY_DELAY_SECONDS:-5}
+      CALCULATOR_API_URL: ${CALCULATOR_API_URL:-https://api.coinmarketcap.com/data-api/v3/cryptocurrency/market-pairs/latest}
+      CALCULATOR_EXCHANGES: ${CALCULATOR_EXCHANGES:-binance,bybit,okx,mexc}
+      CALCULATOR_CATEGORY: ${CALCULATOR_CATEGORY:-spot}
+      CALCULATOR_PAGE_SIZE: ${CALCULATOR_PAGE_SIZE:-500}
+      CALCULATOR_CENTER_TYPE: ${CALCULATOR_CENTER_TYPE:-all}
+      CALCULATOR_SORT: ${CALCULATOR_SORT:-cmc_rank_advanced}
+      CALCULATOR_DIRECTION: ${CALCULATOR_DIRECTION:-desc}
+      CALCULATOR_SPOT_UNTRACKED: ${CALCULATOR_SPOT_UNTRACKED:-true}
+      CALCULATOR_SPREAD_LEVELS: ${CALCULATOR_SPREAD_LEVELS:-0.5,1,1.5}
+      CALCULATOR_REQUEST_DELAY_SECONDS: ${CALCULATOR_REQUEST_DELAY_SECONDS:-0.2}
+      CALCULATOR_WORKERS: ${CALCULATOR_WORKERS:-4}
+
+  web:
+    build: .
+    command: ["python", "-m", "main.web"]
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: ${DB_HOST:-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-${MYSQL_DATABASE:-arbitraj}}
+      DB_USER: ${DB_USER:-${MYSQL_USER:-bot}}
+      DB_PASSWORD: ${DB_PASSWORD:-${MYSQL_PASSWORD:-ArbBot_26!x7Qp2L}}
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-10}
+      DB_CONNECT_RETRIES: ${DB_CONNECT_RETRIES:-12}
+      DB_RETRY_DELAY_SECONDS: ${DB_RETRY_DELAY_SECONDS:-5}
+      WEB_PORT: 8080
+      CALCULATOR_SPREAD_LEVELS: ${CALCULATOR_SPREAD_LEVELS:-0.5,1,1.5}
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+
+  phpmyadmin:
+    image: phpmyadmin:5.2-apache
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      UPLOAD_LIMIT: 64M
+    ports:
+      - "${PHPMYADMIN_PORT:-8081}:80"
+
+volumes:
+  mysql_data:
+    name: arbitrajv2_mysql_data
