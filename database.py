@@ -335,16 +335,19 @@ def finalize_interrupted_lifetimes() -> int:
         connection.close()
 
 
-def finalize_lifetime_at_checkpoint(lifetime_id: int) -> None:
+def finalize_lifetime_at_checkpoint(
+    lifetime_id: int, last_confirmed_at: datetime | None = None
+) -> None:
     """Close one episode at its last heartbeat when its instruments disappear."""
     connection = connect_db()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "UPDATE opportunity_lifetimes SET ended_at = last_confirmed_at, "
-                "duration_seconds = GREATEST(0, TIMESTAMPDIFF(SECOND, started_at, last_confirmed_at)), "
+                "UPDATE opportunity_lifetimes SET last_confirmed_at = COALESCE(%s, last_confirmed_at), "
+                "ended_at = COALESCE(%s, last_confirmed_at), "
+                "duration_seconds = GREATEST(0, TIMESTAMPDIFF(SECOND, started_at, COALESCE(%s, last_confirmed_at))), "
                 "is_active = 0 WHERE lifetime_id = %s AND is_active = 1",
-                (lifetime_id,),
+                (last_confirmed_at, last_confirmed_at, last_confirmed_at, lifetime_id),
             )
         connection.commit()
     finally:

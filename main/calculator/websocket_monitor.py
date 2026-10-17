@@ -45,6 +45,8 @@ class Instrument:
 class Quote:
     bid: Decimal
     ask: Decimal
+    bid_size: Decimal
+    ask_size: Decimal
     received_at: float
 
 
@@ -54,6 +56,7 @@ class Episode:
     started_at: datetime
     max_spread: Decimal
     last_checkpoint: datetime
+    last_confirmed_at: datetime
     spread: Decimal
     buy_exchange: str
     buy_market_pair: str
@@ -156,28 +159,60 @@ class OpportunityConfirmer:
         }
 
     def reconfigure(self, instruments: list[Instrument]) -> None:
+        previous_symbols = {
+            (item.source_id, item.exchange): item.symbol.upper()
+            for item in self.instruments
+        }
+        current_symbols = {
+            (item.source_id, item.exchange): item.symbol.upper()
+            for item in instruments
+        }
+        retained_quote_keys = {
+            key for key, symbol in current_symbols.items()
+            if previous_symbols.get(key) == symbol and key in self.quotes
+        }
+        self.quotes = {
+            key: quote_data
+            for key, quote_data in self.quotes.items()
+            if key in retained_quote_keys
+        }
         self.instruments = instruments
         self.by_exchange_symbol.clear()
-        self.quotes.clear()
         for instrument in instruments:
             self.by_exchange_symbol.setdefault(
                 (instrument.exchange, instrument.symbol.upper()), []
             ).append(instrument)
 
-    async def quote(self, exchange: str, symbol: str, bid: Any, ask: Any) -> None:
+    async def quote(
+        self,
+        exchange: str,
+        symbol: str,
+        bid: Any,
+        ask: Any,
+        bid_size: Any,
+        ask_size: Any,
+    ) -> None:
         try:
-            bid_price = Decimal(str(bid))
-            ask_price = Decimal(str(ask))
+            bid_price = Decimal(str(bid or "0"))
+            ask_price = Decimal(str(ask or "0"))
+            bid_quantity = Decimal(str(bid_size or "0"))
+            ask_quantity = Decimal(str(ask_size or "0"))
         except Exception:
             return
-        if bid_price <= 0 or ask_price <= 0 or bid_price > ask_price:
+        if not all(value.is_finite() for value in (
+            bid_price, ask_price, bid_quantity, ask_quantity
+        )):
             return
         key = (exchange, symbol.upper())
         for instrument in self.by_exchange_symbol.get(key, ()):
             self._cycle_quote_updates[exchange] = self._cycle_quote_updates.get(exchange, 0) + 1
+            if bid_price > 0 and ask_price > 0 and bid_price > ask_price:
+                bid_quantity = ask_quantity = Decimal(0)
             normalized = Quote(
-                bid_price / instrument.unit_count,
-                ask_price / instrument.unit_count,
+                bid_price / instrument.unit_count if bid_price > 0 else Decimal(0),
+                ask_price / instrument.unit_count if ask_price > 0 else Decimal(0),
+                max(Decimal(0), bid_quantity),
+                max(Decimal(0), ask_quantity),
                 time.monotonic(),
             )
             self.quotes[(instrument.source_id, instrument.exchange)] = normalized
@@ -200,13 +235,57 @@ class OpportunityConfirmer:
             if quote_data and now_mono - quote_data.received_at <= STALE_SECONDS:
                 by_exchange[instrument.exchange] = (instrument, quote_data)
         if len(by_exchange) < 2:
+            # Закрываем эпизоды, если уже нельзя подтвердить котировки как минимум
+            # на двух биржах. Длительность заканчивается на последней проверке,
+            # которая действительно подтвердила спред.
+            for episode_key, episode in list(self.episodes.items()):
+                if episode_key[0] != source_id:
+                    continue
+                await asyncio.to_thread(
+                    finalize_lifetime_at_checkpoint,
+                    episode.lifetime_id,
+                    episode.last_confirmed_at,
+                )
+                del self.episodes[episode_key]
+                logger.info(
+                    "Возможность %s завершена: недостаточно свежих котировок; "
+                    "последнее подтверждение %s UTC, длительность %s сек.",
+                    source_id,
+                    episode.last_confirmed_at.isoformat(sep=" "),
+                    int((episode.last_confirmed_at - episode.started_at).total_seconds()),
+                )
             return
         self._cycle_sources_with_two_quotes.add(source_id)
 
-        buy = min(by_exchange.values(), key=lambda item: item[1].ask)
-        sell = max(by_exchange.values(), key=lambda item: item[1].bid)
-        if buy[0].exchange == sell[0].exchange or buy[1].ask <= 0:
+        executable_pairs = [
+            (buy, sell)
+            for buy in by_exchange.values()
+            if buy[1].ask > 0 and buy[1].ask_size > 0
+            for sell in by_exchange.values()
+            if sell[0].exchange != buy[0].exchange
+            and sell[1].bid > 0 and sell[1].bid_size > 0
+        ]
+        if not executable_pairs:
+            for episode_key, episode in list(self.episodes.items()):
+                if episode_key[0] != source_id:
+                    continue
+                await asyncio.to_thread(
+                    finalize_lifetime_at_checkpoint,
+                    episode.lifetime_id,
+                    episode.last_confirmed_at,
+                )
+                del self.episodes[episode_key]
+                logger.info(
+                    "Возможность %s завершена: нет встречных уровней стакана "
+                    "с доступным объёмом на разных биржах; длительность %s сек.",
+                    source_id,
+                    int((episode.last_confirmed_at - episode.started_at).total_seconds()),
+                )
             return
+        buy, sell = max(
+            executable_pairs,
+            key=lambda pair: (pair[1][1].bid - pair[0][1].ask) / pair[0][1].ask,
+        )
         spread = (sell[1].bid - buy[1].ask) / buy[1].ask * Decimal(100)
         if self._cycle_max_spread is None or spread > self._cycle_max_spread:
             self._cycle_max_spread = spread
@@ -234,7 +313,7 @@ class OpportunityConfirmer:
                     )
                     if episode_id is not None:
                         self.episodes[episode_key] = Episode(
-                            episode_id, now, spread, now, spread,
+                            episode_id, now, spread, now, now, spread,
                             buy[0].exchange_name, buy[0].market_pair, buy[1].ask,
                             sell[0].exchange_name, sell[0].market_pair, sell[1].bid,
                         )
@@ -245,6 +324,7 @@ class OpportunityConfirmer:
                             buy[0].source_pair, spread, threshold,
                         )
                 if episode is not None:
+                    episode.last_confirmed_at = now
                     episode.max_spread = max(episode.max_spread, spread)
                     episode.spread = spread
                     episode.buy_exchange = buy[0].exchange_name
@@ -280,10 +360,23 @@ class OpportunityConfirmer:
 
     async def checkpoint(self) -> None:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # Периодически проверяем свежесть даже если биржа перестала присылать
+        # сообщения: иначе UI продолжал бы считать такой эпизод активным.
+        for source_id in {source_id for source_id, _ in self.episodes}:
+            now_mono = time.monotonic()
+            fresh_exchanges = {
+                instrument.exchange
+                for instrument in self.instruments
+                if instrument.source_id == source_id
+                and (quote_data := self.quotes.get((source_id, instrument.exchange))) is not None
+                and now_mono - quote_data.received_at <= STALE_SECONDS
+            }
+            if len(fresh_exchanges) < 2:
+                await self._evaluate(source_id)
         active = [episode for episode in self.episodes.values()
                   if now - episode.last_checkpoint >= timedelta(seconds=30)]
         rows = [
-            (now, episode.spread, episode.max_spread, episode.buy_exchange,
+            (episode.last_confirmed_at, episode.spread, episode.max_spread, episode.buy_exchange,
              episode.buy_market_pair, episode.buy_price, episode.sell_exchange,
              episode.sell_market_pair, episode.sell_price, episode.lifetime_id)
             for episode in active
@@ -297,7 +390,10 @@ async def _listen_binance(instruments: list[Instrument], confirmer: OpportunityC
     streams = sorted({f"{item.symbol.lower()}@bookTicker" for item in instruments})
     async def listen_batch(batch: list[str]) -> None:
         url = "wss://stream.binance.com:9443/stream?streams=" + quote("/".join(batch), safe="@/")
-        await _listen_json(url, stop, lambda data: confirmer.quote("binance", data.get("s", ""), data.get("b"), data.get("a")))
+        await _listen_json(url, stop, lambda data: confirmer.quote(
+            "binance", data.get("s", ""), data.get("b"), data.get("a"),
+            data.get("B"), data.get("A"),
+        ))
     await asyncio.gather(*(listen_batch(streams[offset:offset + 200]) for offset in range(0, len(streams), 200)))
 
 
@@ -307,7 +403,11 @@ async def _listen_bybit(instruments: list[Instrument], confirmer: OpportunityCon
         topic = str(data.get("topic", ""))
         ticker = data.get("data") or {}
         if isinstance(ticker, dict):
-            await confirmer.quote("bybit", ticker.get("symbol", topic.removeprefix("tickers.")), ticker.get("bid1Price"), ticker.get("ask1Price"))
+            await confirmer.quote(
+                "bybit", ticker.get("symbol", topic.removeprefix("tickers.")),
+                ticker.get("bid1Price"), ticker.get("ask1Price"),
+                ticker.get("bid1Size"), ticker.get("ask1Size"),
+            )
     await _listen_subscribed("wss://stream.bybit.com/v5/public/spot", topics, 10, stop, process, "bybit")
 
 
@@ -318,7 +418,10 @@ async def _listen_okx(instruments: list[Instrument], confirmer: OpportunityConfi
     ]
     async def process(data: dict[str, Any]) -> None:
         for ticker in data.get("data", []):
-            await confirmer.quote("okx", ticker.get("instId", ""), ticker.get("bidPx"), ticker.get("askPx"))
+            await confirmer.quote(
+                "okx", ticker.get("instId", ""), ticker.get("bidPx"), ticker.get("askPx"),
+                ticker.get("bidSz"), ticker.get("askSz"),
+            )
     await _listen_subscribed("wss://ws.okx.com/ws/v5/public", args, 100, stop, process, "okx")
 
 
@@ -326,7 +429,10 @@ async def _listen_mexc(instruments: list[Instrument], confirmer: OpportunityConf
     subscriptions = sorted({f"spot@public.aggre.bookTicker.v3.api.pb@100ms@{item.symbol}" for item in instruments})
     async def process(data: dict[str, Any]) -> None:
         ticker = data.get("publicbookticker") or {}
-        await confirmer.quote("mexc", data.get("symbol", ""), ticker.get("bidprice"), ticker.get("askprice"))
+        await confirmer.quote(
+            "mexc", data.get("symbol", ""), ticker.get("bidprice"), ticker.get("askprice"),
+            ticker.get("bidquantity"), ticker.get("askquantity"),
+        )
     batches = [subscriptions[offset:offset + 30] for offset in range(0, len(subscriptions), 30)]
     await asyncio.gather(*(
         _listen_subscribed("wss://wbs-api.mexc.com/ws", batch, len(batch), stop, process, "mexc", mexc_ping=True)
@@ -402,7 +508,9 @@ async def _listen_subscribed(
                                 "symbol": protobuf_message.symbol,
                                 "publicbookticker": {
                                     "bidprice": ticker.bidPrice,
+                                    "bidquantity": ticker.bidQuantity,
                                     "askprice": ticker.askPrice,
+                                    "askquantity": ticker.askQuantity,
                                 },
                             }
                         else:
@@ -431,7 +539,11 @@ async def _configure_confirmer(instruments: list[Instrument]) -> OpportunityConf
         if _confirmer:
             for episode in _confirmer.episodes.values():
                 # Preserve confirmed time up to the last periodic checkpoint.
-                await asyncio.to_thread(finalize_lifetime_at_checkpoint, episode.lifetime_id)
+                await asyncio.to_thread(
+                    finalize_lifetime_at_checkpoint,
+                    episode.lifetime_id,
+                    episode.last_confirmed_at,
+                )
             _confirmer = None
         return None
     if _confirmer is None:
@@ -443,7 +555,11 @@ async def _configure_confirmer(instruments: list[Instrument]) -> OpportunityConf
         }
         for episode_key, episode in list(_confirmer.episodes.items()):
             if episode_key[0] not in covered_sources:
-                await asyncio.to_thread(finalize_lifetime_at_checkpoint, episode.lifetime_id)
+                await asyncio.to_thread(
+                    finalize_lifetime_at_checkpoint,
+                    episode.lifetime_id,
+                    episode.last_confirmed_at,
+                )
                 del _confirmer.episodes[episode_key]
         _confirmer.reconfigure(instruments)
     return _confirmer

@@ -62,6 +62,12 @@ CALCULATOR_REQUEST_DELAY_SECONDS = float(
 )
 CALCULATOR_WORKERS = int(os.getenv("CALCULATOR_WORKERS", "4"))
 
+# Фильтр направления сделки: true — покупка дешевле продажи (прибыльное направление),
+# false — обратное условие.
+BUY_PRICE_MUST_BE_LOWER = os.getenv(
+    "BUY_PRICE_MUST_BE_LOWER", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # Значения добавляются в MySQL-таблицу `config`, только если ключа ещё нет.
 # Чтобы изменить настройки во время работы, отредактируйте эту таблицу в phpMyAdmin.
 DEFAULT_CONFIG = {

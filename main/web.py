@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from config import CALCULATOR_SPREAD_LEVELS
+from config import BUY_PRICE_MUST_BE_LOWER, CALCULATOR_SPREAD_LEVELS
 from database import connect_db, initialize_database, read_config
 
 logger = logging.getLogger(__name__)
@@ -40,17 +40,17 @@ def _fmt_time(value: datetime | None) -> str:
     return html.escape(utc_value.astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M:%S "))
 
 
-def _iso_utc(value: datetime | None) -> str:
-    if value is None:
-        return ""
+def _elapsed_seconds_since(value: datetime) -> int:
+    """Посчитать длительность по UTC, независимо от часового пояса процесса."""
     utc_value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
-    return utc_value.isoformat(timespec="seconds").replace("+00:00", "Z")
+    return max(0, int((datetime.now(timezone.utc) - utc_value).total_seconds()))
 
 
 def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
     connection = connect_db()
     try:
         config = read_config(connection)
+        price_direction = "<" if BUY_PRICE_MUST_BE_LOWER else ">"
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
                 "SELECT source.market_id AS source_market_id, source.market_pair AS source_pair, "
@@ -64,7 +64,7 @@ def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
                 "FROM opportunity_lifetimes AS life "
                 "JOIN market_pairs AS source ON source.market_id = life.source_market_id "
                 "WHERE life.is_active = 1 AND life.threshold_percent = %s "
-                "AND life.buy_price > life.sell_price "
+                f"AND life.buy_price {price_direction} life.sell_price "
                 "ORDER BY life.spread_percent DESC, source.market_id",
                 (CALCULATOR_SPREAD_LEVELS[0],),
             )
@@ -124,13 +124,14 @@ def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
 def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
     connection = connect_db()
     try:
+        price_direction = "<" if BUY_PRICE_MUST_BE_LOWER else ">"
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
                 "SELECT source_pair, threshold_percent, spread_percent, max_spread_percent, "
                 "buy_exchange, buy_market_pair, buy_price, sell_exchange, sell_market_pair, sell_price, "
                 "started_at, last_confirmed_at, ended_at, duration_seconds, is_active "
                 "FROM opportunity_lifetimes WHERE is_active = %s "
-                "AND buy_price > sell_price "
+                f"AND buy_price {price_direction} sell_price "
                 "ORDER BY started_at DESC, lifetime_id DESC LIMIT 500",
                 (int(is_active),),
             )
@@ -195,11 +196,25 @@ def _render_history(
             for item in episodes
         )
         starts = "<br>".join(_fmt_time(item["started_at"]) for item in episodes)
-        states = "<br>".join("Активна" if item["is_active"] else _fmt_time(item["ended_at"]) for item in episodes)
-        durations = "<br>".join(
-            f'<span class="{"live-duration" if item["is_active"] else ""}" data-started-at="{_iso_utc(item["started_at"]) if item["is_active"] else ""}">{int(max(0, (datetime.utcnow() - item["started_at"]).total_seconds())) if item["is_active"] else int(item["duration_seconds"] or 0)} сек.</span>'
+        states = "<br>".join(
+            (
+                f"Активна · последняя проверка {_fmt_time(item['last_confirmed_at'])}"
+                if item["is_active"]
+                else _fmt_time(item["ended_at"])
+            )
             for item in episodes
         )
+        duration_cells = []
+        for item in episodes:
+            is_active = bool(item["is_active"])
+            seconds = (
+                _elapsed_seconds_since(item["started_at"])
+                if is_active
+                else int(item["duration_seconds"] or 0)
+            )
+            live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds}"' if is_active else ""
+            duration_cells.append(f'<span{live_attrs}>{seconds} сек.</span>')
+        durations = "<br>".join(duration_cells)
         lifetime_rows_list.append(
             "<tr>"
             f"<td>{html.escape(str(row['source_pair']))}</td>"
@@ -236,11 +251,15 @@ def _render_history(
 <tbody id="lifetimes-body">{lifetime_rows}</tbody></table></div>
 </main><script>
 function updateLiveDurations() {{
-  const now = Date.now();
-  document.querySelectorAll('.live-duration[data-started-at]').forEach(cell => {{
-    const startedAt = Date.parse(cell.dataset.startedAt);
-    if (!Number.isFinite(startedAt)) return;
-    let seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const now = performance.now();
+  document.querySelectorAll('.live-duration[data-elapsed-seconds]').forEach(cell => {{
+    const elapsed = Number(cell.dataset.elapsedSeconds);
+    if (!Number.isFinite(elapsed)) return;
+    if (!Number.isFinite(Number(cell.dataset.timerBaseMs))) {{
+      cell.dataset.timerBaseMs = String(now);
+      return;
+    }}
+    let seconds = elapsed + Math.floor((now - Number(cell.dataset.timerBaseMs)) / 1000);
     const hours = Math.floor(seconds / 3600); seconds %= 3600;
     const minutes = Math.floor(seconds / 60); seconds %= 60;
     cell.textContent = (hours ? hours + ' ч ' : '') + (minutes ? minutes + ' мин ' : '') + seconds + ' сек.';
@@ -276,6 +295,7 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
         band = "low" if spread < CALCULATOR_SPREAD_LEVELS[1] else (
             "medium" if spread < CALCULATOR_SPREAD_LEVELS[2] else "high"
         )
+        elapsed_seconds = _elapsed_seconds_since(row["started_at"])
         table_rows.append(
             f'<tr data-source-id="{html.escape(str(row["source_market_id"]))}" data-band="{band}">'
             f"<td>{html.escape(str(source_pair))}<small>ID {html.escape(str(row['source_market_id']))}</small></td>"
@@ -289,7 +309,7 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
             f'<td><span class="{freshness_class}">{freshness}</span>'
             f"<small>Последняя котировка: {_fmt_time(last_updated)}</small></td>"
             f"<td>{_fmt_time(row['started_at'])}</td>"
-        f'<td class="live-duration" data-started-at="{_iso_utc(row["started_at"])}">{int(max(0, (now - row["started_at"]).total_seconds()))} сек.</td>'
+        f'<td><span class="live-duration" data-elapsed-seconds="{elapsed_seconds}">{elapsed_seconds} сек.</span></td>'
             "</tr>"
         )
 
@@ -364,11 +384,15 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
   {body}</main>
 <script>
 function updateLiveDurations() {{
-  const now = Date.now();
-  document.querySelectorAll('.live-duration[data-started-at]').forEach(cell => {{
-    const startedAt = Date.parse(cell.dataset.startedAt);
-    if (!Number.isFinite(startedAt)) return;
-    let seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const now = performance.now();
+  document.querySelectorAll('.live-duration[data-elapsed-seconds]').forEach(cell => {{
+    const elapsed = Number(cell.dataset.elapsedSeconds);
+    if (!Number.isFinite(elapsed)) return;
+    if (!Number.isFinite(Number(cell.dataset.timerBaseMs))) {{
+      cell.dataset.timerBaseMs = String(now);
+      return;
+    }}
+    let seconds = elapsed + Math.floor((now - Number(cell.dataset.timerBaseMs)) / 1000);
     const hours = Math.floor(seconds / 3600);
     seconds %= 3600;
     const minutes = Math.floor(seconds / 60);
