@@ -18,6 +18,7 @@ from database import connect_db, initialize_database, read_config
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
+TRANSFER_EPISODE_GAP_SECONDS = 60
 
 
 def _fmt(value: Any) -> str:
@@ -93,6 +94,83 @@ def _load_worker_status() -> dict[str, str]:
         connection.close()
 
 
+def _classify_transfer_groups(
+    lifetime_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate short interruptions for the same route and threshold.
+
+    Confirmed spread seconds accumulate across episodes separated by at most
+    TRANSFER_EPISODE_GAP_SECONDS. The first episode's sampled transfer estimate applies to that
+    transfer attempt. Gaps themselves do not add to the elapsed opportunity time.
+    """
+    now = datetime.utcnow()
+    route_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in lifetime_rows:
+        key = (
+            row.get("source_market_id"), row["source_pair"], row["threshold_percent"],
+            row["buy_exchange"], row["buy_market_pair"],
+            row["sell_exchange"], row["sell_market_pair"],
+        )
+        route_groups.setdefault(key, []).append(row)
+
+    transfer_groups: list[dict[str, Any]] = []
+    for key, episodes in route_groups.items():
+        episodes.sort(key=lambda item: item["started_at"])
+        clusters: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        previous_end: datetime | None = None
+        for row in episodes:
+            start = row["started_at"]
+            if row["is_active"]:
+                end = now
+                duration = max(0, int((end - start).total_seconds()))
+            else:
+                duration = int(row.get("duration_seconds") or 0)
+                end = start + timedelta(seconds=duration)
+            row["_confirmed_seconds"] = duration
+            gap = (start - previous_end).total_seconds() if previous_end else None
+            if current and gap is not None and gap > TRANSFER_EPISODE_GAP_SECONDS:
+                clusters.append(current)
+                current = []
+            current.append(row)
+            previous_end = max(previous_end, end) if previous_end else end
+        if current:
+            clusters.append(current)
+
+        for cluster in clusters:
+            total_seconds = sum(row["_confirmed_seconds"] for row in cluster)
+            active = any(bool(row["is_active"]) for row in cluster)
+            expected = next(
+                (float(row["transfer_seconds"]) for row in cluster
+                 if row.get("transfer_seconds") is not None),
+                None,
+            )
+            if expected is None:
+                state = "unknown"
+            elif total_seconds >= expected:
+                state = "passed"
+            elif active:
+                state = "pending"
+            else:
+                state = "failed"
+            group = {
+                "source_market_id": key[0],
+                "threshold_percent": key[2],
+                "started_at": cluster[0]["started_at"],
+                "total_seconds": total_seconds,
+                "expected_seconds": expected,
+                "state": state,
+                "episodes": cluster,
+            }
+            transfer_groups.append(group)
+            for row in cluster:
+                row["_transfer_state"] = state
+                row["_transfer_total_seconds"] = total_seconds
+                row["_transfer_expected_seconds"] = expected
+                row["_transfer_group_started_at"] = cluster[0]["started_at"]
+    return transfer_groups
+
+
 def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
     connection = connect_db()
     try:
@@ -103,19 +181,31 @@ def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
                 "FROM opportunity_history ORDER BY observed_at DESC, history_id DESC LIMIT 500"
             )
             rows = cursor.fetchall()
+            cursor.execute(
+                "SELECT lifetime_id, source_market_id, source_pair, threshold_percent, "
+                "buy_exchange, buy_market_pair, sell_exchange, sell_market_pair, "
+                "started_at, ended_at, last_confirmed_at, duration_seconds, is_active, transfer_seconds "
+                "FROM opportunity_lifetimes "
+                "WHERE started_at >= TIMESTAMPADD(MINUTE, -1440, UTC_TIMESTAMP()) "
+                "ORDER BY source_market_id, threshold_percent, started_at, lifetime_id"
+            )
+            transfer_rows = cursor.fetchall()
+            transfer_groups = _classify_transfer_groups(transfer_rows)
             counters: dict[int, dict[str, int]] = {}
             low, middle, high = CALCULATOR_SPREAD_LEVELS
             for minutes in (60, 720, 1440):
-                cursor.execute(
-                    "SELECT "
-                    "COUNT(CASE WHEN threshold_percent = %s THEN 1 END) AS low_band, "
-                    "COUNT(CASE WHEN threshold_percent = %s THEN 1 END) AS middle_band, "
-                    "COUNT(CASE WHEN threshold_percent = %s THEN 1 END) AS high_band "
-                    "FROM opportunity_lifetimes "
-                    "WHERE started_at >= TIMESTAMPADD(MINUTE, -%s, UTC_TIMESTAMP())",
-                    (low, middle, high, minutes),
-                )
-                counters[minutes] = cursor.fetchone()
+                cutoff = datetime.utcnow() - timedelta(minutes=minutes)
+                counters[minutes] = {
+                    band: sum(
+                        group["state"] == "passed"
+                        and group["started_at"] >= cutoff
+                        and group["threshold_percent"] == threshold
+                        for group in transfer_groups
+                    )
+                    for band, threshold in (
+                        ("low_band", low), ("middle_band", middle), ("high_band", high)
+                    )
+                }
         return rows, counters
     finally:
         connection.close()
@@ -127,7 +217,7 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
         price_direction = "<" if BUY_PRICE_MUST_BE_LOWER else ">"
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
-                "SELECT source_pair, threshold_percent, spread_percent, max_spread_percent, "
+                "SELECT lifetime_id, source_market_id, source_pair, threshold_percent, spread_percent, max_spread_percent, "
                 "buy_exchange, buy_market_pair, buy_price, sell_exchange, sell_market_pair, sell_price, "
                 "started_at, last_confirmed_at, ended_at, duration_seconds, is_active, transfer_seconds "
                 "FROM opportunity_lifetimes WHERE is_active = %s "
@@ -172,20 +262,10 @@ def _render_history(
     )
     if not history_rows:
         history_rows = '<tr><td colspan="7">История появится после первого пересчёта.</td></tr>'
+    _classify_transfer_groups(rows_lifetimes)
     quote_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows_lifetimes:
-        elapsed = (
-            _elapsed_seconds_since(row["started_at"])
-            if row["is_active"]
-            else int(row["duration_seconds"] or 0)
-        )
-        transfer_seconds = row.get("transfer_seconds")
-        transfer_state = (
-            "unknown" if transfer_seconds is None
-            else "passed" if elapsed >= float(transfer_seconds)
-            else "pending" if row["is_active"]
-            else "failed"
-        )
+        transfer_state = row.get("_transfer_state", "unknown")
         quote_key = (
             row["source_pair"], row["buy_exchange"], row["buy_market_pair"], row["buy_price"],
             row["sell_exchange"], row["sell_market_pair"], row["sell_price"], transfer_state,
@@ -229,9 +309,9 @@ def _render_history(
         durations = "<br>".join(duration_cells)
         transfer_state = quote_key[-1]
         transfer_labels = {
-            "passed": "Успела за время перевода",
-            "failed": "Не успела за время перевода",
-            "pending": "Проверяется",
+            "passed": f"Успела суммарно {row['_transfer_total_seconds']} / {row['_transfer_expected_seconds']:.0f} сек.",
+            "failed": f"Не успела суммарно {row['_transfer_total_seconds']} / {row['_transfer_expected_seconds']:.0f} сек.",
+            "pending": f"Проверяется: {row['_transfer_total_seconds']} / {row['_transfer_expected_seconds']:.0f} сек.",
             "unknown": "Нет данных",
         }
         lifetime_rows_list.append(
@@ -267,7 +347,7 @@ def _render_history(
 </style></head><body>
 <header><h1>{page_title}</h1><div class="muted">{('Текущие подтверждённые ситуации · список обновляется автоматически' if active_view else f'Последние 500 наблюдений · данные хранятся 30 дней · обновлено {refreshed_at}')}</div>
 <nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a></nav></header>
-<main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
+<main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="muted counter-note">Суммируется подтверждённое время эпизодов одного маршрута с паузами до 60 секунд; паузы не учитываются.</div><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
 <tbody>{counter_rows}</tbody></table></div>
 </section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="filters"><label><input id="hide-transfer-failed" type="checkbox" checked> Скрывать возможности, которые не пережили время перевода</label></div><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность</th><th>Проверка времени перевода</th></tr></thead>
 <tbody id="lifetimes-body">{lifetime_rows}</tbody></table></div>
