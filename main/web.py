@@ -129,7 +129,7 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
             cursor.execute(
                 "SELECT source_pair, threshold_percent, spread_percent, max_spread_percent, "
                 "buy_exchange, buy_market_pair, buy_price, sell_exchange, sell_market_pair, sell_price, "
-                "started_at, last_confirmed_at, ended_at, duration_seconds, is_active "
+                "started_at, last_confirmed_at, ended_at, duration_seconds, is_active, transfer_seconds "
                 "FROM opportunity_lifetimes WHERE is_active = %s "
                 f"AND buy_price {price_direction} sell_price "
                 "ORDER BY started_at DESC, lifetime_id DESC LIMIT 500",
@@ -174,9 +174,21 @@ def _render_history(
         history_rows = '<tr><td colspan="7">История появится после первого пересчёта.</td></tr>'
     quote_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows_lifetimes:
+        elapsed = (
+            _elapsed_seconds_since(row["started_at"])
+            if row["is_active"]
+            else int(row["duration_seconds"] or 0)
+        )
+        transfer_seconds = row.get("transfer_seconds")
+        transfer_state = (
+            "unknown" if transfer_seconds is None
+            else "passed" if elapsed >= float(transfer_seconds)
+            else "pending" if row["is_active"]
+            else "failed"
+        )
         quote_key = (
             row["source_pair"], row["buy_exchange"], row["buy_market_pair"], row["buy_price"],
-            row["sell_exchange"], row["sell_market_pair"], row["sell_price"],
+            row["sell_exchange"], row["sell_market_pair"], row["sell_price"], transfer_state,
         )
         group = quote_groups.setdefault(quote_key, {"row": row, "episodes": {}})
         episode_key = (row["threshold_percent"], row["started_at"], bool(row["is_active"]), row["ended_at"])
@@ -215,17 +227,25 @@ def _render_history(
             live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds}"' if is_active else ""
             duration_cells.append(f'<span{live_attrs}>{seconds} сек.</span>')
         durations = "<br>".join(duration_cells)
+        transfer_state = quote_key[-1]
+        transfer_labels = {
+            "passed": "Успела за время перевода",
+            "failed": "Не успела за время перевода",
+            "pending": "Проверяется",
+            "unknown": "Нет данных",
+        }
         lifetime_rows_list.append(
-            "<tr>"
+            f'<tr data-transfer-state="{transfer_state}">'
             f"<td>{html.escape(str(row['source_pair']))}</td>"
             f"<td>{thresholds}</td><td>{spreads}</td>"
             f"<td>{html.escape(str(row['buy_exchange']))}<small>{html.escape(str(row['buy_market_pair']))} · {_fmt(row['buy_price'])}</small></td>"
             f"<td>{html.escape(str(row['sell_exchange']))}<small>{html.escape(str(row['sell_market_pair']))} · {_fmt(row['sell_price'])}</small></td>"
-            f"<td>{starts}</td><td>{states}</td><td>{durations}</td></tr>"
+            f"<td>{starts}</td><td>{states}</td><td>{durations}</td>"
+            f"<td>{transfer_labels[transfer_state]}</td></tr>"
         )
     lifetime_rows = "".join(lifetime_rows_list)
     if not lifetime_rows:
-        lifetime_rows = '<tr><td colspan="8">Ожидаются подтверждения от WebSocket-стаканов.</td></tr>'
+        lifetime_rows = '<tr><td colspan="9">Ожидаются подтверждения от WebSocket-стаканов.</td></tr>'
     refreshed_at = datetime.now(KYIV_TZ).strftime("%Y-%m-%d %H:%M:%S")
     page_title = "Активные ситуации" if active_view else "История возможностей"
     return f"""<!doctype html>
@@ -242,12 +262,14 @@ def _render_history(
   table {{ width: 100%; border-collapse: collapse; min-width: 760px; background: #111b2e; }}
   th, td {{ padding: 11px 14px; text-align: left; border-bottom: 1px solid #26334a; white-space: nowrap; }}
   th {{ color: #9fb4d0; font-size: .82rem; text-transform: uppercase; }} .spread {{ color: #67e8a5; font-weight: 700; }}
+  tr[hidden] {{ display: none; }} .filters {{ margin: 0 0 14px; padding: 12px 14px; border: 1px solid #26334a; border-radius: 10px; background: #111b2e; }}
+  .filters input {{ accent-color: #38bdf8; vertical-align: middle; }} .filters label {{ cursor: pointer; }}
 </style></head><body>
 <header><h1>{page_title}</h1><div class="muted">{('Текущие подтверждённые ситуации · список обновляется автоматически' if active_view else f'Последние 500 наблюдений · данные хранятся 30 дней · обновлено {refreshed_at}')}</div>
 <nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a></nav></header>
 <main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
 <tbody>{counter_rows}</tbody></table></div>
-</section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность</th></tr></thead>
+</section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="filters"><label><input id="hide-transfer-failed" type="checkbox" checked> Скрывать возможности, которые не пережили время перевода</label></div><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность</th><th>Проверка времени перевода</th></tr></thead>
 <tbody id="lifetimes-body">{lifetime_rows}</tbody></table></div>
 </main><script>
 function updateLiveDurations() {{
@@ -274,8 +296,25 @@ async function refreshLifetimeHistory() {{
     const updatedBody = documentCopy.getElementById('lifetimes-body');
     const currentBody = document.getElementById('lifetimes-body');
     if (updatedBody && currentBody) currentBody.replaceChildren(...updatedBody.cloneNode(true).childNodes);
+    renderTransferFilter();
   }} catch (_) {{}}
 }}
+const transferFilter = document.getElementById('hide-transfer-failed');
+if (transferFilter) {{
+  const savedTransferFilter = localStorage.getItem('hide-transfer-failed');
+  if (savedTransferFilter !== null) transferFilter.checked = savedTransferFilter === 'true';
+  transferFilter.addEventListener('change', () => {{
+    localStorage.setItem('hide-transfer-failed', String(transferFilter.checked));
+    renderTransferFilter();
+  }});
+}}
+function renderTransferFilter() {{
+  if (!transferFilter) return;
+  document.querySelectorAll('#lifetimes-body tr[data-transfer-state]').forEach(row => {{
+    row.hidden = transferFilter.checked && row.dataset.transferState === 'failed';
+  }});
+}}
+renderTransferFilter();
 setInterval(refreshLifetimeHistory, 5000);
 </script></body></html>"""
 

@@ -68,6 +68,31 @@ BUY_PRICE_MUST_BE_LOWER = os.getenv(
     "BUY_PRICE_MUST_BE_LOWER", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# Сопоставление тикеров валюты с профилями перевода из main/treider/tran_emulation.py.
+# Неуказанные валюты используют общий профиль эмулятора.
+TRANSFER_NETWORK_MAP = {}
+for _transfer_mapping in os.getenv(
+    "TRANSFER_NETWORK_MAP",
+    "BTC:BITCOIN,ETH:ETHEREUM,SOL:SOLANA,TON:TON,TRX:TRON,BNB:BSC",
+).split(","):
+    if ":" in _transfer_mapping:
+        _transfer_symbol, _transfer_network = _transfer_mapping.split(":", 1)
+        if _transfer_symbol.strip() and _transfer_network.strip():
+            TRANSFER_NETWORK_MAP[_transfer_symbol.strip().upper()] = _transfer_network.strip().upper()
+
+# Ключи с правами только на чтение информации о кошельке и сетях.
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+OKX_API_KEY = os.getenv("OKX_API_KEY", "").strip()
+OKX_API_SECRET = os.getenv("OKX_API_SECRET", os.getenv("OkX_API_SECRET", "")).strip()
+OKX_API_PASSPHRASE = os.getenv(
+    "OKX_API_PASSPHRASE", os.getenv("OkX_passphrase", "")
+).strip()
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
+MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "").strip()
+
 # Значения добавляются в MySQL-таблицу `config`, только если ключа ещё нет.
 # Чтобы изменить настройки во время работы, отредактируйте эту таблицу в phpMyAdmin.
 DEFAULT_CONFIG = {

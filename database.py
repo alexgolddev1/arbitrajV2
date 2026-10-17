@@ -133,6 +133,11 @@ def initialize_database(connection: MySQLConnection) -> None:
             cursor.execute(
                 "ALTER TABLE calculator_market_pairs ADD COLUMN rank_no INT NULL AFTER market_id"
             )
+        cursor.execute("SHOW COLUMNS FROM opportunity_lifetimes LIKE 'transfer_seconds'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE opportunity_lifetimes ADD COLUMN transfer_seconds DECIMAL(10, 2) NULL"
+            )
         cursor.execute("SHOW COLUMNS FROM calculator_market_pairs LIKE 'market_id'")
         market_id_column = cursor.fetchone()
         if market_id_column is not None and not str(market_id_column[1]).lower().startswith("decimal"):
@@ -262,6 +267,7 @@ def record_opportunity_lifetime(
     sell_price: Decimal,
     started_at: datetime,
     last_confirmed_at: datetime,
+    transfer_seconds: Decimal | float | None = None,
     ended_at: datetime | None = None,
 ) -> int | None:
     """Insert a confirmed episode or close it with its observed lifetime."""
@@ -272,11 +278,11 @@ def record_opportunity_lifetime(
                 cursor.execute(
                     "INSERT INTO opportunity_lifetimes (source_market_id, source_pair, threshold_percent, "
                     "spread_percent, max_spread_percent, buy_exchange, buy_market_pair, buy_price, "
-                    "sell_exchange, sell_market_pair, sell_price, started_at, last_confirmed_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "sell_exchange, sell_market_pair, sell_price, started_at, last_confirmed_at, transfer_seconds) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (source_market_id, source_pair, threshold_percent, spread_percent, max_spread_percent,
                      buy_exchange, buy_market_pair, buy_price, sell_exchange, sell_market_pair, sell_price,
-                     started_at, last_confirmed_at),
+                     started_at, last_confirmed_at, transfer_seconds),
                 )
                 lifetime_id = int(cursor.lastrowid)
             else:

@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS opportunity_lifetimes (
     last_confirmed_at DATETIME NOT NULL,
     ended_at DATETIME NULL,
     duration_seconds BIGINT UNSIGNED NULL,
+    transfer_seconds DECIMAL(10, 2) NULL,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
     INDEX idx_lifetime_active (is_active, threshold_percent),
     INDEX idx_lifetime_time (started_at),

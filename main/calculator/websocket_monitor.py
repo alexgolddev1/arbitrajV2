@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from websockets.asyncio.client import connect
 
-from config import CALCULATOR_SPREAD_LEVELS
+from config import CALCULATOR_SPREAD_LEVELS, TRANSFER_NETWORK_MAP
 from database import (
     connect_db,
     finalize_interrupted_lifetimes,
@@ -24,6 +24,7 @@ from database import (
     record_opportunity_lifetime,
     touch_opportunity_lifetimes,
 )
+from main.treider.tran_emulation import TransferTimeEmulator
 from .mexc_proto import PushDataV3ApiWrapper
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ STALE_SECONDS = 60
 class Instrument:
     source_id: int
     source_pair: str
+    source_base_symbol: str
     exchange: str
     exchange_name: str
     market_pair: str
@@ -56,6 +58,23 @@ class Episode:
     started_at: datetime
     max_spread: Decimal
     last_checkpoint: datetime
+    last_confirmed_at: datetime
+    spread: Decimal
+    buy_exchange: str
+    buy_market_pair: str
+    buy_price: Decimal
+    sell_exchange: str
+    sell_market_pair: str
+    sell_price: Decimal
+
+
+@dataclass
+class PendingEpisode:
+    started_at: datetime
+    started_monotonic: float
+    transfer_seconds: float
+    network: str
+    max_spread: Decimal
     last_confirmed_at: datetime
     spread: Decimal
     buy_exchange: str
@@ -104,6 +123,7 @@ def _load_instruments() -> list[Instrument]:
         instruments.append(Instrument(
             source_id=int(row["source_market_id"]),
             source_pair=str(row["source_pair"] or market_pair),
+            source_base_symbol=str(row["source_base_symbol"] or "").upper(),
             exchange=exchange,
             exchange_name=str(row["exchange_name"] or exchange.upper()),
             market_pair=market_pair,
@@ -123,6 +143,8 @@ class OpportunityConfirmer:
             ).append(instrument)
         self.quotes: dict[tuple[int, str], Quote] = {}
         self.episodes: dict[tuple[int, Decimal], Episode] = {}
+        self.pending: dict[tuple[int, Decimal], PendingEpisode] = {}
+        self.transfer_emulator = TransferTimeEmulator()
         self._evaluation_locks: dict[int, asyncio.Lock] = {}
         self._cycle_confirmed_sources: set[int] = set()
         self._cycle_confirmed_by_threshold = {threshold: 0 for threshold in CALCULATOR_SPREAD_LEVELS}
@@ -146,7 +168,12 @@ class OpportunityConfirmer:
             threshold: sum(1 for _, active_threshold in self.episodes if active_threshold == threshold)
             for threshold in CALCULATOR_SPREAD_LEVELS
         }
+        pending_by_threshold = {
+            threshold: sum(1 for _, active_threshold in self.pending if active_threshold == threshold)
+            for threshold in CALCULATOR_SPREAD_LEVELS
+        }
         active_sources = {source_id for source_id, _ in self.episodes}
+        pending_sources = {source_id for source_id, _ in self.pending}
         return {
             "candidate_pairs": sum(len(exchanges) >= 2 for exchanges in exchanges_by_source.values()),
             "quoted_pairs": len(self._cycle_sources_with_two_quotes),
@@ -156,6 +183,8 @@ class OpportunityConfirmer:
             "confirmed_levels": dict(self._cycle_confirmed_by_threshold),
             "active_pairs": len(active_sources),
             "active_levels": active_by_threshold,
+            "pending_pairs": len(pending_sources),
+            "pending_levels": pending_by_threshold,
         }
 
     def reconfigure(self, instruments: list[Instrument]) -> None:
@@ -254,6 +283,14 @@ class OpportunityConfirmer:
                     episode.last_confirmed_at.isoformat(sep=" "),
                     int((episode.last_confirmed_at - episode.started_at).total_seconds()),
                 )
+                self.pending.pop(episode_key, None)
+            for pending_key, pending in list(self.pending.items()):
+                if pending_key[0] == source_id:
+                    del self.pending[pending_key]
+                    logger.info(
+                        "Кандидат %s отброшен: котировки устарели до завершения перевода сети %s",
+                        source_id, pending.network,
+                    )
             return
         self._cycle_sources_with_two_quotes.add(source_id)
 
@@ -281,6 +318,14 @@ class OpportunityConfirmer:
                     source_id,
                     int((episode.last_confirmed_at - episode.started_at).total_seconds()),
                 )
+                self.pending.pop(episode_key, None)
+            for pending_key, pending in list(self.pending.items()):
+                if pending_key[0] == source_id:
+                    del self.pending[pending_key]
+                    logger.info(
+                        "Кандидат %s отброшен: нет доступных уровней стакана до завершения перевода сети %s",
+                        source_id, pending.network,
+                    )
             return
         buy, sell = max(
             executable_pairs,
@@ -293,35 +338,114 @@ class OpportunityConfirmer:
         for threshold in CALCULATOR_SPREAD_LEVELS:
             episode_key = (source_id, threshold)
             episode = self.episodes.get(episode_key)
+            pending = self.pending.get(episode_key)
+            route = (buy[0].exchange_name, buy[0].market_pair,
+                     sell[0].exchange_name, sell[0].market_pair)
+
+            if episode is not None and route != (
+                episode.buy_exchange, episode.buy_market_pair,
+                episode.sell_exchange, episode.sell_market_pair,
+            ):
+                await asyncio.to_thread(
+                    record_opportunity_lifetime,
+                    lifetime_id=episode.lifetime_id,
+                    source_market_id=source_id,
+                    source_pair=buy[0].source_pair,
+                    threshold_percent=threshold,
+                    spread_percent=episode.spread,
+                    max_spread_percent=episode.max_spread,
+                    buy_exchange=episode.buy_exchange,
+                    buy_market_pair=episode.buy_market_pair,
+                    buy_price=episode.buy_price,
+                    sell_exchange=episode.sell_exchange,
+                    sell_market_pair=episode.sell_market_pair,
+                    sell_price=episode.sell_price,
+                    started_at=episode.started_at,
+                    last_confirmed_at=episode.last_confirmed_at,
+                    ended_at=now,
+                )
+                del self.episodes[episode_key]
+                self.pending.pop(episode_key, None)
+                pending = None
+                episode = None
+
             if spread > threshold:
                 if episode is None:
-                    episode_id = await asyncio.to_thread(
-                        record_opportunity_lifetime,
-                        source_market_id=source_id,
-                        source_pair=buy[0].source_pair,
-                        threshold_percent=threshold,
-                        spread_percent=spread,
-                        max_spread_percent=spread,
-                        buy_exchange=buy[0].exchange_name,
-                        buy_market_pair=buy[0].market_pair,
-                        buy_price=buy[1].ask,
-                        sell_exchange=sell[0].exchange_name,
-                        sell_market_pair=sell[0].market_pair,
-                        sell_price=sell[1].bid,
-                        started_at=now,
-                        last_confirmed_at=now,
-                    )
-                    if episode_id is not None:
-                        self.episodes[episode_key] = Episode(
-                            episode_id, now, spread, now, now, spread,
-                            buy[0].exchange_name, buy[0].market_pair, buy[1].ask,
-                            sell[0].exchange_name, sell[0].market_pair, sell[1].bid,
+                    if pending is not None and route != (
+                        pending.buy_exchange, pending.buy_market_pair,
+                        pending.sell_exchange, pending.sell_market_pair,
+                    ):
+                        del self.pending[episode_key]
+                        pending = None
+                    if pending is None:
+                        network = TRANSFER_NETWORK_MAP.get(
+                            buy[0].source_base_symbol, "UNKNOWN"
                         )
-                        self._cycle_confirmed_sources.add(source_id)
-                        self._cycle_confirmed_by_threshold[threshold] += 1
+                        transfer_seconds = self.transfer_emulator.get_emulated_duration(network)
+                        pending = PendingEpisode(
+                            started_at=now,
+                            started_monotonic=time.monotonic(),
+                            transfer_seconds=transfer_seconds,
+                            network=network,
+                            max_spread=spread,
+                            last_confirmed_at=now,
+                            spread=spread,
+                            buy_exchange=buy[0].exchange_name,
+                            buy_market_pair=buy[0].market_pair,
+                            buy_price=buy[1].ask,
+                            sell_exchange=sell[0].exchange_name,
+                            sell_market_pair=sell[0].market_pair,
+                            sell_price=sell[1].bid,
+                        )
+                        self.pending[episode_key] = pending
+                        episode_id = await asyncio.to_thread(
+                            record_opportunity_lifetime,
+                            source_market_id=source_id,
+                            source_pair=buy[0].source_pair,
+                            threshold_percent=threshold,
+                            spread_percent=spread,
+                            max_spread_percent=spread,
+                            buy_exchange=buy[0].exchange_name,
+                            buy_market_pair=buy[0].market_pair,
+                            buy_price=buy[1].ask,
+                            sell_exchange=sell[0].exchange_name,
+                            sell_market_pair=sell[0].market_pair,
+                            sell_price=sell[1].bid,
+                            started_at=now,
+                            last_confirmed_at=now,
+                            transfer_seconds=transfer_seconds,
+                        )
+                        if episode_id is not None:
+                            episode = Episode(
+                                episode_id, now, spread, now, now, spread,
+                                buy[0].exchange_name, buy[0].market_pair, buy[1].ask,
+                                sell[0].exchange_name, sell[0].market_pair, sell[1].bid,
+                            )
+                            self.episodes[episode_key] = episode
+                            self._cycle_confirmed_sources.add(source_id)
+                            self._cycle_confirmed_by_threshold[threshold] += 1
                         logger.info(
-                            "WebSocket подтвердил %s: спред %.4f%% выше %.4f%%",
-                            buy[0].source_pair, spread, threshold,
+                            "Кандидат %s: проверяю сохранение спреда %.4f%% выше %.4f%% "
+                            "на время эмулируемого перевода сети %s (%.1f сек.)",
+                            buy[0].source_pair, spread, threshold, network, transfer_seconds,
+                        )
+                    else:
+                        pending.last_confirmed_at = now
+                        pending.max_spread = max(pending.max_spread, spread)
+                        pending.spread = spread
+                        pending.buy_exchange = buy[0].exchange_name
+                        pending.buy_market_pair = buy[0].market_pair
+                        pending.buy_price = buy[1].ask
+                        pending.sell_exchange = sell[0].exchange_name
+                        pending.sell_market_pair = sell[0].market_pair
+                        pending.sell_price = sell[1].bid
+
+                    if time.monotonic() - pending.started_monotonic >= pending.transfer_seconds:
+                        del self.pending[episode_key]
+                        logger.info(
+                            "Возможность %s сохраняла спред выше %.4f%% в течение %.1f сек. "
+                            "эмуляции сети %s",
+                            buy[0].source_pair, threshold, pending.transfer_seconds, pending.network,
                         )
                 if episode is not None:
                     episode.last_confirmed_at = now
@@ -333,6 +457,34 @@ class OpportunityConfirmer:
                     episode.sell_exchange = sell[0].exchange_name
                     episode.sell_market_pair = sell[0].market_pair
                     episode.sell_price = sell[1].bid
+            elif pending is not None:
+                if episode is not None:
+                    await asyncio.to_thread(
+                        record_opportunity_lifetime,
+                        lifetime_id=episode.lifetime_id,
+                        source_market_id=source_id,
+                        source_pair=buy[0].source_pair,
+                        threshold_percent=threshold,
+                        spread_percent=episode.spread,
+                        max_spread_percent=episode.max_spread,
+                        buy_exchange=episode.buy_exchange,
+                        buy_market_pair=episode.buy_market_pair,
+                        buy_price=episode.buy_price,
+                        sell_exchange=episode.sell_exchange,
+                        sell_market_pair=episode.sell_market_pair,
+                        sell_price=episode.sell_price,
+                        started_at=episode.started_at,
+                        last_confirmed_at=episode.last_confirmed_at,
+                        ended_at=now,
+                    )
+                    del self.episodes[episode_key]
+                del self.pending[episode_key]
+                logger.info(
+                    "Кандидат %s отброшен: спред %.4f%% опустился ниже порога %.4f%% "
+                    "до завершения перевода сети %s (прошло %.1f из %.1f сек.)",
+                    buy[0].source_pair, spread, threshold, pending.network,
+                    time.monotonic() - pending.started_monotonic, pending.transfer_seconds,
+                )
             elif episode is not None:
                 await asyncio.to_thread(
                     record_opportunity_lifetime,
@@ -362,7 +514,9 @@ class OpportunityConfirmer:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         # Периодически проверяем свежесть даже если биржа перестала присылать
         # сообщения: иначе UI продолжал бы считать такой эпизод активным.
-        for source_id in {source_id for source_id, _ in self.episodes}:
+        source_ids = {source_id for source_id, _ in self.episodes}
+        source_ids.update(source_id for source_id, _ in self.pending)
+        for source_id in source_ids:
             now_mono = time.monotonic()
             fresh_exchanges = {
                 instrument.exchange
@@ -561,6 +715,13 @@ async def _configure_confirmer(instruments: list[Instrument]) -> OpportunityConf
                     episode.last_confirmed_at,
                 )
                 del _confirmer.episodes[episode_key]
+        for pending_key, pending in list(_confirmer.pending.items()):
+            if pending_key[0] not in covered_sources:
+                del _confirmer.pending[pending_key]
+                logger.info(
+                    "Кандидат %s отброшен: в обновлённом списке нет двух биржевых рынков",
+                    pending_key[0],
+                )
         _confirmer.reconfigure(instruments)
     return _confirmer
 
@@ -638,6 +799,10 @@ async def _monitor_forever(refresh_callback: Callable[[], int]) -> None:
                     f"{threshold}%: {stats['active_levels'][threshold]}"
                     for threshold in CALCULATOR_SPREAD_LEVELS
                 )
+                pending_by_level = ", ".join(
+                    f"{threshold}%: {stats['pending_levels'][threshold]}"
+                    for threshold in CALCULATOR_SPREAD_LEVELS
+                )
                 quote_updates = ", ".join(
                     f"{exchange}: {count}" for exchange, count in sorted(stats["quote_updates"].items())
                 ) or "нет"
@@ -647,6 +812,11 @@ async def _monitor_forever(refresh_callback: Callable[[], int]) -> None:
                     f"{stats['max_spread']:.4f}" if stats["max_spread"] is not None else "нет данных",
                     stats["confirmed_pairs"], confirmed_by_level, stats["active_pairs"], active_by_level,
                 )
+                if stats["pending_pairs"]:
+                    logger.info(
+                        "Ожидают эмулируемый перевод: кандидатов %s, пороги [%s]",
+                        stats["pending_pairs"], pending_by_level,
+                    )
 
 
 def monitor_forever(refresh_callback: Callable[[], int]) -> None:
