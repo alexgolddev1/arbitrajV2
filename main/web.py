@@ -18,7 +18,7 @@ from database import connect_db, initialize_database, read_config
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-TRANSFER_EPISODE_GAP_SECONDS = 60
+LIFETIME_EPISODE_GAP_SECONDS = 60
 
 
 def _fmt(value: Any) -> str:
@@ -313,14 +313,13 @@ document.querySelectorAll('.trade-row').forEach(row => {{
 </script></body></html>"""
 
 
-def _classify_transfer_groups(
+def _aggregate_lifetime_groups(
     lifetime_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Aggregate short interruptions for the same route and threshold.
+) -> None:
+    """Attach summed confirmed time to episodes on the same route and threshold.
 
     Confirmed spread seconds accumulate across episodes separated by at most
-    TRANSFER_EPISODE_GAP_SECONDS. The first episode's sampled transfer estimate applies to that
-    transfer attempt. Gaps themselves do not add to the elapsed opportunity time.
+    LIFETIME_EPISODE_GAP_SECONDS. Gaps themselves do not add to the elapsed opportunity time.
     """
     now = datetime.utcnow()
     route_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
@@ -332,7 +331,6 @@ def _classify_transfer_groups(
         )
         route_groups.setdefault(key, []).append(row)
 
-    transfer_groups: list[dict[str, Any]] = []
     for key, episodes in route_groups.items():
         episodes.sort(key=lambda item: item["started_at"])
         clusters: list[list[dict[str, Any]]] = []
@@ -348,7 +346,7 @@ def _classify_transfer_groups(
                 end = start + timedelta(seconds=duration)
             row["_confirmed_seconds"] = duration
             gap = (start - previous_end).total_seconds() if previous_end else None
-            if current and gap is not None and gap > TRANSFER_EPISODE_GAP_SECONDS:
+            if current and gap is not None and gap > LIFETIME_EPISODE_GAP_SECONDS:
                 clusters.append(current)
                 current = []
             current.append(row)
@@ -358,37 +356,36 @@ def _classify_transfer_groups(
 
         for cluster in clusters:
             total_seconds = round(sum(row["_confirmed_seconds"] for row in cluster), 3)
-            active = any(bool(row["is_active"]) for row in cluster)
-            expected = next(
-                (float(row["transfer_seconds"]) for row in cluster
-                 if row.get("transfer_seconds") is not None),
-                None,
-            )
-            if expected is None:
-                state = "unknown"
-            elif total_seconds >= expected:
-                state = "passed"
-            elif active:
-                state = "pending"
-            else:
-                state = "failed"
-            group = {
-                "source_market_id": key[0],
-                "threshold_percent": key[2],
-                "started_at": cluster[0]["started_at"],
-                "total_seconds": total_seconds,
-                "expected_seconds": expected,
-                "state": state,
-                "episodes": cluster,
-            }
-            transfer_groups.append(group)
             for row in cluster:
-                row["_transfer_state"] = state
-                row["_transfer_total_seconds"] = total_seconds
-                row["_transfer_expected_seconds"] = expected
-                row["_transfer_episode_count"] = len(cluster)
-                row["_transfer_group_started_at"] = cluster[0]["started_at"]
-    return transfer_groups
+                row["_lifetime_total_seconds"] = total_seconds
+                row["_lifetime_episode_count"] = len(cluster)
+
+
+def _count_trader_positions(
+    positions: list[dict[str, Any]],
+    spread_levels: tuple[Decimal, ...],
+    now: datetime | None = None,
+) -> dict[int, dict[str, int]]:
+    """Count created trader positions by signal threshold and creation window."""
+    current_time = now or datetime.utcnow()
+    counters = {
+        minutes: {f"threshold_{index}": 0 for index, _ in enumerate(spread_levels)}
+        for minutes in (60, 720, 1440)
+    }
+    cutoffs = {
+        minutes: current_time - timedelta(minutes=minutes)
+        for minutes in counters
+    }
+    for position in positions:
+        position_threshold = Decimal(str(position["threshold_percent"]))
+        for index, threshold in enumerate(spread_levels):
+            if position_threshold != threshold:
+                continue
+            key = f"threshold_{index}"
+            for minutes, cutoff in cutoffs.items():
+                if position["created_at"] >= cutoff:
+                    counters[minutes][key] += 1
+    return counters
 
 
 def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
@@ -402,28 +399,13 @@ def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
             )
             rows = cursor.fetchall()
             cursor.execute(
-                "SELECT lifetime_id, source_market_id, source_pair, threshold_percent, "
-                "buy_exchange, buy_market_pair, sell_exchange, sell_market_pair, "
-                "started_at, ended_at, last_confirmed_at, duration_seconds, is_active, transfer_seconds "
-                "FROM opportunity_lifetimes "
-                "WHERE started_at >= TIMESTAMPADD(MINUTE, -1440, UTC_TIMESTAMP()) "
-                "ORDER BY source_market_id, threshold_percent, started_at, lifetime_id"
+                "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(sig.payload, '$.threshold_percent')) "
+                "AS DECIMAL(10, 4)) AS threshold_percent, settlement.created_at "
+                "FROM trader_training_settlements AS settlement "
+                "JOIN trader_signals AS sig ON sig.signal_id = settlement.signal_id "
+                "WHERE settlement.created_at >= TIMESTAMPADD(MINUTE, -1440, UTC_TIMESTAMP())"
             )
-            transfer_rows = cursor.fetchall()
-            transfer_groups = _classify_transfer_groups(transfer_rows)
-            counters: dict[int, dict[str, int]] = {}
-            for minutes in (60, 720, 1440):
-                cutoff = datetime.utcnow() - timedelta(minutes=minutes)
-                counters[minutes] = {
-                    band: sum(
-                        group["state"] == "passed"
-                        and group["started_at"] >= cutoff
-                        and group["threshold_percent"] == threshold
-                        for group in transfer_groups
-                    )
-                    for index, threshold in enumerate(CALCULATOR_SPREAD_LEVELS)
-                    for band in (f"threshold_{index}",)
-                }
+            counters = _count_trader_positions(cursor.fetchall(), CALCULATOR_SPREAD_LEVELS)
         return rows, counters
     finally:
         connection.close()
@@ -437,7 +419,7 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
             cursor.execute(
                 "SELECT lifetime_id, source_market_id, source_pair, threshold_percent, spread_percent, max_spread_percent, "
                 "buy_exchange, buy_market_pair, buy_price, sell_exchange, sell_market_pair, sell_price, "
-                "started_at, last_confirmed_at, ended_at, duration_seconds, is_active, transfer_seconds "
+                "started_at, last_confirmed_at, ended_at, duration_seconds, is_active "
                 "FROM opportunity_lifetimes WHERE is_active = %s "
                 f"AND (is_active = 0 OR buy_price {price_direction} sell_price) "
                 "ORDER BY started_at DESC, lifetime_id DESC LIMIT 500",
@@ -478,11 +460,10 @@ def _render_history(
     )
     if not history_rows:
         history_rows = '<tr><td colspan="7">История появится после первого пересчёта.</td></tr>'
-    _classify_transfer_groups(rows_lifetimes)
+    _aggregate_lifetime_groups(rows_lifetimes)
     # Одна строка соответствует одному эпизоду: котировки и время больше не смешиваются.
     lifetime_rows_list = []
     for row in rows_lifetimes:
-        transfer_state = row.get("_transfer_state", "unknown")
         threshold = _fmt(row["threshold_percent"]) + "%"
         spread_value = Decimal(str(row["spread_percent"]))
         spread = (
@@ -504,33 +485,20 @@ def _render_history(
         live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds:.3f}"' if is_active else ""
         seconds_label = f"{seconds:.1f}".rstrip("0").rstrip(".")
         duration = f'<span{live_attrs}>{seconds_label} сек.</span>'
-        episode_count = row.get("_transfer_episode_count", 1)
+        episode_count = row.get("_lifetime_episode_count", 1)
         episode_word = "эпизод" if episode_count == 1 else "эпизода" if episode_count < 5 else "эпизодов"
-        total_seconds = row.get("_transfer_total_seconds", 0)
+        total_seconds = row.get("_lifetime_total_seconds", 0)
         total_minutes = total_seconds / 60
         total_seconds_label = f"{total_seconds:.1f}".rstrip("0").rstrip(".")
-        total_duration = f"{total_seconds_label} сек. ({total_minutes:.1f} мин.)"
-        expected_seconds = row.get("_transfer_expected_seconds")
-        if transfer_state == "unknown":
-            transfer_label = "Нет данных"
-        else:
-            prefix = {
-                "passed": "Успела суммарно",
-                "failed": "Не успела суммарно",
-                "pending": "Проверяется суммарно",
-            }[transfer_state]
-            transfer_label = (
-                f"{prefix}: {total_duration} из {expected_seconds:.0f} сек. "
-                f"({episode_count} {episode_word})"
-            )
+        total_duration = f"{total_seconds_label} сек. ({total_minutes:.1f} мин.; {episode_count} {episode_word})"
         lifetime_rows_list.append(
-            f'<tr data-transfer-state="{transfer_state}">'
+            "<tr>"
             f"<td>{html.escape(str(row['source_pair']))}</td>"
             f"<td>{threshold}</td><td class=spread>{spread}</td>"
             f"<td>{_market_cell(row['buy_exchange'], row['buy_market_pair'], row['buy_price'])}</td>"
             f"<td>{_market_cell(row['sell_exchange'], row['sell_market_pair'], row['sell_price'])}</td>"
             f"<td>{started}</td><td>{state}</td><td>{duration}</td>"
-            f"<td>{transfer_label}</td></tr>"
+            f"<td>{total_duration}</td></tr>"
         )
     lifetime_rows = "".join(lifetime_rows_list)
     if not lifetime_rows:
@@ -552,14 +520,12 @@ def _render_history(
   th, td {{ padding: 11px 14px; text-align: left; border-bottom: 1px solid #26334a; white-space: nowrap; }}
   th {{ color: #9fb4d0; font-size: .82rem; text-transform: uppercase; }} .spread {{ color: #67e8a5; font-weight: 700; }}
   a.market-link {{ color: inherit; text-decoration: none; }} a.market-link:hover {{ color: #7dd3fc; text-decoration: underline; }}
-  tr[hidden] {{ display: none; }} .filters {{ margin: 0 0 14px; padding: 12px 14px; border: 1px solid #26334a; border-radius: 10px; background: #111b2e; }}
-  .filters input {{ accent-color: #38bdf8; vertical-align: middle; }} .filters label {{ cursor: pointer; }}
 </style></head><body>
 <header><h1>{page_title}</h1><div class="muted">{('Текущие подтверждённые ситуации · список обновляется автоматически' if active_view else f'Последние 500 наблюдений · данные хранятся 30 дней · обновлено {refreshed_at}')}</div>
 <nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a><a href="/trader">Трейдер</a></nav></header>
-<main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="muted counter-note">Суммируется подтверждённое время эпизодов одного маршрута с паузами до 60 секунд; паузы не учитываются.</div><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
+<main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="muted counter-note">Считаются только позиции, созданные трейдером в тренировочном режиме; период определяется временем открытия позиции.</div><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
 <tbody>{counter_rows}</tbody></table></div>
-</section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="filters"><label><input id="hide-transfer-failed" type="checkbox" checked> Скрывать возможности, которые не пережили время перевода</label></div><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность эпизода</th><th>Суммарное время для перевода</th></tr></thead>
+</section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность эпизода</th><th>Суммарное подтверждённое время</th></tr></thead>
 <tbody id="lifetimes-body">{lifetime_rows}</tbody></table></div>
 </main><script>
 function updateLiveDurations() {{
@@ -586,25 +552,8 @@ async function refreshLifetimeHistory() {{
     const updatedBody = documentCopy.getElementById('lifetimes-body');
     const currentBody = document.getElementById('lifetimes-body');
     if (updatedBody && currentBody) currentBody.replaceChildren(...updatedBody.cloneNode(true).childNodes);
-    renderTransferFilter();
   }} catch (_) {{}}
 }}
-const transferFilter = document.getElementById('hide-transfer-failed');
-if (transferFilter) {{
-  const savedTransferFilter = localStorage.getItem('hide-transfer-failed');
-  if (savedTransferFilter !== null) transferFilter.checked = savedTransferFilter === 'true';
-  transferFilter.addEventListener('change', () => {{
-    localStorage.setItem('hide-transfer-failed', String(transferFilter.checked));
-    renderTransferFilter();
-  }});
-}}
-function renderTransferFilter() {{
-  if (!transferFilter) return;
-  document.querySelectorAll('#lifetimes-body tr[data-transfer-state]').forEach(row => {{
-    row.hidden = transferFilter.checked && row.dataset.transferState === 'failed';
-  }});
-}}
-renderTransferFilter();
 setInterval(refreshLifetimeHistory, 5000);
 </script></body></html>"""
 
