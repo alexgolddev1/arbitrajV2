@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
 from config import BUY_PRICE_MUST_BE_LOWER, CALCULATOR_SPREAD_LEVELS
@@ -39,6 +39,46 @@ def _fmt_time(value: datetime | None) -> str:
         else value.astimezone(timezone.utc)
     )
     return html.escape(utc_value.astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M:%S "))
+
+
+def _spot_market_url(exchange: Any, market_pair: Any) -> str | None:
+    """Build a direct spot-trading URL for supported exchanges."""
+    pair = str(market_pair or "").strip().upper()
+    if "/" not in pair:
+        return None
+    base, quote_symbol = pair.split("/", 1)
+    if not base or not quote_symbol:
+        return None
+    safe_pair = f"{quote(base, safe='')}_{quote(quote_symbol, safe='')}"
+    exchange_name = str(exchange or "").strip().casefold()
+    if exchange_name == "mexc":
+        return f"https://www.mexc.com/exchange/{safe_pair}?_from=search_spot_trade"
+    if exchange_name == "binance":
+        return f"https://www.binance.com/ru-UA/trade/{safe_pair}?type=spot"
+    if exchange_name == "okx":
+        okx_pair = f"{quote(base.lower(), safe='')}-{quote(quote_symbol.lower(), safe='')}"
+        return f"https://www.okx.com/ru/trade-spot/{okx_pair}#workspaceId=1031710357440172032"
+    if exchange_name == "bybit":
+        return f"https://www.bybit.com/uk-UA/trade/spot/{quote(base, safe='')}/{quote(quote_symbol, safe='')}"
+    return None
+
+
+def _market_cell(exchange: Any, market_pair: Any, price: Any) -> str:
+    exchange_text = html.escape(str(exchange))
+    pair_text = html.escape(str(market_pair))
+    url = _spot_market_url(exchange, market_pair)
+    content = f"{exchange_text}<small>{pair_text} · {_fmt(price)}</small>"
+    if url is None:
+        return content
+    return f'<a class="market-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{content}</a>'
+
+
+def _market_link(exchange: Any, market_pair: Any, label: Any) -> str:
+    text = html.escape(str(label))
+    url = _spot_market_url(exchange, market_pair)
+    if url is None:
+        return text
+    return f'<a class="market-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{text}</a>'
 
 
 def _elapsed_seconds_since(value: datetime) -> int:
@@ -167,6 +207,7 @@ def _classify_transfer_groups(
                 row["_transfer_state"] = state
                 row["_transfer_total_seconds"] = total_seconds
                 row["_transfer_expected_seconds"] = expected
+                row["_transfer_episode_count"] = len(cluster)
                 row["_transfer_group_started_at"] = cluster[0]["started_at"]
     return transfer_groups
 
@@ -267,10 +308,13 @@ def _render_history(
     for row in rows_lifetimes:
         transfer_state = row.get("_transfer_state", "unknown")
         quote_key = (
-            row["source_pair"], row["buy_exchange"], row["buy_market_pair"], row["buy_price"],
-            row["sell_exchange"], row["sell_market_pair"], row["sell_price"], transfer_state,
+            row["source_market_id"], row["source_pair"], row["threshold_percent"],
+            row["buy_exchange"], row["buy_market_pair"], row["sell_exchange"],
+            row["sell_market_pair"], transfer_state, row.get("_transfer_group_started_at"),
         )
-        group = quote_groups.setdefault(quote_key, {"row": row, "episodes": {}})
+        group = quote_groups.setdefault(
+            quote_key, {"row": row, "episodes": {}, "transfer_state": transfer_state}
+        )
         episode_key = (row["threshold_percent"], row["started_at"], bool(row["is_active"]), row["ended_at"])
         existing = group["episodes"].get(episode_key)
         if existing is None:
@@ -282,7 +326,7 @@ def _render_history(
     for group in quote_groups.values():
         row = group["row"]
         episodes = list(group["episodes"].values())
-        thresholds = "<br>".join(f"{_fmt(item['threshold_percent'])}%" for item in episodes)
+        thresholds = _fmt(episodes[0]["threshold_percent"]) + "%"
         spreads = "<br>".join(
             f"+{_fmt(item['spread_percent'])}%<small>Максимум: +{_fmt(item['max_spread_percent'])}%</small>"
             for item in episodes
@@ -307,19 +351,32 @@ def _render_history(
             live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds}"' if is_active else ""
             duration_cells.append(f'<span{live_attrs}>{seconds} сек.</span>')
         durations = "<br>".join(duration_cells)
-        transfer_state = quote_key[-1]
+        buys = "<br>".join(
+            _market_cell(item["buy_exchange"], item["buy_market_pair"], item["buy_price"])
+            for item in episodes
+        )
+        sells = "<br>".join(
+            _market_cell(item["sell_exchange"], item["sell_market_pair"], item["sell_price"])
+            for item in episodes
+        )
+        transfer_state = group["transfer_state"]
+        episode_count = row.get("_transfer_episode_count", 1)
+        episode_word = "эпизод" if episode_count == 1 else "эпизода" if episode_count < 5 else "эпизодов"
+        total_seconds = row.get("_transfer_total_seconds", 0)
+        total_minutes = total_seconds / 60
+        total_duration = f"{total_seconds} сек. ({total_minutes:.1f} мин.)"
         transfer_labels = {
-            "passed": f"Успела суммарно {row['_transfer_total_seconds']} / {row['_transfer_expected_seconds']:.0f} сек.",
-            "failed": f"Не успела суммарно {row['_transfer_total_seconds']} / {row['_transfer_expected_seconds']:.0f} сек.",
-            "pending": f"Проверяется: {row['_transfer_total_seconds']} / {row['_transfer_expected_seconds']:.0f} сек.",
+            "passed": f"Успела: {total_duration} из {row['_transfer_expected_seconds']:.0f} сек. ({episode_count} {episode_word})",
+            "failed": f"Не успела: {total_duration} из {row['_transfer_expected_seconds']:.0f} сек. ({episode_count} {episode_word})",
+            "pending": f"Проверяется: {total_duration} из {row['_transfer_expected_seconds']:.0f} сек. ({episode_count} {episode_word})",
             "unknown": "Нет данных",
         }
         lifetime_rows_list.append(
             f'<tr data-transfer-state="{transfer_state}">'
             f"<td>{html.escape(str(row['source_pair']))}</td>"
             f"<td>{thresholds}</td><td>{spreads}</td>"
-            f"<td>{html.escape(str(row['buy_exchange']))}<small>{html.escape(str(row['buy_market_pair']))} · {_fmt(row['buy_price'])}</small></td>"
-            f"<td>{html.escape(str(row['sell_exchange']))}<small>{html.escape(str(row['sell_market_pair']))} · {_fmt(row['sell_price'])}</small></td>"
+            f"<td>{buys}</td>"
+            f"<td>{sells}</td>"
             f"<td>{starts}</td><td>{states}</td><td>{durations}</td>"
             f"<td>{transfer_labels[transfer_state]}</td></tr>"
         )
@@ -342,6 +399,7 @@ def _render_history(
   table {{ width: 100%; border-collapse: collapse; min-width: 760px; background: #111b2e; }}
   th, td {{ padding: 11px 14px; text-align: left; border-bottom: 1px solid #26334a; white-space: nowrap; }}
   th {{ color: #9fb4d0; font-size: .82rem; text-transform: uppercase; }} .spread {{ color: #67e8a5; font-weight: 700; }}
+  a.market-link {{ color: inherit; text-decoration: none; }} a.market-link:hover {{ color: #7dd3fc; text-decoration: underline; }}
   tr[hidden] {{ display: none; }} .filters {{ margin: 0 0 14px; padding: 12px 14px; border: 1px solid #26334a; border-radius: 10px; background: #111b2e; }}
   .filters input {{ accent-color: #38bdf8; vertical-align: middle; }} .filters label {{ cursor: pointer; }}
 </style></head><body>
@@ -349,7 +407,7 @@ def _render_history(
 <nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a></nav></header>
 <main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="muted counter-note">Суммируется подтверждённое время эпизодов одного маршрута с паузами до 60 секунд; паузы не учитываются.</div><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
 <tbody>{counter_rows}</tbody></table></div>
-</section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="filters"><label><input id="hide-transfer-failed" type="checkbox" checked> Скрывать возможности, которые не пережили время перевода</label></div><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность</th><th>Проверка времени перевода</th></tr></thead>
+</section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="filters"><label><input id="hide-transfer-failed" type="checkbox" checked> Скрывать возможности, которые не пережили время перевода</label></div><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность эпизода</th><th>Суммарное время для перевода</th></tr></thead>
 <tbody id="lifetimes-body">{lifetime_rows}</tbody></table></div>
 </main><script>
 function updateLiveDurations() {{
@@ -419,11 +477,11 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
             f'<tr data-source-id="{html.escape(str(row["source_market_id"]))}" data-band="{band}">'
             f"<td>{html.escape(str(source_pair))}<small>ID {html.escape(str(row['source_market_id']))}</small></td>"
             f"<td class=spread>+{_fmt(row['price_difference_percent'])}%</td>"
-            f"<td>{html.escape(str(row['exchange_name']))}</td>"
-            f"<td>{html.escape(str(row['venue_pair'] or '—'))}</td>"
+            f"<td>{_market_link(row['exchange_name'], row['venue_pair'], row['exchange_name'])}</td>"
+            f"<td>{_market_link(row['exchange_name'], row['venue_pair'], row['venue_pair'] or '—')}</td>"
             f"<td class=price>{_fmt(row['price'])}</td>"
-            f"<td>{html.escape(str(row['sell_exchange']))}</td>"
-            f"<td>{html.escape(str(row['sell_market_pair'] or '—'))}</td>"
+            f"<td>{_market_link(row['sell_exchange'], row['sell_market_pair'], row['sell_exchange'])}</td>"
+            f"<td>{_market_link(row['sell_exchange'], row['sell_market_pair'], row['sell_market_pair'] or '—')}</td>"
             f"<td class=price>{_fmt(row['sell_price'])}</td>"
             f'<td><span class="{freshness_class}">{freshness}</span>'
             f"<small>Последняя котировка: {_fmt_time(last_updated)}</small></td>"
