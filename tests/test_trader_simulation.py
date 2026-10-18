@@ -121,6 +121,28 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(trade._exit_trigger(Decimal("99.5"), Decimal("101"), Decimal("99.5")), "stop_loss")
         self.assertIsNone(trade._exit_trigger(Decimal("100"), Decimal("101"), Decimal("99.5")))
 
+    def test_network_check_logs_exchange_networks_and_transfer_flags(self) -> None:
+        from main.treider.network_check import _log_exchange_networks
+
+        result = {
+            "source_exchange": "binance", "destination_exchange": "mexc",
+            "networks": {
+                "binance": [{
+                    "network_code": "CHZ2", "network_name": "CHZ2",
+                    "withdraw_enabled": True, "deposit_enabled": True,
+                }],
+                "mexc": [{
+                    "network_code": "CHZ2", "network_name": "CHZ2",
+                    "withdraw_enabled": True, "deposit_enabled": True,
+                }],
+            },
+        }
+        with self.assertLogs("main.treider.network_check", level="INFO") as captured:
+            _log_exchange_networks("ACM", result)
+        output = "\n".join(captured.output)
+        self.assertIn("Сети ACM на BINANCE: CHZ2 / CHZ2", output)
+        self.assertIn("Сети ACM на MEXC: CHZ2 / CHZ2", output)
+
     def test_ethereum_and_arbitrum_are_distinct_exact_matches(self) -> None:
         self.assertEqual(exchange_networks._network_profile({"network_code": "ETH", "network_name": "Ethereum"}), "ETHEREUM")
         self.assertEqual(exchange_networks._network_profile({"network_code": "Arbitrum One", "network_name": "ARB"}), "ARBITRUM")

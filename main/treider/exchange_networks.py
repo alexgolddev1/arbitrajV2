@@ -455,6 +455,7 @@ def get_transfer_routes(
         "currency": currency.strip().upper(),
         "source_exchange": source,
         "destination_exchange": destination,
+        "networks": exchange_data["networks"],
         "routes": build_transfer_routes(
             currency, source, destination, exchange_data, configured_profile=profile
         ),

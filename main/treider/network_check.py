@@ -21,6 +21,25 @@ _cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 _cache_lock = threading.Lock()
 
 
+def _log_exchange_networks(currency: str, result: dict[str, Any]) -> None:
+    """Log normalized network names and transfer flags without dumping raw API data."""
+    networks = result.get("networks") or {}
+    exchanges = (result.get("source_exchange"), result.get("destination_exchange"))
+    for exchange in dict.fromkeys(item for item in exchanges if item):
+        records = networks.get(exchange) or []
+        if not records:
+            logger.info("Сети %s на %s: не найдены", currency, exchange.upper())
+            continue
+        rendered = "; ".join(
+            f"{item.get('network_code') or '?'} / {item.get('network_name') or '?'} "
+            f"(вывод={item.get('withdraw_enabled')}, ввод={item.get('deposit_enabled')})"
+            for item in records
+        )
+        logger.info("Сети %s на %s: %s", currency, exchange.upper(), rendered)
+    for exchange, error in (result.get("errors") or {}).items():
+        logger.warning("Ошибка получения сетей %s на %s: %s", currency, exchange.upper(), error)
+
+
 def _currency_from_pair(pair: str) -> str:
     for separator in ("/", "_", "-"):
         if separator in pair:
@@ -39,6 +58,7 @@ def _fetch_routes(currency: str, source: str, destination: str) -> dict[str, Any
             return cached[1]
 
     result = get_transfer_routes(currency, source, destination)
+    _log_exchange_networks(currency, result)
     with _cache_lock:
         _cache[key] = (time.monotonic(), result)
     return result
