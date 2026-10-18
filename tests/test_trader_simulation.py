@@ -289,6 +289,22 @@ class MarketAndRouteTests(unittest.TestCase):
 
 
 class TradeCalculationTests(unittest.TestCase):
+    def test_cheap_coin_buy_quantity_is_rounded_down_to_whole_units(self) -> None:
+        from main.treider.trade import _round_buy_quantity
+
+        self.assertEqual(
+            _round_buy_quantity(Decimal("146052.777631725000146053"), Decimal("0.000684")),
+            Decimal("146052"),
+        )
+
+    def test_expensive_coin_buy_keeps_eight_fractional_places(self) -> None:
+        from main.treider.trade import _round_buy_quantity
+
+        self.assertEqual(
+            _round_buy_quantity(Decimal("0.123456789123"), Decimal("65000")),
+            Decimal("0.12345678"),
+        )
+
     @patch("main.treider.trade.fetch_market_sell_execution")
     @patch("main.treider.trade.PRICE_MOVE_RESERVE_PERCENT", Decimal("1"))
     @patch("main.treider.trade.MIN_NET_PROFIT_USDT", Decimal("0"))

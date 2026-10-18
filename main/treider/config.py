@@ -43,6 +43,11 @@ except InvalidOperation as error:
 if not INITIAL_BALANCE_USD.is_finite() or INITIAL_BALANCE_USD < 0:
     raise ValueError("TRADER_INITIAL_BALANCE_USD должен быть конечным неотрицательным числом")
 
+# Для дешёвых активов покупаем целое число монет; для дорогих оставляем до 8 знаков.
+# Цена пары котируется в USDT, поэтому порог применяется к цене одной монеты в USDT.
+INTEGER_QUANTITY_PRICE_THRESHOLD_USD = Decimal("1")
+FRACTIONAL_QUANTITY_DECIMAL_PLACES = 8
+
 
 def _decimal_setting(name: str, default: str) -> Decimal:
     try:

@@ -8,12 +8,14 @@ import uuid
 import requests
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from database import connect_db
 from main.treider.config import (
     BUY_FEE_CURRENCY,
+    FRACTIONAL_QUANTITY_DECIMAL_PLACES,
+    INTEGER_QUANTITY_PRICE_THRESHOLD_USD,
     MIN_NET_PROFIT_USDT,
     PRICE_MOVE_RESERVE_PERCENT,
     SETTLEMENT_MAX_WAIT_SECONDS,
@@ -76,6 +78,16 @@ def _quote_currency(pair: str) -> str:
     raise ValueError(f"Не удалось определить котируемую валюту в паре {pair!r}")
 
 
+def _round_buy_quantity(quantity: Decimal, unit_price: Decimal) -> Decimal:
+    """Round simulated buy size down: whole cheap coins, 8 decimals for pricier coins."""
+    decimals = (
+        0 if unit_price < INTEGER_QUANTITY_PRICE_THRESHOLD_USD
+        else FRACTIONAL_QUANTITY_DECIMAL_PLACES
+    )
+    step = Decimal(1).scaleb(-decimals)
+    return (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
 def _estimate_trade(
     buy: SpotBookTicker,
     sell: SpotBookTicker,
@@ -104,7 +116,7 @@ def _estimate_trade(
     quote_transfer_fee = transfer_fee if transfer_fee_currency == quote else Decimal(0)
     affordable_balance = max(Decimal(0), balance_usd - quote_transfer_fee)
     affordable_quantity = affordable_balance / (buy.ask * buy_factor)
-    quantity = min(affordable_quantity, buy.ask_size)
+    quantity = _round_buy_quantity(min(affordable_quantity, buy.ask_size), buy.ask)
     if quantity <= 0:
         raise ValueError("Недостаточный баланс или нулевой доступный объём стакана")
 
