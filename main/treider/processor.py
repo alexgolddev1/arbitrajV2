@@ -58,10 +58,12 @@ def process_opportunity(payload: dict[str, Any], signal_id: int) -> tuple[str, s
 
     logger.info(
         "Маршрут перевода найден: %s → %s, сеть=%s, оценка=%.1f сек., "
-        "статус маршрута=%s, допущение по биржам: вывод=%s, ввод=%s; %s",
+        "статус маршрута=%s, комиссия вывода=%s %s, допущение по биржам: вывод=%s, ввод=%s; %s",
         transfer["source_exchange"], transfer["destination_exchange"],
         transfer["network"], transfer["estimated_seconds"],
-        transfer.get("route_status"), transfer["assumed_source"], transfer["assumed_destination"], context,
+        transfer.get("route_status"), transfer.get("withdraw_fee"),
+        transfer.get("withdraw_fee_currency") or transfer.get("currency"),
+        transfer["assumed_source"], transfer["assumed_destination"], context,
     )
 
     # Персональные ставки аккаунта — отдельно от комиссии вывода по выбранной сети.

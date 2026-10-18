@@ -353,7 +353,6 @@ def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
             transfer_rows = cursor.fetchall()
             transfer_groups = _classify_transfer_groups(transfer_rows)
             counters: dict[int, dict[str, int]] = {}
-            low, middle, high = CALCULATOR_SPREAD_LEVELS
             for minutes in (60, 720, 1440):
                 cutoff = datetime.utcnow() - timedelta(minutes=minutes)
                 counters[minutes] = {
@@ -363,9 +362,8 @@ def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
                         and group["threshold_percent"] == threshold
                         for group in transfer_groups
                     )
-                    for band, threshold in (
-                        ("low_band", low), ("middle_band", middle), ("high_band", high)
-                    )
+                    for index, threshold in enumerate(CALCULATOR_SPREAD_LEVELS)
+                    for band in (f"threshold_{index}",)
                 }
         return rows, counters
     finally:
@@ -397,15 +395,13 @@ def _render_history(
     rows_lifetimes: list[dict[str, Any]],
     active_view: bool = False,
 ) -> str:
-    low, middle, high = CALCULATOR_SPREAD_LEVELS
-    bands = (
-        ("low_band", f"от {_fmt(low)}%"),
-        ("middle_band", f"от {_fmt(middle)}%"),
-        ("high_band", f"от {_fmt(high)}%"),
+    bands = tuple(
+        (f"threshold_{index}", f"от {_fmt(threshold)}%")
+        for index, threshold in enumerate(CALCULATOR_SPREAD_LEVELS)
     )
     counter_rows = "".join(
         "<tr><td>" + label + "</td>"
-        + "".join(f"<td>{counters[minutes][key]}</td>" for minutes in (60, 720, 1440))
+        + "".join(f"<td>{counters.get(minutes, {}).get(key, 0)}</td>" for minutes in (60, 720, 1440))
         + "</tr>"
         for key, label in bands
     )
@@ -563,9 +559,12 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
         freshness_class = "fresh" if is_fresh else "stale"
         source_pair = row["source_pair"] or f'{row["base_symbol"]}/{row["source_quote"]}'
         spread = Decimal(str(row["price_difference_percent"]))
-        band = "low" if spread < CALCULATOR_SPREAD_LEVELS[1] else (
-            "medium" if spread < CALCULATOR_SPREAD_LEVELS[2] else "high"
-        )
+        band_index = 0
+        for index, threshold in enumerate(CALCULATOR_SPREAD_LEVELS[1:], start=1):
+            if spread < threshold:
+                break
+            band_index = index
+        band = f"band-{band_index}"
         elapsed_seconds = _elapsed_seconds_since(row["started_at"])
         table_rows.append(
             f'<tr data-source-id="{html.escape(str(row["source_market_id"]))}" data-band="{band}">'
@@ -584,12 +583,20 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
             "</tr>"
         )
 
+    filter_labels = []
+    for index, threshold in enumerate(CALCULATOR_SPREAD_LEVELS):
+        label = (
+            f"{_fmt(threshold)}–{_fmt(CALCULATOR_SPREAD_LEVELS[index + 1])}%"
+            if index + 1 < len(CALCULATOR_SPREAD_LEVELS)
+            else f"от {_fmt(threshold)}%"
+        )
+        filter_labels.append(
+            f'<label><input type="checkbox" data-band-filter="band-{index}" checked> {label}</label>'
+        )
     filter_controls = (
-        f'<section class="filters"><strong>Показывать спред:</strong>'
-        f'<label><input type="checkbox" data-band-filter="low" checked> {_fmt(CALCULATOR_SPREAD_LEVELS[0])}–{_fmt(CALCULATOR_SPREAD_LEVELS[1])}%</label>'
-        f'<label><input type="checkbox" data-band-filter="medium" checked> {_fmt(CALCULATOR_SPREAD_LEVELS[1])}–{_fmt(CALCULATOR_SPREAD_LEVELS[2])}%</label>'
-        f'<label><input type="checkbox" data-band-filter="high" checked> от {_fmt(CALCULATOR_SPREAD_LEVELS[2])}%</label>'
-        '</section>'
+        '<section class="filters"><strong>Показывать спред:</strong>'
+        + "".join(filter_labels)
+        + "</section>"
     )
     if not table_rows:
         body = '<div class="empty">Пока нет возможностей, подтверждённых WebSocket-стаканами.</div>'
@@ -744,7 +751,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path in ("/api/history-lifetimes", "/api/active-situations"):
             try:
                 active_view = path == "/api/active-situations"
-                empty_counters = {minutes: {"low_band": 0, "middle_band": 0, "high_band": 0} for minutes in (60, 720, 1440)}
+                empty_counters = {minutes: {} for minutes in (60, 720, 1440)}
                 body = _render_history([], empty_counters, _load_lifetimes(active_view), active_view).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -760,7 +767,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 active_view = path == "/situations"
                 if active_view:
-                    rows, counters = [], {minutes: {"low_band": 0, "middle_band": 0, "high_band": 0} for minutes in (60, 720, 1440)}
+                    rows, counters = [], {minutes: {} for minutes in (60, 720, 1440)}
                 else:
                     rows, counters = _load_history()
                 rows_lifetimes = _load_lifetimes(active_view)

@@ -46,15 +46,16 @@ CALCULATOR_DIRECTION = os.getenv("CALCULATOR_DIRECTION", "desc")
 CALCULATOR_SPOT_UNTRACKED = os.getenv("CALCULATOR_SPOT_UNTRACKED", "true")
 CALCULATOR_SPREAD_LEVELS = tuple(
     Decimal(level.strip())
-    for level in os.getenv("CALCULATOR_SPREAD_LEVELS", "0.5,1,1.5").split(",")
+    for level in os.getenv("CALCULATOR_SPREAD_LEVELS", "1,1.5").split(",")
     if level.strip()
 )
 if (
-    len(CALCULATOR_SPREAD_LEVELS) != 3
-    or tuple(sorted(set(CALCULATOR_SPREAD_LEVELS))) != CALCULATOR_SPREAD_LEVELS
+    len(CALCULATOR_SPREAD_LEVELS) < 2
+    or any(not level.is_finite() or level <= 0 for level in CALCULATOR_SPREAD_LEVELS)
+    or any(left >= right for left, right in zip(CALCULATOR_SPREAD_LEVELS, CALCULATOR_SPREAD_LEVELS[1:]))
 ):
     raise ValueError(
-        "CALCULATOR_SPREAD_LEVELS должен содержать три возрастающих значения, например 0.5,1,1.5"
+        "CALCULATOR_SPREAD_LEVELS должен содержать минимум два положительных возрастающих значения, например 1,1.5"
     )
 CALCULATOR_MIN_SPREAD_PERCENT = CALCULATOR_SPREAD_LEVELS[0]
 CALCULATOR_REQUEST_DELAY_SECONDS = float(

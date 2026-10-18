@@ -213,8 +213,37 @@ def _prepare_training_trade(
             available = max(Decimal(0), balance - legacy_reserved)
             estimate = _estimate_trade(buy, sell, buy_fees, sell_fees, available, transfer)
             if estimate.expected_profit_after_reserve_usd < MIN_NET_PROFIT_USDT:
+                logger.info(
+                    "Тренировочная сделка невыгодна после полного расчёта: прибыль до резерва=%s USDT, "
+                    "резерв цены=%s USDT, прибыль после резерва=%s USDT, минимум=%s USDT, "
+                    "не хватает=%s USDT; объём покупки=%s по ask=%s, выручка продажи=%s "
+                    "по средней цене=%s, комиссия покупки=%s (ставка=%s, валюта=%s), "
+                    "комиссия продажи=%s (ставка=%s), комиссия перевода=%s %s (в USDT учтено %s); сигнал=%s, пара=%s",
+                    estimate.expected_profit_before_reserve_usd,
+                    estimate.price_reserve_usd,
+                    estimate.expected_profit_after_reserve_usd,
+                    MIN_NET_PROFIT_USDT,
+                    estimate.shortfall_usd,
+                    estimate.quantity,
+                    buy.ask,
+                    estimate.expected_sell_proceeds_usd,
+                    estimate.expected_sell_average_price,
+                    estimate.buy_fee_usd,
+                    buy_fees.taker_for("buy"),
+                    BUY_FEE_CURRENCY[buy.exchange],
+                    estimate.expected_sell_fee_usd,
+                    sell_fees.taker_for("sell"),
+                    estimate.transfer_fee_amount,
+                    estimate.transfer_fee_currency,
+                    estimate.transfer_fee_usd,
+                    signal_id,
+                    signal["source_pair"],
+                )
                 connection.commit()
-                return estimate, "ожидаемая прибыль после резерва ниже настроенного минимума"
+                return estimate, (
+                    "ожидаемая прибыль после резерва ниже настроенного минимума: "
+                    f"{estimate.expected_profit_after_reserve_usd} USDT; минимум {MIN_NET_PROFIT_USDT} USDT"
+                )
             started_raw = signal.get("opportunity_started_at_utc")
             if started_raw:
                 started_at = datetime.fromisoformat(str(started_raw).replace("Z", "+00:00"))
