@@ -146,6 +146,7 @@ def initialize_database(connection: MySQLConnection) -> None:
                 "lease_token": "CHAR(36) NULL", "lease_version": "BIGINT UNSIGNED NOT NULL DEFAULT 0",
             },
             "trader_training_settlements": {
+                "stop_loss_price": "DECIMAL(38, 18) NULL",
                 "route_status": "VARCHAR(24) NOT NULL DEFAULT 'legacy'", "route_assumptions": "JSON NULL",
                 "network_name": "VARCHAR(64) NULL", "transfer_seconds": "DECIMAL(12, 3) NULL",
                 "buy_fee_source": "VARCHAR(16) NOT NULL DEFAULT 'legacy'",

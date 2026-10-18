@@ -116,9 +116,10 @@ def fetch_spot_book(exchange: str, market_pair: str) -> SpotBookTicker:
 
 
 def fetch_market_sell_execution(
-    exchange: str, market_pair: str, quantity: Decimal
+    exchange: str, market_pair: str, quantity: Decimal,
+    *, minimum_price: Decimal | None = None,
 ) -> SpotMarketSell:
-    """Simulate a market sell by consuming descending spot bid levels."""
+    """Simulate a sell using bid depth, optionally filling only at a limit price or better."""
     exchange_slug = exchange.strip().lower()
     base, quote = _pair_parts(market_pair)
     symbol = f"{base}{quote}"
@@ -157,19 +158,33 @@ def fetch_market_sell_execution(
     else:
         raise ValueError(f"Биржа {exchange!r} не поддерживается для рыночной продажи")
 
-    return simulate_market_sell(exchange_slug, market_pair, quantity, bids)
+    return simulate_market_sell(
+        exchange_slug, market_pair, quantity, bids, minimum_price=minimum_price
+    )
+
+
+def fetch_limit_sell_execution(
+    exchange: str, market_pair: str, quantity: Decimal, limit_price: Decimal
+) -> SpotMarketSell:
+    """Simulate a take-profit limit sell; bids below its limit cannot fill it."""
+    return fetch_market_sell_execution(
+        exchange, market_pair, quantity, minimum_price=limit_price
+    )
 
 
 def simulate_market_sell(
-    exchange: str, market_pair: str, quantity: Decimal, bids: list[list[Any]]
+    exchange: str, market_pair: str, quantity: Decimal, bids: list[list[Any]],
+    *, minimum_price: Decimal | None = None,
 ) -> SpotMarketSell:
-    """Consume bid depth once and preserve any unfilled remainder."""
+    """Consume eligible bid depth once and preserve any unfilled remainder."""
     if not quantity.is_finite() or quantity <= 0:
         raise ValueError(f"Объём рыночной продажи должен быть положительным: {quantity}")
     remaining = quantity
     proceeds = Decimal(0)
     best_bid = Decimal(0)
     levels_used = 0
+    if minimum_price is not None and (not minimum_price.is_finite() or minimum_price <= 0):
+        raise ValueError(f"Цена лимитной продажи должна быть положительной: {minimum_price}")
     for level in bids:
         if len(level) < 2:
             continue
@@ -177,6 +192,8 @@ def simulate_market_sell(
         size = _decimal(level[1], "bid_size")
         if not best_bid:
             best_bid = price
+        if minimum_price is not None and price < minimum_price:
+            continue
         filled = min(remaining, size)
         proceeds += filled * price
         remaining -= filled

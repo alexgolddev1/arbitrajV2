@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS trader_training_settlements (
     quantity DECIMAL(38, 18) NOT NULL,
     buy_price DECIMAL(38, 18) NOT NULL,
     expected_sell_price DECIMAL(38, 18) NOT NULL,
+    stop_loss_price DECIMAL(38, 18) NULL,
     final_sell_price DECIMAL(38, 18) NULL,
     buy_taker_fee_rate DECIMAL(20, 12) NOT NULL,
     expected_sell_taker_fee_rate DECIMAL(20, 12) NOT NULL,

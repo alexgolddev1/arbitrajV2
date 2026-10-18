@@ -157,7 +157,7 @@ def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], lis
             stats = cursor.fetchone() or {}
             cursor.execute(
                 "SELECT settlement_id, source_pair, buy_exchange, buy_market_pair, buy_price, "
-                "sell_exchange, sell_market_pair, expected_sell_price, final_sell_price, quantity, "
+                "sell_exchange, sell_market_pair, expected_sell_price, stop_loss_price, final_sell_price, quantity, "
                 "buy_cost_usd, realized_sell_proceeds_usd, buy_fee_usd, sell_fee_usd, "
                 "expected_profit_usd, realized_profit_usd, status, created_at, settle_after_utc, settled_at, "
                 "planned_sell_at, actual_sell_at, "
@@ -197,6 +197,7 @@ def _render_trader_page(
             f"<td>{html.escape(str(trade['source_pair']))}</td>"
             f"<td>{_market_cell(trade['buy_exchange'], trade['buy_market_pair'], trade['buy_price'])}</td>"
             f"<td>{_market_cell(trade['sell_exchange'], trade['sell_market_pair'], sale_price)}</td>"
+            f"<td>TP {_fmt(trade['expected_sell_price'])}<small>SL {_fmt(trade['stop_loss_price'])}</small></td>"
             f"<td>{_fmt(trade['quantity'])}</td>"
             f"<td>{_fmt(trade['buy_cost_usd'])}</td>"
             f"<td>{_fmt(trade['realized_sell_proceeds_usd'] if realized else None)}</td>"
@@ -215,7 +216,7 @@ def _render_trader_page(
             "</tr>"
         )
     if not trade_rows:
-        trade_rows.append('<tr><td colspan="12">Трейдер ещё не входил в сделки.</td></tr>')
+        trade_rows.append('<tr><td colspan="13">Трейдер ещё не входил в сделки.</td></tr>')
 
     balance = _fmt(account["balance_usd"]) if account else "—"
     mode = "Тренировка" if account and account["training_mode"] else "Рабочий режим"
@@ -249,7 +250,7 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 <div class="card"><span>Реализованный результат</span><strong class="{'positive' if Decimal(str(stats.get('net_profit') or 0)) >= 0 else 'negative'}">{_fmt(stats.get('net_profit') or 0)} USD</strong></div>
 <div class="card"><span>Уплаченные комиссии</span><strong>{_fmt(stats.get('total_fees') or 0)} USD</strong></div>
 </section><h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
-<th>Пара</th><th>Купил</th><th>Продал / цена оценки</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
+<th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
 </tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div></main></body></html>"""
 
 

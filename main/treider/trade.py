@@ -19,6 +19,7 @@ from main.treider.config import (
     SETTLEMENT_MAX_WAIT_SECONDS,
     SETTLEMENT_RETRY_SECONDS,
     SIGNAL_MAX_AGE_SECONDS,
+    STOP_LOSS_PERCENT,
     TRAINING_MODE,
 )
 from main.treider.fees import TradeFeeRates, get_trade_fee_rates
@@ -27,10 +28,25 @@ from main.treider.market_data import (
     SpotBookTicker,
     fetch_market_sell_execution,
     fetch_spot_book,
+    fetch_limit_sell_execution,
 )
 from main.treider.config import TRANSFER_FEE_AMOUNT
 
 logger = logging.getLogger(__name__)
+
+
+def calculate_stop_loss_price(entry_price: Decimal, stop_loss_percent: Decimal = STOP_LOSS_PERCENT) -> Decimal:
+    if entry_price <= 0 or stop_loss_percent < 0 or stop_loss_percent >= 100:
+        raise ValueError("Некорректная цена входа или процент стоп-лосса")
+    return entry_price * (Decimal(1) - stop_loss_percent / Decimal(100))
+
+
+def _exit_trigger(best_bid: Decimal, take_profit_price: Decimal, stop_loss_price: Decimal) -> str | None:
+    if best_bid >= take_profit_price:
+        return "take_profit"
+    if best_bid <= stop_loss_price:
+        return "stop_loss"
+    return None
 
 
 @dataclass(frozen=True)
@@ -217,15 +233,19 @@ def _prepare_training_trade(
                 connection.commit()
                 return estimate, "недостаточно данных: неизвестна комиссия перевода"
             buy_debit = estimate.buy_cost_usd + estimate.buy_fee_usd + estimate.transfer_fee_usd
+            take_profit_price = Decimal(str(signal["sell"]["price"]))
+            stop_loss_price = calculate_stop_loss_price(buy.ask)
             assumptions = dict(transfer or {})
             assumptions["buy_fee_source"] = buy_fees.source
             assumptions["sell_fee_source"] = sell_fees.source
             assumptions["buy_fee_currency_model"] = BUY_FEE_CURRENCY[buy.exchange]
             assumptions["purchase_model"] = "marketable-limit-at-best-ask; capped-by-visible-best-ask-size"
+            assumptions["take_profit_source"] = "signal.sell.price"
+            assumptions["stop_loss_percent"] = str(STOP_LOSS_PERCENT)
             cursor.execute(
                 "INSERT INTO trader_training_settlements ("
                 "signal_id, source_pair, buy_exchange, buy_market_pair, sell_exchange, sell_market_pair, "
-                "quantity, buy_price, expected_sell_price, buy_taker_fee_rate, expected_sell_taker_fee_rate, "
+                "quantity, buy_price, expected_sell_price, stop_loss_price, buy_taker_fee_rate, expected_sell_taker_fee_rate, "
                 "buy_cost_usd, buy_fee_usd, expected_sell_fee_usd, expected_profit_usd, "
                 "balance_before_usd, settle_after_utc, status, route_status, route_assumptions, network_name, "
                 "transfer_seconds, buy_fee_source, sell_fee_source, buy_fee_currency, buy_fee_base_quantity, "
@@ -233,12 +253,12 @@ def _prepare_training_trade(
                 "expected_sell_proceeds_usd, expected_profit_before_reserve_usd, price_reserve_usd, "
                 "expected_profit_after_reserve_usd, buy_debit_usd, purchase_model, position_status, "
                 "planned_sell_at, retry_started_at"
-                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', "
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', "
                 "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
                 "'marketable-limit-at-best-ask', 'pending_transfer', %s, NULL)",
                 (
                     signal_id, signal["source_pair"], buy.exchange, buy.market_pair,
-                    sell.exchange, sell.market_pair, estimate.quantity, buy.ask, estimate.expected_sell_average_price,
+                    sell.exchange, sell.market_pair, estimate.quantity, buy.ask, take_profit_price, stop_loss_price,
                     buy_fees.taker_for("buy"), sell_fees.taker_for("sell"), estimate.buy_cost_usd,
                     estimate.buy_fee_usd, estimate.expected_sell_fee_usd,
                     estimate.expected_profit_before_reserve_usd, balance, settle_at,
@@ -334,8 +354,33 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
     try:
         quantity = Decimal(str(trade.get("remaining_quantity") or trade["quantity"]))
         sell_fees = get_trade_fee_rates(trade["sell_exchange"], trade["sell_market_pair"])
-        execution = fetch_market_sell_execution(
-            trade["sell_exchange"], trade["sell_market_pair"], quantity
+        current_sell_book = fetch_spot_book(trade["sell_exchange"], trade["sell_market_pair"])
+        take_profit_price = Decimal(str(trade["expected_sell_price"]))
+        stop_loss_price = Decimal(str(
+            trade.get("stop_loss_price")
+            or calculate_stop_loss_price(Decimal(str(trade["buy_price"])))
+        ))
+        trigger = _exit_trigger(current_sell_book.bid, take_profit_price, stop_loss_price)
+        if trigger is None:
+            _retry_settlement(
+                trade_id,
+                f"тейк-профит не достигнут и стоп-лосс не сработал: bid={current_sell_book.bid}, "
+                f"тейк-профит={take_profit_price}, стоп-лосс={stop_loss_price}",
+                trade.get("claim_token"),
+            )
+            logger.info(
+                "Тренировочная позиция остаётся открытой: bid=%s; TP=%s; SL=%s; повторная проверка через %s сек.; %s",
+                current_sell_book.bid, take_profit_price, stop_loss_price, SETTLEMENT_RETRY_SECONDS, context,
+            )
+            return
+        execution = (
+            fetch_limit_sell_execution(
+                trade["sell_exchange"], trade["sell_market_pair"], quantity, take_profit_price
+            )
+            if trigger == "take_profit"
+            else fetch_market_sell_execution(
+                trade["sell_exchange"], trade["sell_market_pair"], quantity
+            )
         )
         if execution.filled_quantity <= 0:
             raise InsufficientLiquidity("Недостаточно bid-ликвидности: стакан не исполнил ни одной части объёма")
@@ -434,17 +479,17 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
 
     if realized_profit > 0:
         logger.info(
-            "Тренировочная рыночная продажа после сети: лучший bid=%s, средняя цена исполнения=%s, "
+            "Тренировочная продажа (%s) после сети: лучший bid=%s, средняя цена исполнения=%s, "
             "уровней стакана=%s, исполнено=%s, остаток=%s, накопленный результат=%s USD, баланс=%s → %s USDT; %s",
-            execution.best_bid, execution.average_price, execution.levels_used,
+            trigger, execution.best_bid, execution.average_price, execution.levels_used,
             execution.filled_quantity, execution.remaining_quantity,
             realized_profit, balance_before, balance_after, context,
         )
     else:
         logger.warning(
-            "После ожидания сети продажа убыточна или частична: лучший bid=%s, средняя цена исполнения=%s, "
+            "После ожидания сети сработал выход (%s), продажа убыточна или частична: лучший bid=%s, средняя цена исполнения=%s, "
             "уровней стакана=%s, исполнено=%s, остаток=%s, результат=%s USDT, баланс=%s → %s USDT; %s",
-            execution.best_bid, execution.average_price, execution.levels_used,
+            trigger, execution.best_bid, execution.average_price, execution.levels_used,
             execution.filled_quantity, execution.remaining_quantity, realized_profit,
             balance_before, balance_after, context,
         )
@@ -535,9 +580,10 @@ def process_trade(
         return "rejected", "рабочий режим не реализован"
 
     logger.info(
-        "Виртуальная покупка зафиксирована по ask=%s, объём=%s; прибыль до резерва=%s USDT. "
+        "Виртуальная покупка зафиксирована по ask=%s, объём=%s; TP=%s из JSON sell.price, SL=%s; прибыль до резерва=%s USDT. "
         "Стоимость покупки зарезервирована из доступного баланса; ожидаем сеть %.1f сек., затем повторно проверим стакан продажи; %s",
         buy_book.ask, estimate.quantity,
+        signal["sell"]["price"], calculate_stop_loss_price(buy_book.ask),
         estimate.expected_profit_before_reserve_usd,
         max(0.0, delay_seconds), context,
     )

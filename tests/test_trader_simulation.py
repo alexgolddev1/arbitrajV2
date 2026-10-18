@@ -102,6 +102,25 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(partial.remaining_quantity, Decimal("2"))
         self.assertEqual(partial.proceeds, Decimal("47"))
 
+    def test_take_profit_limit_ignores_bids_below_limit(self) -> None:
+        result = market_data.simulate_market_sell(
+            "mexc", "ABC/USDT", Decimal("4"),
+            [["12", "1"], ["11", "1"], ["9", "5"]],
+            minimum_price=Decimal("10"),
+        )
+        self.assertEqual(result.filled_quantity, Decimal("2"))
+        self.assertEqual(result.remaining_quantity, Decimal("2"))
+        self.assertEqual(result.proceeds, Decimal("23"))
+        self.assertEqual(result.best_bid, Decimal("12"))
+
+    def test_stop_loss_and_take_profit_levels(self) -> None:
+        from main.treider import trade
+
+        self.assertEqual(trade.calculate_stop_loss_price(Decimal("100"), Decimal("0.5")), Decimal("99.500"))
+        self.assertEqual(trade._exit_trigger(Decimal("101"), Decimal("101"), Decimal("99.5")), "take_profit")
+        self.assertEqual(trade._exit_trigger(Decimal("99.5"), Decimal("101"), Decimal("99.5")), "stop_loss")
+        self.assertIsNone(trade._exit_trigger(Decimal("100"), Decimal("101"), Decimal("99.5")))
+
     def test_ethereum_and_arbitrum_are_distinct_exact_matches(self) -> None:
         self.assertEqual(exchange_networks._network_profile({"network_code": "ETH", "network_name": "Ethereum"}), "ETHEREUM")
         self.assertEqual(exchange_networks._network_profile({"network_code": "Arbitrum One", "network_name": "ARB"}), "ARBITRUM")
@@ -307,8 +326,9 @@ class TradeCalculationTests(unittest.TestCase):
     @patch("main.treider.trade.get_trade_fee_rates")
     @patch("main.treider.trade.fetch_market_sell_execution")
     @patch("main.treider.trade.connect_db")
+    @patch("main.treider.trade.fetch_spot_book")
     def test_partial_sell_credits_only_filled_part_and_preserves_remainder(
-        self, connect: Mock, sell_execution: Mock, fee_rates: Mock,
+        self, spot_book: Mock, connect: Mock, sell_execution: Mock, fee_rates: Mock,
     ) -> None:
         from main.treider import trade
 
@@ -332,6 +352,7 @@ class TradeCalculationTests(unittest.TestCase):
             proceeds=Decimal("20"), filled_quantity=Decimal("2"), remaining_quantity=Decimal("1"),
             average_price=Decimal("10"), best_bid=Decimal("10"), levels_used=1,
         )
+        spot_book.return_value = SimpleNamespace(bid=Decimal("10"))
         fee_rates.return_value = fees.TradeFeeRates(
             "mexc", "ABCUSDT", Decimal(0), Decimal("0.001"), "now",
             sell_taker_rate=Decimal("0.001"),
@@ -340,6 +361,7 @@ class TradeCalculationTests(unittest.TestCase):
             "settlement_id": 2, "signal_id": 17, "source_pair": "ABC/USDT",
             "buy_exchange": "binance", "buy_market_pair": "ABC/USDT", "buy_price": Decimal("10"),
             "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT", "quantity": Decimal("3"),
+            "expected_sell_price": Decimal("11"), "stop_loss_price": Decimal("10.5"),
             "remaining_quantity": Decimal("3"), "claim_token": "lease", "settle_after_utc": None,
         })
         updates = [call for call in cursor.execute.call_args_list if "UPDATE trader_training_settlements SET status" in call.args[0]]
