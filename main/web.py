@@ -134,6 +134,104 @@ def _load_worker_status() -> dict[str, str]:
         connection.close()
 
 
+def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], list[dict[str, Any]]]:
+    connection = connect_db()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT balance_usd, training_mode, created_at, updated_at "
+                "FROM trader_account WHERE account_id = 1"
+            )
+            account = cursor.fetchone()
+            cursor.execute(
+                "SELECT COUNT(*) AS total_count, "
+                "SUM(status = 'settled') AS settled_count, "
+                "SUM(status IN ('pending', 'settling')) AS pending_count, "
+                "COALESCE(SUM(CASE WHEN status = 'settled' THEN realized_profit_usd ELSE 0 END), 0) AS net_profit, "
+                "COALESCE(SUM(CASE WHEN status = 'settled' THEN buy_fee_usd + COALESCE(sell_fee_usd, 0) ELSE 0 END), 0) AS total_fees "
+                "FROM trader_training_settlements"
+            )
+            stats = cursor.fetchone() or {}
+            cursor.execute(
+                "SELECT settlement_id, source_pair, buy_exchange, buy_market_pair, buy_price, "
+                "sell_exchange, sell_market_pair, expected_sell_price, final_sell_price, quantity, "
+                "buy_cost_usd, realized_sell_proceeds_usd, buy_fee_usd, sell_fee_usd, "
+                "expected_profit_usd, realized_profit_usd, status, created_at, settle_after_utc, settled_at "
+                "FROM trader_training_settlements ORDER BY created_at DESC, settlement_id DESC LIMIT 500"
+            )
+            trades = cursor.fetchall()
+        return account, stats, trades
+    finally:
+        connection.close()
+
+
+def _render_trader_page(
+    account: dict[str, Any] | None, stats: dict[str, Any], trades: list[dict[str, Any]]
+) -> str:
+    trade_rows = []
+    status_labels = {
+        "pending": "Ожидает перевода",
+        "settling": "Проверяется продажа",
+        "settled": "Завершена",
+    }
+    for trade in trades:
+        settled = trade["status"] == "settled"
+        profit = trade["realized_profit_usd"] if settled else trade["expected_profit_usd"]
+        profit_class = "positive" if profit is not None and Decimal(str(profit)) >= 0 else "negative"
+        sale_price = trade["final_sell_price"] if settled else trade["expected_sell_price"]
+        trade_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(trade['source_pair']))}</td>"
+            f"<td>{_market_cell(trade['buy_exchange'], trade['buy_market_pair'], trade['buy_price'])}</td>"
+            f"<td>{_market_cell(trade['sell_exchange'], trade['sell_market_pair'], sale_price)}</td>"
+            f"<td>{_fmt(trade['quantity'])}</td>"
+            f"<td>{_fmt(trade['buy_cost_usd'])}</td>"
+            f"<td>{_fmt(trade['realized_sell_proceeds_usd'] if settled else None)}</td>"
+            f"<td>{_fmt(trade['buy_fee_usd'])} + {_fmt(trade['sell_fee_usd'] if settled else None)}</td>"
+            f'<td class="{profit_class}">{_fmt(profit)} USD'
+            f'{"<small>ожидаемая</small>" if not settled else ""}</td>'
+            f"<td><span class=\"status status-{html.escape(str(trade['status']))}\">"
+            f"{status_labels.get(trade['status'], html.escape(str(trade['status'])))}</span></td>"
+            f"<td>{_fmt_time(trade['created_at'])}"
+            f"<small>{'Завершена: ' + _fmt_time(trade['settled_at']) if settled else 'Расчёт после: ' + _fmt_time(trade['settle_after_utc'])}</small></td>"
+            "</tr>"
+        )
+    if not trade_rows:
+        trade_rows.append('<tr><td colspan="10">Трейдер ещё не входил в сделки.</td></tr>')
+
+    balance = _fmt(account["balance_usd"]) if account else "—"
+    mode = "Тренировка" if account and account["training_mode"] else "Рабочий режим"
+    last_update = _fmt_time(account["updated_at"]) if account else "Счёт ещё не создан"
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30"><title>Трейдер</title>
+<style>
+:root {{ color-scheme: dark; font-family: system-ui, sans-serif; background:#0b1220; color:#e5e7eb; }}
+body {{ margin:0; }} header {{ padding:24px 4vw; background:#111b2e; border-bottom:1px solid #26334a; }}
+main {{ padding:24px 4vw; }} h1 {{ margin:0 0 8px; }} nav {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }}
+nav a {{ padding:8px 12px; border:1px solid #334155; border-radius:8px; color:#7dd3fc; text-decoration:none; }} nav a.active {{ background:#1e3a5f; }}
+.muted, small {{ color:#9ca3af; }} small {{ display:block; margin-top:4px; }}
+.cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:24px; }}
+.card {{ padding:16px; border:1px solid #26334a; border-radius:10px; background:#111b2e; }} .card span {{ display:block; color:#9ca3af; font-size:.85rem; }} .card strong {{ display:block; margin-top:8px; font-size:1.3rem; }}
+.table-wrap {{ overflow-x:auto; border:1px solid #26334a; border-radius:10px; }} table {{ width:100%; min-width:1200px; border-collapse:collapse; background:#111b2e; }}
+th,td {{ padding:11px 13px; text-align:left; border-bottom:1px solid #26334a; white-space:nowrap; }} th {{ color:#9fb4d0; font-size:.8rem; text-transform:uppercase; }}
+.positive {{ color:#67e8a5; font-weight:700; }} .negative {{ color:#f87171; font-weight:700; }} .status {{ color:#fbbf24; }} .status-settled {{ color:#67e8a5; }}
+a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ color:#7dd3fc; text-decoration:underline; }}
+</style></head><body>
+<header><h1>Трейдер</h1><div class="muted">Состояние счёта и сделки · страница обновляется каждые 30 секунд · баланс на {last_update}</div>
+<nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a class="active" href="/trader">Трейдер</a></nav></header>
+<main><section class="cards">
+<div class="card"><span>Баланс</span><strong>{balance} USD</strong></div>
+<div class="card"><span>Режим</span><strong>{mode}</strong></div>
+<div class="card"><span>Завершено сделок</span><strong>{_fmt(stats.get('settled_count') or 0)}</strong></div>
+<div class="card"><span>В ожидании</span><strong>{_fmt(stats.get('pending_count') or 0)}</strong></div>
+<div class="card"><span>Реализованный результат</span><strong class="{'positive' if Decimal(str(stats.get('net_profit') or 0)) >= 0 else 'negative'}">{_fmt(stats.get('net_profit') or 0)} USD</strong></div>
+<div class="card"><span>Уплаченные комиссии</span><strong>{_fmt(stats.get('total_fees') or 0)} USD</strong></div>
+</section><h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
+<th>Пара</th><th>Купил</th><th>Продал / цена оценки</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Прибыль</th><th>Статус</th><th>Время (Киев)</th>
+</tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div></main></body></html>"""
+
+
 def _classify_transfer_groups(
     lifetime_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -404,7 +502,7 @@ def _render_history(
   .filters input {{ accent-color: #38bdf8; vertical-align: middle; }} .filters label {{ cursor: pointer; }}
 </style></head><body>
 <header><h1>{page_title}</h1><div class="muted">{('Текущие подтверждённые ситуации · список обновляется автоматически' if active_view else f'Последние 500 наблюдений · данные хранятся 30 дней · обновлено {refreshed_at}')}</div>
-<nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a></nav></header>
+<nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a><a href="/trader">Трейдер</a></nav></header>
 <main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="muted counter-note">Суммируется подтверждённое время эпизодов одного маршрута с паузами до 60 секунд; паузы не учитываются.</div><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
 <tbody>{counter_rows}</tbody></table></div>
 </section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="filters"><label><input id="hide-transfer-failed" type="checkbox" checked> Скрывать возможности, которые не пережили время перевода</label></div><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность эпизода</th><th>Суммарное время для перевода</th></tr></thead>
@@ -553,7 +651,7 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
   </style>
 </head>
 <body>
-  <nav><a class="active" href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a></nav>
+  <nav><a class="active" href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/trader">Трейдер</a></nav>
   <header><h1>Арбитражный скринер</h1>
   <div id="worker-status" class="worker-status"><strong>Проверяю обновление…</strong><small></small></div>
   <div class="muted">Длительность активных возможностей обновляется каждую секунду · данные пересчитываются по расписанию</div></header>
@@ -633,6 +731,20 @@ setInterval(refreshWorkerStatus, 1000);
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/trader":
+            try:
+                account, stats, trades = _load_trader_dashboard()
+                body = _render_trader_page(account, stats, trades).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                logger.exception("Не удалось загрузить страницу трейдера")
+                self.send_error(500, "Не удалось получить данные трейдера из БД")
+            return
         if path in ("/api/history-lifetimes", "/api/active-situations"):
             try:
                 active_view = path == "/api/active-situations"

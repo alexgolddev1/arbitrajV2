@@ -25,6 +25,9 @@ from database import (
     touch_opportunity_lifetimes,
 )
 from main.treider.tran_emulation import TransferTimeEmulator
+from main.treider.config import MIN_OPPORTUNITY_LIFETIME_SECONDS
+from main.treider.queue import enqueue as enqueue_trader_signal
+from main.treider.signals import build_opportunity_signal
 from .mexc_proto import PushDataV3ApiWrapper
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,7 @@ class Quote:
 class Episode:
     lifetime_id: int
     started_at: datetime
+    started_monotonic: float
     max_spread: Decimal
     last_checkpoint: datetime
     last_confirmed_at: datetime
@@ -63,9 +67,14 @@ class Episode:
     buy_exchange: str
     buy_market_pair: str
     buy_price: Decimal
+    buy_size: Decimal
     sell_exchange: str
     sell_market_pair: str
     sell_price: Decimal
+    sell_size: Decimal
+    network: str
+    transfer_seconds: float
+    trader_signal_sent: bool = False
 
 
 @dataclass
@@ -417,9 +426,10 @@ class OpportunityConfirmer:
                         )
                         if episode_id is not None:
                             episode = Episode(
-                                episode_id, now, spread, now, now, spread,
-                                buy[0].exchange_name, buy[0].market_pair, buy[1].ask,
-                                sell[0].exchange_name, sell[0].market_pair, sell[1].bid,
+                                episode_id, now, pending.started_monotonic, spread, now, now, spread,
+                                buy[0].exchange_name, buy[0].market_pair, buy[1].ask, buy[1].ask_size,
+                                sell[0].exchange_name, sell[0].market_pair, sell[1].bid, sell[1].bid_size,
+                                network, transfer_seconds,
                             )
                             self.episodes[episode_key] = episode
                             self._cycle_confirmed_sources.add(source_id)
@@ -454,9 +464,45 @@ class OpportunityConfirmer:
                     episode.buy_exchange = buy[0].exchange_name
                     episode.buy_market_pair = buy[0].market_pair
                     episode.buy_price = buy[1].ask
+                    episode.buy_size = buy[1].ask_size
                     episode.sell_exchange = sell[0].exchange_name
                     episode.sell_market_pair = sell[0].market_pair
                     episode.sell_price = sell[1].bid
+                    episode.sell_size = sell[1].bid_size
+                    # Life is measured independently of the simulated transfer countdown.
+                    elapsed_seconds = time.monotonic() - episode.started_monotonic
+                    if (
+                        not episode.trader_signal_sent
+                        and elapsed_seconds >= MIN_OPPORTUNITY_LIFETIME_SECONDS
+                    ):
+                        signal_key, payload = build_opportunity_signal(
+                            lifetime_id=episode.lifetime_id,
+                            source_market_id=source_id,
+                            source_pair=buy[0].source_pair,
+                            threshold_percent=threshold,
+                            spread_percent=episode.spread,
+                            max_spread_percent=episode.max_spread,
+                            buy_exchange=episode.buy_exchange,
+                            buy_market_pair=episode.buy_market_pair,
+                            buy_price=episode.buy_price,
+                            buy_size=episode.buy_size,
+                            sell_exchange=episode.sell_exchange,
+                            sell_market_pair=episode.sell_market_pair,
+                            sell_price=episode.sell_price,
+                            sell_size=episode.sell_size,
+                            network=episode.network,
+                            estimated_transfer_seconds=episode.transfer_seconds,
+                            started_at_utc=episode.started_at.isoformat(sep=" "),
+                            lifetime_seconds=elapsed_seconds,
+                        )
+                        await asyncio.to_thread(enqueue_trader_signal, signal_key, payload)
+                        episode.trader_signal_sent = True
+                        logger.info(
+                            "Скринер отправил трейдеру JSON по %s: порог %.4f%%, жизнь %.1f сек.",
+                            buy[0].source_pair,
+                            threshold,
+                            elapsed_seconds,
+                        )
             elif pending is not None:
                 if episode is not None:
                     await asyncio.to_thread(

@@ -4,6 +4,67 @@ CREATE TABLE IF NOT EXISTS config (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS trader_signals (
+    signal_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    opportunity_key VARCHAR(191) NOT NULL,
+    payload JSON NOT NULL,
+    status ENUM('pending', 'processing', 'processed', 'failed') NOT NULL DEFAULT 'pending',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claimed_at DATETIME NULL,
+    processed_at DATETIME NULL,
+    error_message TEXT NULL,
+    UNIQUE KEY uq_trader_signal_opportunity (opportunity_key),
+    INDEX idx_trader_signal_queue (status, signal_id),
+    INDEX idx_trader_signal_claimed (status, claimed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS trader_account (
+    account_id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+    balance_usd DECIMAL(18, 8) NOT NULL,
+    training_mode TINYINT(1) NOT NULL DEFAULT 1,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS trader_training_settlements (
+    settlement_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    signal_id BIGINT UNSIGNED NOT NULL,
+    source_pair VARCHAR(128) NOT NULL,
+    buy_exchange VARCHAR(64) NOT NULL,
+    buy_market_pair VARCHAR(128) NOT NULL,
+    sell_exchange VARCHAR(64) NOT NULL,
+    sell_market_pair VARCHAR(128) NOT NULL,
+    quantity DECIMAL(38, 18) NOT NULL,
+    buy_price DECIMAL(38, 18) NOT NULL,
+    expected_sell_price DECIMAL(38, 18) NOT NULL,
+    final_sell_price DECIMAL(38, 18) NULL,
+    buy_taker_fee_rate DECIMAL(20, 12) NOT NULL,
+    expected_sell_taker_fee_rate DECIMAL(20, 12) NOT NULL,
+    actual_sell_taker_fee_rate DECIMAL(20, 12) NULL,
+    buy_cost_usd DECIMAL(38, 12) NOT NULL,
+    realized_sell_proceeds_usd DECIMAL(38, 12) NULL,
+    buy_fee_usd DECIMAL(38, 12) NOT NULL,
+    expected_sell_fee_usd DECIMAL(38, 12) NOT NULL,
+    sell_fee_usd DECIMAL(38, 12) NULL,
+    expected_profit_usd DECIMAL(38, 12) NOT NULL,
+    realized_profit_usd DECIMAL(38, 12) NULL,
+    balance_before_usd DECIMAL(18, 8) NOT NULL,
+    settlement_balance_before_usd DECIMAL(18, 8) NULL,
+    balance_after_usd DECIMAL(18, 8) NULL,
+    status ENUM('pending', 'settling', 'settled') NOT NULL DEFAULT 'pending',
+    settle_after_utc DATETIME NOT NULL,
+    claimed_at DATETIME NULL,
+    settlement_attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    last_error TEXT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    settled_at DATETIME NULL,
+    UNIQUE KEY uq_trader_training_signal (signal_id),
+    INDEX idx_trader_training_due (status, settle_after_utc),
+    CONSTRAINT fk_trader_training_settlement_signal
+        FOREIGN KEY (signal_id) REFERENCES trader_signals (signal_id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS market_pairs (
     market_id BIGINT UNSIGNED PRIMARY KEY,
     rank_no INT NULL,
