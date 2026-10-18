@@ -24,6 +24,7 @@ class SpotBookTicker:
     bid_size: Decimal
     ask: Decimal
     ask_size: Decimal
+    last_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ def fetch_spot_book(exchange: str, market_pair: str) -> SpotBookTicker:
     exchange_slug = exchange.strip().lower()
     base, quote = _pair_parts(market_pair)
     symbol = f"{base}{quote}"
+    last_price_value: Any = None
 
     if exchange_slug == "binance":
         payload = _get_json(
@@ -87,6 +89,7 @@ def fetch_spot_book(exchange: str, market_pair: str) -> SpotBookTicker:
             raise ValueError(f"Bybit не вернул spot-котировку для {symbol}")
         item = items[0]
         values = (item.get("bid1Price"), item.get("bid1Size"), item.get("ask1Price"), item.get("ask1Size"))
+        last_price_value = item.get("lastPrice")
     elif exchange_slug == "okx":
         payload = _get_json(
             "https://www.okx.com/api/v5/market/ticker",
@@ -99,12 +102,14 @@ def fetch_spot_book(exchange: str, market_pair: str) -> SpotBookTicker:
             raise ValueError(f"OKX не вернул spot-котировку для {base}-{quote}")
         item = items[0]
         values = (item.get("bidPx"), item.get("bidSz"), item.get("askPx"), item.get("askSz"))
+        last_price_value = item.get("last")
     elif exchange_slug == "mexc":
         payload = _get_json(
-            "https://api.mexc.com/api/v3/ticker/bookTicker",
+            "https://api.mexc.com/api/v3/ticker/24hr",
             {"symbol": symbol},
         )
         values = (payload.get("bidPrice"), payload.get("bidQty"), payload.get("askPrice"), payload.get("askQty"))
+        last_price_value = payload.get("lastPrice")
     else:
         raise ValueError(f"Биржа {exchange!r} не поддерживается для проверки котировок")
 
@@ -112,7 +117,11 @@ def fetch_spot_book(exchange: str, market_pair: str) -> SpotBookTicker:
         _decimal(value, field)
         for value, field in zip(values, ("bid", "bid_size", "ask", "ask_size"))
     )
-    return SpotBookTicker(exchange_slug, market_pair, bid, bid_size, ask, ask_size)
+    try:
+        last_price = _decimal(last_price_value, "last_price") if last_price_value else None
+    except ValueError:
+        last_price = None
+    return SpotBookTicker(exchange_slug, market_pair, bid, bid_size, ask, ask_size, last_price)
 
 
 def fetch_market_sell_execution(

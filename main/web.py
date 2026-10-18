@@ -30,6 +30,13 @@ def _fmt(value: Any) -> str:
     return html.escape(result)
 
 
+def _fmt_fixed(value: Any, places: int) -> str:
+    """Format dashboard numbers at a fixed display precision without changing stored values."""
+    if value is None:
+        return "—"
+    return html.escape(f"{Decimal(str(value)):.{places}f}")
+
+
 def _fmt_time(value: datetime | None) -> str:
     if value is None:
         return "—"
@@ -159,6 +166,7 @@ def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], lis
                 "SELECT settlement_id, source_pair, buy_exchange, buy_market_pair, buy_price, "
                 "sell_exchange, sell_market_pair, expected_sell_price, stop_loss_price, final_sell_price, quantity, "
                 "buy_cost_usd, realized_sell_proceeds_usd, buy_fee_usd, sell_fee_usd, "
+                "sold_quantity, sell_proceeds_accumulated_usd, "
                 "expected_profit_usd, realized_profit_usd, status, created_at, settle_after_utc, settled_at, "
                 "planned_sell_at, actual_sell_at, "
                 "route_status, remaining_quantity, transfer_fee_amount, transfer_fee_currency, "
@@ -186,6 +194,12 @@ def _render_trader_page(
     for trade in trades:
         settled = trade["status"] == "settled"
         realized = trade["status"] in {"settled", "partial", "open"}
+        sold_quantity = Decimal(str(trade.get("sold_quantity") or 0))
+        remaining_quantity = Decimal(str(trade.get("remaining_quantity") or 0))
+        accumulated_proceeds = Decimal(str(trade.get("sell_proceeds_accumulated_usd") or 0))
+        average_execution_price = (
+            accumulated_proceeds / sold_quantity if sold_quantity > 0 else None
+        )
         profit = trade["realized_profit_usd"] if realized else trade["expected_profit_usd"]
         profit_class = "positive" if profit is not None and Decimal(str(profit)) >= 0 else "negative"
         sale_price = trade["final_sell_price"] if realized else trade["expected_sell_price"]
@@ -193,20 +207,24 @@ def _render_trader_page(
             trade["route_status"], html.escape(str(trade["route_status"]))
         )
         trade_rows.append(
-            "<tr>"
+            f'<tr class="trade-row" tabindex="0" '
+            f'data-pair="{html.escape(str(trade["source_pair"]), quote=True)}" '
+            f'data-average="{_fmt_fixed(average_execution_price, 8)}" '
+            f'data-sold="{_fmt_fixed(sold_quantity, 8)}" '
+            f'data-remaining="{_fmt_fixed(remaining_quantity, 8)}">'
             f"<td>{html.escape(str(trade['source_pair']))}</td>"
             f"<td>{_market_cell(trade['buy_exchange'], trade['buy_market_pair'], trade['buy_price'])}</td>"
             f"<td>{_market_cell(trade['sell_exchange'], trade['sell_market_pair'], sale_price)}</td>"
             f"<td>TP {_fmt(trade['expected_sell_price'])}<small>SL {_fmt(trade['stop_loss_price'])}</small></td>"
-            f"<td>{_fmt(trade['quantity'])}</td>"
-            f"<td>{_fmt(trade['buy_cost_usd'])}</td>"
-            f"<td>{_fmt(trade['realized_sell_proceeds_usd'] if realized else None)}</td>"
-            f"<td>{_fmt(trade['buy_fee_usd'])} + {_fmt(trade['sell_fee_usd'] if realized else None)}</td>"
-            f'<td class="{profit_class}">{_fmt(profit)} USD'
+            f"<td>{_fmt_fixed(trade['quantity'], 8)}</td>"
+            f"<td>{_fmt_fixed(trade['buy_cost_usd'], 3)}</td>"
+            f"<td>{_fmt_fixed(trade['realized_sell_proceeds_usd'] if realized else None, 3)}</td>"
+            f"<td>{_fmt_fixed(trade['buy_fee_usd'], 3)} + {_fmt_fixed(trade['sell_fee_usd'] if realized else None, 3)}</td>"
+            f'<td class="{profit_class}">{_fmt_fixed(profit, 3)} USD'
             f'{"<small>накопленная, позиция открыта</small>" if realized and not settled else ""}'
-            f'{"<small>ожидаемая до резерва; после резерва " + _fmt(trade["expected_profit_after_reserve_usd"]) + " USDT</small>" if not realized else ""}</td>'
+            f'{"<small>ожидаемая до резерва; после резерва " + _fmt_fixed(trade["expected_profit_after_reserve_usd"], 3) + " USDT</small>" if not realized else ""}</td>'
             f"<td>{route_label}<small>Перевод: {_fmt(trade['transfer_fee_amount'])} {html.escape(str(trade['transfer_fee_currency']))}</small></td>"
-            f"<td>{_fmt(trade['remaining_quantity'])}</td>"
+            f"<td>{_fmt_fixed(remaining_quantity, 8)}</td>"
             f"<td><span class=\"status status-{html.escape(str(trade['status']))}\">"
             f"{status_labels.get(trade['status'], html.escape(str(trade['status'])))}</span></td>"
             f"<td>{_fmt_time(trade['created_at'])}"
@@ -218,7 +236,7 @@ def _render_trader_page(
     if not trade_rows:
         trade_rows.append('<tr><td colspan="13">Трейдер ещё не входил в сделки.</td></tr>')
 
-    balance = _fmt(account["balance_usd"]) if account else "—"
+    balance = _fmt_fixed(account["balance_usd"], 3) if account else "—"
     mode = "Тренировка" if account and account["training_mode"] else "Рабочий режим"
     last_update = _fmt_time(account["updated_at"]) if account else "Счёт ещё не создан"
     return f"""<!doctype html>
@@ -236,6 +254,9 @@ nav a {{ padding:8px 12px; border:1px solid #334155; border-radius:8px; color:#7
 th,td {{ padding:11px 13px; text-align:left; border-bottom:1px solid #26334a; white-space:nowrap; }} th {{ color:#9fb4d0; font-size:.8rem; text-transform:uppercase; }}
 .positive {{ color:#67e8a5; font-weight:700; }} .negative {{ color:#f87171; font-weight:700; }} .status {{ color:#fbbf24; }} .status-settled {{ color:#67e8a5; }}
 a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ color:#7dd3fc; text-decoration:underline; }}
+#trade-detail-modal {{ display:none; position:fixed; z-index:1000; max-width:320px; padding:14px 16px; border:1px solid #475569; border-radius:10px; background:#0f172a; box-shadow:0 12px 32px #0009; pointer-events:none; line-height:1.5; }}
+#trade-detail-modal.visible {{ display:block; }} #trade-detail-modal strong {{ display:block; margin-bottom:7px; color:#7dd3fc; }}
+.trade-row {{ cursor:help; }} .trade-row:focus {{ outline:2px solid #38bdf8; outline-offset:-2px; }}
 </style></head><body>
 <header><h1>Трейдер</h1><div class="muted">Состояние счёта и сделки · страница обновляется каждые 30 секунд · баланс на {last_update}</div>
 <nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a class="active" href="/trader">Трейдер</a></nav></header>
@@ -247,11 +268,49 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 <div class="card"><span>Подтверждённые маршруты</span><strong>{_fmt(stats.get('confirmed_routes') or 0)}</strong></div>
 <div class="card"><span>Предполагаемые маршруты</span><strong>{_fmt(stats.get('assumed_routes') or 0)}</strong></div>
 <div class="card"><span>Остались открыты</span><strong>{_fmt(stats.get('open_count') or 0)}</strong></div>
-<div class="card"><span>Реализованный результат</span><strong class="{'positive' if Decimal(str(stats.get('net_profit') or 0)) >= 0 else 'negative'}">{_fmt(stats.get('net_profit') or 0)} USD</strong></div>
-<div class="card"><span>Уплаченные комиссии</span><strong>{_fmt(stats.get('total_fees') or 0)} USD</strong></div>
+<div class="card"><span>Реализованный результат</span><strong class="{'positive' if Decimal(str(stats.get('net_profit') or 0)) >= 0 else 'negative'}">{_fmt_fixed(stats.get('net_profit') or 0, 3)} USD</strong></div>
+<div class="card"><span>Уплаченные комиссии</span><strong>{_fmt_fixed(stats.get('total_fees') or 0, 3)} USD</strong></div>
 </section><h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
 <th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
-</tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div></main></body></html>"""
+</tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div>
+<div id="trade-detail-modal" role="tooltip" aria-hidden="true"><strong data-detail="pair"></strong>
+<div>Средняя цена исполнения: <span data-detail="average"></span></div>
+<div>Продано монет: <span data-detail="sold"></span></div>
+<div>Остаток монет: <span data-detail="remaining"></span></div></div></main>
+<script>
+const tradeDetail = document.getElementById('trade-detail-modal');
+function positionTradeDetail(event) {{
+  const offset = 14, margin = 8;
+  const box = tradeDetail.getBoundingClientRect();
+  const left = Math.min(event.clientX + offset, window.innerWidth - box.width - margin);
+  const top = Math.min(event.clientY + offset, window.innerHeight - box.height - margin);
+  tradeDetail.style.left = Math.max(margin, left) + 'px';
+  tradeDetail.style.top = Math.max(margin, top) + 'px';
+}}
+function showTradeDetail(row, event) {{
+  tradeDetail.querySelector('[data-detail="pair"]').textContent = row.dataset.pair;
+  tradeDetail.querySelector('[data-detail="average"]').textContent = row.dataset.average;
+  tradeDetail.querySelector('[data-detail="sold"]').textContent = row.dataset.sold;
+  tradeDetail.querySelector('[data-detail="remaining"]').textContent = row.dataset.remaining;
+  tradeDetail.classList.add('visible');
+  tradeDetail.setAttribute('aria-hidden', 'false');
+  positionTradeDetail(event);
+}}
+function hideTradeDetail() {{
+  tradeDetail.classList.remove('visible');
+  tradeDetail.setAttribute('aria-hidden', 'true');
+}}
+document.querySelectorAll('.trade-row').forEach(row => {{
+  row.addEventListener('mouseenter', event => showTradeDetail(row, event));
+  row.addEventListener('mousemove', positionTradeDetail);
+  row.addEventListener('mouseleave', hideTradeDetail);
+  row.addEventListener('focus', () => {{
+    const rect = row.getBoundingClientRect();
+    showTradeDetail(row, {{clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2}});
+  }});
+  row.addEventListener('blur', hideTradeDetail);
+}});
+</script></body></html>"""
 
 
 def _classify_transfer_groups(
@@ -283,9 +342,9 @@ def _classify_transfer_groups(
             start = row["started_at"]
             if row["is_active"]:
                 end = now
-                duration = max(0, int((end - start).total_seconds()))
+                duration = max(0.0, (end - start).total_seconds())
             else:
-                duration = int(row.get("duration_seconds") or 0)
+                duration = float(row.get("duration_seconds") or 0)
                 end = start + timedelta(seconds=duration)
             row["_confirmed_seconds"] = duration
             gap = (start - previous_end).total_seconds() if previous_end else None
@@ -298,7 +357,7 @@ def _classify_transfer_groups(
             clusters.append(current)
 
         for cluster in clusters:
-            total_seconds = sum(row["_confirmed_seconds"] for row in cluster)
+            total_seconds = round(sum(row["_confirmed_seconds"] for row in cluster), 3)
             active = any(bool(row["is_active"]) for row in cluster)
             expected = next(
                 (float(row["transfer_seconds"]) for row in cluster
@@ -380,7 +439,7 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
                 "buy_exchange, buy_market_pair, buy_price, sell_exchange, sell_market_pair, sell_price, "
                 "started_at, last_confirmed_at, ended_at, duration_seconds, is_active, transfer_seconds "
                 "FROM opportunity_lifetimes WHERE is_active = %s "
-                f"AND buy_price {price_direction} sell_price "
+                f"AND (is_active = 0 OR buy_price {price_direction} sell_price) "
                 "ORDER BY started_at DESC, lifetime_id DESC LIMIT 500",
                 (int(is_active),),
             )
@@ -425,8 +484,9 @@ def _render_history(
     for row in rows_lifetimes:
         transfer_state = row.get("_transfer_state", "unknown")
         threshold = _fmt(row["threshold_percent"]) + "%"
+        spread_value = Decimal(str(row["spread_percent"]))
         spread = (
-            f"+{_fmt(row['spread_percent'])}%"
+            f"{'+' if spread_value >= 0 else ''}{_fmt(spread_value)}%"
             f"<small>Максимум: +{_fmt(row['max_spread_percent'])}%</small>"
         )
         started = _fmt_time(row["started_at"])
@@ -439,15 +499,17 @@ def _render_history(
         seconds = (
             _elapsed_seconds_since(row["started_at"])
             if is_active
-            else int(row["duration_seconds"] or 0)
+            else float(row["duration_seconds"] or 0)
         )
-        live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds}"' if is_active else ""
-        duration = f'<span{live_attrs}>{seconds} сек.</span>'
+        live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds:.3f}"' if is_active else ""
+        seconds_label = f"{seconds:.1f}".rstrip("0").rstrip(".")
+        duration = f'<span{live_attrs}>{seconds_label} сек.</span>'
         episode_count = row.get("_transfer_episode_count", 1)
         episode_word = "эпизод" if episode_count == 1 else "эпизода" if episode_count < 5 else "эпизодов"
         total_seconds = row.get("_transfer_total_seconds", 0)
         total_minutes = total_seconds / 60
-        total_duration = f"{total_seconds} сек. ({total_minutes:.1f} мин.)"
+        total_seconds_label = f"{total_seconds:.1f}".rstrip("0").rstrip(".")
+        total_duration = f"{total_seconds_label} сек. ({total_minutes:.1f} мин.)"
         expected_seconds = row.get("_transfer_expected_seconds")
         if transfer_state == "unknown":
             transfer_label = "Нет данных"

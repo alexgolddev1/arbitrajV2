@@ -84,6 +84,18 @@ class FeeTests(unittest.TestCase):
 
 
 class MarketAndRouteTests(unittest.TestCase):
+    @patch("main.treider.market_data._get_json")
+    def test_mexc_spot_book_keeps_last_price_separate_from_best_bid(self, get_json: Mock) -> None:
+        get_json.return_value = {
+            "bidPrice": "0.0006900", "bidQty": "1000",
+            "askPrice": "0.0006920", "askQty": "1200", "lastPrice": "0.0006910",
+        }
+        book = market_data.fetch_spot_book("mexc", "MBL/USDT")
+
+        self.assertEqual(book.bid, Decimal("0.0006900"))
+        self.assertEqual(book.last_price, Decimal("0.0006910"))
+        self.assertIn("/api/v3/ticker/24hr", get_json.call_args.args[0])
+
     def test_market_sell_walks_depth_and_preserves_remainder(self) -> None:
         full = market_data.simulate_market_sell(
             "mexc", "ABC/USDT", Decimal("7"),
@@ -364,7 +376,7 @@ class TradeCalculationTests(unittest.TestCase):
                 "sell_fees_accumulated_usd": Decimal("0"), "buy_debit_usd": Decimal("30"),
                 "settlement_attempts": 1, "planned_sell_at": None,
             },
-            (10,),
+            {"elapsed_seconds": 10},
         ]
         cursor.rowcount = 1
         connection = MagicMock()

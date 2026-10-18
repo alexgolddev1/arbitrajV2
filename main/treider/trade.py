@@ -398,8 +398,11 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
                 trade.get("claim_token"),
             )
             logger.info(
-                "Тренировочная позиция остаётся открытой: bid=%s; TP=%s; SL=%s; повторная проверка через %s сек.; %s",
-                current_sell_book.bid, take_profit_price, stop_loss_price, SETTLEMENT_RETRY_SECONDS, context,
+                "Тренировочная позиция остаётся открытой: лучшая цена продажи (bid)=%s; "
+                "последняя цена сделки=%s; TP=%s; SL=%s; "
+                "повторная проверка через %s сек.; %s",
+                current_sell_book.bid, current_sell_book.last_price or "н/д",
+                take_profit_price, stop_loss_price, SETTLEMENT_RETRY_SECONDS, context,
             )
             return
         execution = (
@@ -467,11 +470,12 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             exceeded_wait = False
             if remaining > 0:
                 cursor.execute(
-                    "SELECT TIMESTAMPDIFF(SECOND, planned_sell_at, UTC_TIMESTAMP()) "
+                    "SELECT TIMESTAMPDIFF(SECOND, planned_sell_at, UTC_TIMESTAMP()) AS elapsed_seconds "
                     "FROM trader_training_settlements WHERE settlement_id = %s",
                     (trade_id,),
                 )
-                elapsed_since_sell = int(cursor.fetchone()[0] or 0)
+                elapsed_row = cursor.fetchone()
+                elapsed_since_sell = int((elapsed_row or {}).get("elapsed_seconds") or 0)
                 exceeded_wait = elapsed_since_sell >= SETTLEMENT_MAX_WAIT_SECONDS
             next_status = "settled" if remaining <= 0 else "open" if exceeded_wait else "partial"
             next_position_status = "closed" if remaining <= 0 else "open" if exceeded_wait else "partial"
@@ -500,9 +504,23 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             if cursor.rowcount != 1:
                 raise RuntimeError("Устаревшее владение задачей: продажу зафиксировать нельзя")
         connection.commit()
-    except Exception:
+    except Exception as error:
         connection.rollback()
-        raise
+        try:
+            _retry_settlement(trade_id, str(error), trade.get("claim_token"))
+        except Exception:
+            logger.exception(
+                "Не удалось вернуть тренировочную продажу в очередь повторов; settlement=%s",
+                trade_id,
+            )
+            raise
+        logger.exception(
+            "Ошибка фиксации тренировочной продажи; баланс не зафиксирован, "
+            "сделка поставлена на повтор через %s сек.; settlement=%s",
+            SETTLEMENT_RETRY_SECONDS,
+            trade_id,
+        )
+        return
     finally:
         connection.close()
 

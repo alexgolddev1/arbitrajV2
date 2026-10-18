@@ -435,9 +435,17 @@ class OpportunityConfirmer:
                             self._cycle_confirmed_sources.add(source_id)
                             self._cycle_confirmed_by_threshold[threshold] += 1
                         logger.info(
-                            "Кандидат %s: проверяю сохранение спреда %.4f%% выше %.4f%% "
-                            "на время эмулируемого перевода сети %s (%.1f сек.)",
-                            buy[0].source_pair, spread, threshold, network, transfer_seconds,
+                            "Кандидат %s: спред %.4f%% выше порога %.4f%%; "
+                            "покупка %s ask=%s (котировка %.2f сек.), "
+                            "продажа %s bid=%s (котировка %.2f сек.); "
+                            "сигнал трейдеру после %.1f сек. непрерывного спреда; "
+                            "сеть %s, оценка перевода %.1f сек.",
+                            buy[0].source_pair, spread, threshold,
+                            buy[0].exchange_name, buy[1].ask,
+                            max(0.0, now_mono - buy[1].received_at),
+                            sell[0].exchange_name, sell[1].bid,
+                            max(0.0, now_mono - sell[1].received_at),
+                            MIN_OPPORTUNITY_LIFETIME_SECONDS, network, transfer_seconds,
                         )
                     else:
                         pending.last_confirmed_at = now
@@ -511,25 +519,38 @@ class OpportunityConfirmer:
                         source_market_id=source_id,
                         source_pair=buy[0].source_pair,
                         threshold_percent=threshold,
-                        spread_percent=episode.spread,
+                        spread_percent=spread,
                         max_spread_percent=episode.max_spread,
-                        buy_exchange=episode.buy_exchange,
-                        buy_market_pair=episode.buy_market_pair,
-                        buy_price=episode.buy_price,
-                        sell_exchange=episode.sell_exchange,
-                        sell_market_pair=episode.sell_market_pair,
-                        sell_price=episode.sell_price,
+                        buy_exchange=buy[0].exchange_name,
+                        buy_market_pair=buy[0].market_pair,
+                        buy_price=buy[1].ask,
+                        sell_exchange=sell[0].exchange_name,
+                        sell_market_pair=sell[0].market_pair,
+                        sell_price=sell[1].bid,
                         started_at=episode.started_at,
                         last_confirmed_at=episode.last_confirmed_at,
                         ended_at=now,
                     )
                     del self.episodes[episode_key]
                 del self.pending[episode_key]
+                elapsed_seconds = time.monotonic() - pending.started_monotonic
+                signal_status = (
+                    "сигнал трейдеру уже отправлен"
+                    if episode is not None and episode.trader_signal_sent
+                    else f"сигнал трейдеру не отправлен: нужно {MIN_OPPORTUNITY_LIFETIME_SECONDS:.1f} сек."
+                )
                 logger.info(
-                    "Кандидат %s отброшен: спред %.4f%% опустился ниже порога %.4f%% "
-                    "до завершения перевода сети %s (прошло %.1f из %.1f сек.)",
-                    buy[0].source_pair, spread, threshold, pending.network,
-                    time.monotonic() - pending.started_monotonic, pending.transfer_seconds,
+                    "Кандидат %s отброшен: текущий спред %.4f%% ниже порога %.4f%%; "
+                    "покупка %s ask=%s (котировка %.2f сек.), "
+                    "продажа %s bid=%s (котировка %.2f сек.); прошло %.1f сек.; %s; "
+                    "сеть %s, оценка перевода %.1f сек.",
+                    buy[0].source_pair, spread, threshold,
+                    buy[0].exchange_name, buy[1].ask,
+                    max(0.0, now_mono - buy[1].received_at),
+                    sell[0].exchange_name, sell[1].bid,
+                    max(0.0, now_mono - sell[1].received_at),
+                    elapsed_seconds, signal_status, pending.network,
+                    pending.transfer_seconds,
                 )
             elif episode is not None:
                 await asyncio.to_thread(
@@ -547,7 +568,7 @@ class OpportunityConfirmer:
                     sell_market_pair=sell[0].market_pair,
                     sell_price=sell[1].bid,
                     started_at=episode.started_at,
-                    last_confirmed_at=now,
+                    last_confirmed_at=episode.last_confirmed_at,
                     ended_at=now,
                 )
                 del self.episodes[episode_key]

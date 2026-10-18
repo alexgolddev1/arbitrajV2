@@ -138,6 +138,25 @@ def initialize_database(connection: MySQLConnection) -> None:
             cursor.execute(
                 "ALTER TABLE opportunity_lifetimes ADD COLUMN transfer_seconds DECIMAL(10, 2) NULL"
             )
+        lifetime_precision = {
+            "started_at": ("datetime(3)", "DATETIME(3) NOT NULL"),
+            "last_confirmed_at": ("datetime(3)", "DATETIME(3) NOT NULL"),
+            "ended_at": ("datetime(3)", "DATETIME(3) NULL"),
+            "duration_seconds": (
+                "decimal(12,3) unsigned", "DECIMAL(12, 3) UNSIGNED NULL"
+            ),
+        }
+        for column, (expected_type, definition) in lifetime_precision.items():
+            cursor.execute(f"SHOW COLUMNS FROM opportunity_lifetimes LIKE '{column}'")
+            existing = cursor.fetchone()
+            if existing is not None:
+                existing_type = existing["Type"] if isinstance(existing, dict) else existing[1]
+            else:
+                existing_type = None
+            if existing_type is not None and str(existing_type).lower() != expected_type:
+                cursor.execute(
+                    f"ALTER TABLE opportunity_lifetimes MODIFY COLUMN `{column}` {definition}"
+                )
         trader_migrations = {
             "trader_signals": {
                 "decision": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
@@ -339,7 +358,7 @@ def record_opportunity_lifetime(
                     "UPDATE opportunity_lifetimes SET spread_percent = %s, max_spread_percent = %s, "
                     "buy_exchange = %s, buy_market_pair = %s, buy_price = %s, sell_exchange = %s, "
                     "sell_market_pair = %s, sell_price = %s, last_confirmed_at = %s, ended_at = %s, "
-                    "duration_seconds = GREATEST(0, TIMESTAMPDIFF(SECOND, started_at, %s)), is_active = 0 "
+                    "duration_seconds = GREATEST(0, ROUND(TIMESTAMPDIFF(MICROSECOND, started_at, %s) / 1000000, 3)), is_active = 0 "
                     "WHERE lifetime_id = %s AND is_active = 1",
                     (spread_percent, max_spread_percent, buy_exchange, buy_market_pair, buy_price,
                      sell_exchange, sell_market_pair, sell_price, last_confirmed_at, ended_at,
@@ -380,7 +399,7 @@ def finalize_interrupted_lifetimes() -> int:
         with connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE opportunity_lifetimes SET ended_at = last_confirmed_at, "
-                "duration_seconds = GREATEST(0, TIMESTAMPDIFF(SECOND, started_at, last_confirmed_at)), "
+                "duration_seconds = GREATEST(0, ROUND(TIMESTAMPDIFF(MICROSECOND, started_at, last_confirmed_at) / 1000000, 3)), "
                 "is_active = 0 WHERE is_active = 1"
             )
             count = cursor.rowcount
@@ -400,7 +419,7 @@ def finalize_lifetime_at_checkpoint(
             cursor.execute(
                 "UPDATE opportunity_lifetimes SET last_confirmed_at = COALESCE(%s, last_confirmed_at), "
                 "ended_at = COALESCE(%s, last_confirmed_at), "
-                "duration_seconds = GREATEST(0, TIMESTAMPDIFF(SECOND, started_at, COALESCE(%s, last_confirmed_at))), "
+                "duration_seconds = GREATEST(0, ROUND(TIMESTAMPDIFF(MICROSECOND, started_at, COALESCE(%s, last_confirmed_at)) / 1000000, 3)), "
                 "is_active = 0 WHERE lifetime_id = %s AND is_active = 1",
                 (last_confirmed_at, last_confirmed_at, last_confirmed_at, lifetime_id),
             )
