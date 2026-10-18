@@ -120,6 +120,27 @@ class MarketAndRouteTests(unittest.TestCase):
 
     @patch.object(exchange_networks, "ALLOW_UNCONFIRMED_ROUTE_DEMO", True)
     @patch.object(exchange_networks, "ALLOW_DISABLED_ROUTE_DEMO", False)
+    def test_ontology_ont_network_matches_binance_and_mexc(self) -> None:
+        binance_network = {
+            "network_code": "ONT", "network_name": "Ontology",
+            "withdraw_enabled": True, "deposit_enabled": True,
+            "contract_address": "0xabc",
+        }
+        mexc_network = {
+            "network_code": "Ontology", "network_name": "ONT",
+            "withdraw_enabled": True, "deposit_enabled": True,
+            "contract_address": "0xabc",
+        }
+        routes = exchange_networks.build_transfer_routes(
+            "MBL", "binance", "mexc",
+            {"networks": {"binance": [binance_network], "mexc": [mexc_network]}},
+        )
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["network_profile"], "ONTOLOGY")
+        self.assertEqual(routes[0]["route_status"], "confirmed")
+
+    @patch.object(exchange_networks, "ALLOW_UNCONFIRMED_ROUTE_DEMO", True)
+    @patch.object(exchange_networks, "ALLOW_DISABLED_ROUTE_DEMO", False)
     def test_meme_ethereum_route_matches_compound_exchange_labels(self) -> None:
         routes = exchange_networks.build_transfer_routes(
             "MEME", "okx", "mexc",

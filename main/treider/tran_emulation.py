@@ -21,6 +21,7 @@ class TransferTimeEmulator:
         "ETHEREUM": {"avg": Decimal(600), "min": Decimal(240), "max": Decimal(1800)},
         "ARBITRUM": {"avg": Decimal(90), "min": Decimal(20), "max": Decimal(240)},
         "BITCOIN": {"avg": Decimal(2400), "min": Decimal(900), "max": Decimal(5400)},
+        "ONTOLOGY": {"avg": Decimal(120), "min": Decimal(30), "max": Decimal(300)},
     }
 
     def __init__(self, *, random_mode: bool | None = None, seed: str | int | None = None):

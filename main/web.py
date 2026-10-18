@@ -423,81 +423,55 @@ def _render_history(
     if not history_rows:
         history_rows = '<tr><td colspan="7">История появится после первого пересчёта.</td></tr>'
     _classify_transfer_groups(rows_lifetimes)
-    quote_groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    # Одна строка соответствует одному эпизоду: котировки и время больше не смешиваются.
+    lifetime_rows_list = []
     for row in rows_lifetimes:
         transfer_state = row.get("_transfer_state", "unknown")
-        quote_key = (
-            row["source_market_id"], row["source_pair"], row["threshold_percent"],
-            row["buy_exchange"], row["buy_market_pair"], row["sell_exchange"],
-            row["sell_market_pair"], transfer_state, row.get("_transfer_group_started_at"),
+        threshold = _fmt(row["threshold_percent"]) + "%"
+        spread = (
+            f"+{_fmt(row['spread_percent'])}%"
+            f"<small>Максимум: +{_fmt(row['max_spread_percent'])}%</small>"
         )
-        group = quote_groups.setdefault(
-            quote_key, {"row": row, "episodes": {}, "transfer_state": transfer_state}
+        started = _fmt_time(row["started_at"])
+        state = (
+            f"Активна · последняя проверка {_fmt_time(row['last_confirmed_at'])}"
+            if row["is_active"]
+            else _fmt_time(row["ended_at"])
         )
-        episode_key = (row["threshold_percent"], row["started_at"], bool(row["is_active"]), row["ended_at"])
-        existing = group["episodes"].get(episode_key)
-        if existing is None:
-            group["episodes"][episode_key] = row
-        elif row["max_spread_percent"] > existing["max_spread_percent"]:
-            existing["max_spread_percent"] = row["max_spread_percent"]
-
-    lifetime_rows_list = []
-    for group in quote_groups.values():
-        row = group["row"]
-        episodes = list(group["episodes"].values())
-        thresholds = _fmt(episodes[0]["threshold_percent"]) + "%"
-        spreads = "<br>".join(
-            f"+{_fmt(item['spread_percent'])}%<small>Максимум: +{_fmt(item['max_spread_percent'])}%</small>"
-            for item in episodes
+        is_active = bool(row["is_active"])
+        seconds = (
+            _elapsed_seconds_since(row["started_at"])
+            if is_active
+            else int(row["duration_seconds"] or 0)
         )
-        starts = "<br>".join(_fmt_time(item["started_at"]) for item in episodes)
-        states = "<br>".join(
-            (
-                f"Активна · последняя проверка {_fmt_time(item['last_confirmed_at'])}"
-                if item["is_active"]
-                else _fmt_time(item["ended_at"])
-            )
-            for item in episodes
-        )
-        duration_cells = []
-        for item in episodes:
-            is_active = bool(item["is_active"])
-            seconds = (
-                _elapsed_seconds_since(item["started_at"])
-                if is_active
-                else int(item["duration_seconds"] or 0)
-            )
-            live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds}"' if is_active else ""
-            duration_cells.append(f'<span{live_attrs}>{seconds} сек.</span>')
-        durations = "<br>".join(duration_cells)
-        buys = "<br>".join(
-            _market_cell(item["buy_exchange"], item["buy_market_pair"], item["buy_price"])
-            for item in episodes
-        )
-        sells = "<br>".join(
-            _market_cell(item["sell_exchange"], item["sell_market_pair"], item["sell_price"])
-            for item in episodes
-        )
-        transfer_state = group["transfer_state"]
+        live_attrs = f' class="live-duration" data-elapsed-seconds="{seconds}"' if is_active else ""
+        duration = f'<span{live_attrs}>{seconds} сек.</span>'
         episode_count = row.get("_transfer_episode_count", 1)
         episode_word = "эпизод" if episode_count == 1 else "эпизода" if episode_count < 5 else "эпизодов"
         total_seconds = row.get("_transfer_total_seconds", 0)
         total_minutes = total_seconds / 60
         total_duration = f"{total_seconds} сек. ({total_minutes:.1f} мин.)"
-        transfer_labels = {
-            "passed": f"Успела: {total_duration} из {row['_transfer_expected_seconds']:.0f} сек. ({episode_count} {episode_word})",
-            "failed": f"Не успела: {total_duration} из {row['_transfer_expected_seconds']:.0f} сек. ({episode_count} {episode_word})",
-            "pending": f"Проверяется: {total_duration} из {row['_transfer_expected_seconds']:.0f} сек. ({episode_count} {episode_word})",
-            "unknown": "Нет данных",
-        }
+        expected_seconds = row.get("_transfer_expected_seconds")
+        if transfer_state == "unknown":
+            transfer_label = "Нет данных"
+        else:
+            prefix = {
+                "passed": "Успела суммарно",
+                "failed": "Не успела суммарно",
+                "pending": "Проверяется суммарно",
+            }[transfer_state]
+            transfer_label = (
+                f"{prefix}: {total_duration} из {expected_seconds:.0f} сек. "
+                f"({episode_count} {episode_word})"
+            )
         lifetime_rows_list.append(
             f'<tr data-transfer-state="{transfer_state}">'
             f"<td>{html.escape(str(row['source_pair']))}</td>"
-            f"<td>{thresholds}</td><td>{spreads}</td>"
-            f"<td>{buys}</td>"
-            f"<td>{sells}</td>"
-            f"<td>{starts}</td><td>{states}</td><td>{durations}</td>"
-            f"<td>{transfer_labels[transfer_state]}</td></tr>"
+            f"<td>{threshold}</td><td class=spread>{spread}</td>"
+            f"<td>{_market_cell(row['buy_exchange'], row['buy_market_pair'], row['buy_price'])}</td>"
+            f"<td>{_market_cell(row['sell_exchange'], row['sell_market_pair'], row['sell_price'])}</td>"
+            f"<td>{started}</td><td>{state}</td><td>{duration}</td>"
+            f"<td>{transfer_label}</td></tr>"
         )
     lifetime_rows = "".join(lifetime_rows_list)
     if not lifetime_rows:
