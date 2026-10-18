@@ -8,6 +8,12 @@ import time
 from typing import Any
 
 from main.treider.config import NETWORK_CACHE_TTL_SECONDS
+from main.treider.config import (
+    ALLOW_DISABLED_ROUTE_DEMO,
+    ALLOW_UNCONFIRMED_ROUTE_DEMO,
+    TRANSFER_NETWORK,
+)
+from config import TRANSFER_NETWORK_MAP
 from main.treider.exchange_networks import get_transfer_routes
 
 logger = logging.getLogger(__name__)
@@ -39,11 +45,7 @@ def _fetch_routes(currency: str, source: str, destination: str) -> dict[str, Any
 
 
 def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
-    """Return the fastest shared, enabled network for buying then selling exchanges.
-
-    Existing route logic permits an inferred network on a side where API data is
-    absent, but never overrides an explicitly disabled withdrawal or deposit.
-    """
+    """Return an explicitly selected route, preferring verified routes over assumptions."""
     currency = _currency_from_pair(signal["source_pair"])
     source = str(signal["buy"]["exchange"]).strip().lower()
     destination = str(signal["sell"]["exchange"]).strip().lower()
@@ -52,21 +54,48 @@ def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
     if not routes:
         return {
             "available": False,
+            "route_status": "unavailable",
             "currency": currency,
             "source_exchange": source,
             "destination_exchange": destination,
             "errors": result.get("errors") or {},
         }
 
-    selected = min(routes, key=lambda route: float(route.get("estimated_seconds") or 0))
+    requested_profile = TRANSFER_NETWORK_MAP.get(currency) or TRANSFER_NETWORK
+    selected = sorted(
+        routes,
+        key=lambda route: (
+            0 if requested_profile and route.get("network_profile") == requested_profile else 1,
+            {"confirmed": 0, "unconfirmed": 1, "disabled": 2}.get(route.get("route_status"), 3),
+            route.get("network_profile", ""),
+        ),
+    )[0]
+    if selected.get("route_status") == "disabled" and not ALLOW_DISABLED_ROUTE_DEMO:
+        return {"available": False, "route_status": "unavailable", "currency": currency,
+                "source_exchange": source, "destination_exchange": destination,
+                "errors": result.get("errors") or {}}
+    if selected.get("route_status") != "confirmed" and not ALLOW_UNCONFIRMED_ROUTE_DEMO:
+        return {"available": False, "route_status": "unconfirmed", "currency": currency,
+                "source_exchange": source, "destination_exchange": destination,
+                "errors": result.get("errors") or {}}
     return {
         "available": True,
+        "route_status": selected.get("route_status", "unconfirmed"),
         "currency": currency,
         "source_exchange": source,
         "destination_exchange": destination,
         "network": selected.get("network_name") or selected.get("network_profile"),
         "network_profile": selected.get("network_profile"),
         "estimated_seconds": float(selected.get("estimated_seconds") or 0),
+        "withdraw_fee": selected.get("withdraw_fee"),
+        "withdraw_fee_currency": selected.get("withdraw_fee_currency"),
+        "identity_verified": bool(selected.get("identity_verified")),
+        "fee_required": selected.get("fee_required", True),
+        "time_model": selected.get("time_model"),
+        "random_seed": selected.get("random_seed"),
+        "fixed_delay_seconds": selected.get("fixed_delay_seconds"),
+        "source_network": selected.get("source_network"),
+        "destination_network": selected.get("destination_network"),
         "assumed_source": bool(selected.get("source_assumed")),
         "assumed_destination": bool(selected.get("destination_assumed")),
         "errors": result.get("errors") or {},

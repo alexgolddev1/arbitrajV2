@@ -146,7 +146,10 @@ def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], lis
             cursor.execute(
                 "SELECT COUNT(*) AS total_count, "
                 "SUM(status = 'settled') AS settled_count, "
-                "SUM(status IN ('pending', 'settling')) AS pending_count, "
+                "SUM(status IN ('pending', 'settling', 'partial')) AS pending_count, "
+                "SUM(status = 'open') AS open_count, "
+                "SUM(route_status = 'confirmed') AS confirmed_routes, "
+                "SUM(route_status = 'unconfirmed') AS assumed_routes, "
                 "COALESCE(SUM(CASE WHEN status = 'settled' THEN realized_profit_usd ELSE 0 END), 0) AS net_profit, "
                 "COALESCE(SUM(CASE WHEN status = 'settled' THEN buy_fee_usd + COALESCE(sell_fee_usd, 0) ELSE 0 END), 0) AS total_fees "
                 "FROM trader_training_settlements"
@@ -156,7 +159,10 @@ def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], lis
                 "SELECT settlement_id, source_pair, buy_exchange, buy_market_pair, buy_price, "
                 "sell_exchange, sell_market_pair, expected_sell_price, final_sell_price, quantity, "
                 "buy_cost_usd, realized_sell_proceeds_usd, buy_fee_usd, sell_fee_usd, "
-                "expected_profit_usd, realized_profit_usd, status, created_at, settle_after_utc, settled_at "
+                "expected_profit_usd, realized_profit_usd, status, created_at, settle_after_utc, settled_at, "
+                "planned_sell_at, actual_sell_at, "
+                "route_status, remaining_quantity, transfer_fee_amount, transfer_fee_currency, "
+                "expected_profit_before_reserve_usd, expected_profit_after_reserve_usd, price_reserve_usd "
                 "FROM trader_training_settlements ORDER BY created_at DESC, settlement_id DESC LIMIT 500"
             )
             trades = cursor.fetchall()
@@ -173,12 +179,19 @@ def _render_trader_page(
         "pending": "Ожидает перевода",
         "settling": "Проверяется продажа",
         "settled": "Завершена",
+        "partial": "Продана частично",
+        "open": "Остаток сохранён",
+        "expired": "Истёк срок оценки",
     }
     for trade in trades:
         settled = trade["status"] == "settled"
-        profit = trade["realized_profit_usd"] if settled else trade["expected_profit_usd"]
+        realized = trade["status"] in {"settled", "partial", "open"}
+        profit = trade["realized_profit_usd"] if realized else trade["expected_profit_usd"]
         profit_class = "positive" if profit is not None and Decimal(str(profit)) >= 0 else "negative"
-        sale_price = trade["final_sell_price"] if settled else trade["expected_sell_price"]
+        sale_price = trade["final_sell_price"] if realized else trade["expected_sell_price"]
+        route_label = {"confirmed": "Подтверждён", "unconfirmed": "Предполагаемый", "legacy": "Старая запись"}.get(
+            trade["route_status"], html.escape(str(trade["route_status"]))
+        )
         trade_rows.append(
             "<tr>"
             f"<td>{html.escape(str(trade['source_pair']))}</td>"
@@ -186,18 +199,23 @@ def _render_trader_page(
             f"<td>{_market_cell(trade['sell_exchange'], trade['sell_market_pair'], sale_price)}</td>"
             f"<td>{_fmt(trade['quantity'])}</td>"
             f"<td>{_fmt(trade['buy_cost_usd'])}</td>"
-            f"<td>{_fmt(trade['realized_sell_proceeds_usd'] if settled else None)}</td>"
-            f"<td>{_fmt(trade['buy_fee_usd'])} + {_fmt(trade['sell_fee_usd'] if settled else None)}</td>"
+            f"<td>{_fmt(trade['realized_sell_proceeds_usd'] if realized else None)}</td>"
+            f"<td>{_fmt(trade['buy_fee_usd'])} + {_fmt(trade['sell_fee_usd'] if realized else None)}</td>"
             f'<td class="{profit_class}">{_fmt(profit)} USD'
-            f'{"<small>ожидаемая</small>" if not settled else ""}</td>'
+            f'{"<small>накопленная, позиция открыта</small>" if realized and not settled else ""}'
+            f'{"<small>ожидаемая до резерва; после резерва " + _fmt(trade["expected_profit_after_reserve_usd"]) + " USDT</small>" if not realized else ""}</td>'
+            f"<td>{route_label}<small>Перевод: {_fmt(trade['transfer_fee_amount'])} {html.escape(str(trade['transfer_fee_currency']))}</small></td>"
+            f"<td>{_fmt(trade['remaining_quantity'])}</td>"
             f"<td><span class=\"status status-{html.escape(str(trade['status']))}\">"
             f"{status_labels.get(trade['status'], html.escape(str(trade['status'])))}</span></td>"
             f"<td>{_fmt_time(trade['created_at'])}"
-            f"<small>{'Завершена: ' + _fmt_time(trade['settled_at']) if settled else 'Расчёт после: ' + _fmt_time(trade['settle_after_utc'])}</small></td>"
+            f"<small>План продажи: {_fmt_time(trade['planned_sell_at'])}</small>"
+            f"<small>Последняя продажа: {_fmt_time(trade['actual_sell_at'])}</small>"
+            f"<small>{'Завершена: ' + _fmt_time(trade['settled_at']) if settled else 'Следующая проверка: ' + _fmt_time(trade['settle_after_utc'])}</small></td>"
             "</tr>"
         )
     if not trade_rows:
-        trade_rows.append('<tr><td colspan="10">Трейдер ещё не входил в сделки.</td></tr>')
+        trade_rows.append('<tr><td colspan="12">Трейдер ещё не входил в сделки.</td></tr>')
 
     balance = _fmt(account["balance_usd"]) if account else "—"
     mode = "Тренировка" if account and account["training_mode"] else "Рабочий режим"
@@ -225,10 +243,13 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 <div class="card"><span>Режим</span><strong>{mode}</strong></div>
 <div class="card"><span>Завершено сделок</span><strong>{_fmt(stats.get('settled_count') or 0)}</strong></div>
 <div class="card"><span>В ожидании</span><strong>{_fmt(stats.get('pending_count') or 0)}</strong></div>
+<div class="card"><span>Подтверждённые маршруты</span><strong>{_fmt(stats.get('confirmed_routes') or 0)}</strong></div>
+<div class="card"><span>Предполагаемые маршруты</span><strong>{_fmt(stats.get('assumed_routes') or 0)}</strong></div>
+<div class="card"><span>Остались открыты</span><strong>{_fmt(stats.get('open_count') or 0)}</strong></div>
 <div class="card"><span>Реализованный результат</span><strong class="{'positive' if Decimal(str(stats.get('net_profit') or 0)) >= 0 else 'negative'}">{_fmt(stats.get('net_profit') or 0)} USD</strong></div>
 <div class="card"><span>Уплаченные комиссии</span><strong>{_fmt(stats.get('total_fees') or 0)} USD</strong></div>
 </section><h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
-<th>Пара</th><th>Купил</th><th>Продал / цена оценки</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Прибыль</th><th>Статус</th><th>Время (Киев)</th>
+<th>Пара</th><th>Купил</th><th>Продал / цена оценки</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
 </tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div></main></body></html>"""
 
 

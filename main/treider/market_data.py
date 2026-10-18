@@ -12,6 +12,10 @@ import requests
 from main.treider.config import MARKET_DATA_TIMEOUT_SECONDS
 
 
+class InsufficientLiquidity(ValueError):
+    """The returned depth has no executable quantity for the requested sale."""
+
+
 @dataclass(frozen=True)
 class SpotBookTicker:
     exchange: str
@@ -31,6 +35,8 @@ class SpotMarketSell:
     average_price: Decimal
     best_bid: Decimal
     levels_used: int
+    filled_quantity: Decimal
+    remaining_quantity: Decimal
 
 
 def _pair_parts(market_pair: str) -> tuple[str, str]:
@@ -151,6 +157,15 @@ def fetch_market_sell_execution(
     else:
         raise ValueError(f"Биржа {exchange!r} не поддерживается для рыночной продажи")
 
+    return simulate_market_sell(exchange_slug, market_pair, quantity, bids)
+
+
+def simulate_market_sell(
+    exchange: str, market_pair: str, quantity: Decimal, bids: list[list[Any]]
+) -> SpotMarketSell:
+    """Consume bid depth once and preserve any unfilled remainder."""
+    if not quantity.is_finite() or quantity <= 0:
+        raise ValueError(f"Объём рыночной продажи должен быть положительным: {quantity}")
     remaining = quantity
     proceeds = Decimal(0)
     best_bid = Decimal(0)
@@ -167,15 +182,14 @@ def fetch_market_sell_execution(
         remaining -= filled
         levels_used += 1
         if remaining <= 0:
-            return SpotMarketSell(
-                exchange_slug, market_pair, quantity, proceeds,
-                proceeds / quantity, best_bid, levels_used,
-            )
-
+            break
     filled_quantity = quantity - remaining
-    raise ValueError(
-        f"Недостаточно bid-объёма в полученном стакане {exchange_slug} {market_pair}: "
-        f"доступно {filled_quantity} из {quantity}; обработано уровней {levels_used}"
+    if filled_quantity <= 0 or best_bid <= 0:
+        raise InsufficientLiquidity(f"В стакане нет bid-объёма для продажи {exchange} {market_pair}")
+    return SpotMarketSell(
+        exchange, market_pair, quantity, proceeds,
+        proceeds / filled_quantity, best_bid, levels_used,
+        filled_quantity, remaining,
     )
 
 

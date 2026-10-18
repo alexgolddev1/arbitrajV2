@@ -7,10 +7,10 @@ import time
 
 from database import connect_db, initialize_database
 from main.treider.account import initialize_trader_account
-from main.treider.config import SIGNAL_POLL_INTERVAL_SECONDS
+from main.treider.config import SIGNAL_MAX_ATTEMPTS, SIGNAL_POLL_INTERVAL_SECONDS
 from main.treider.logging_setup import configure_logging
-from main.treider.processor import process_opportunity
-from main.treider.queue import claim_next, mark_failed, mark_processed
+from main.treider.processor import TemporaryProcessingError, process_opportunity
+from main.treider.queue import claim_next, mark_processed, mark_rejected, mark_retry
 from main.treider.trade import process_due_training_trade
 
 logger = logging.getLogger(__name__)
@@ -34,14 +34,29 @@ def _consume_one() -> bool:
     message = claim_next()
     if message is None:
         return False
-    signal_id, payload = message
+    signal_id, payload = message.signal_id, message.payload
     try:
-        process_opportunity(payload, signal_id)
+        disposition, reason = process_opportunity(payload, signal_id)
+    except TemporaryProcessingError as error:
+        changed = mark_retry(signal_id, message.lease_token, str(error), message.attempt_count)
+        logger.warning(
+            "Временная ошибка сигнала №%s; попытка %s/%s; отложен=%s; причина=%s",
+            signal_id, message.attempt_count, SIGNAL_MAX_ATTEMPTS, changed, error,
+        )
+    except (ValueError, KeyError) as error:
+        changed = mark_rejected(signal_id, message.lease_token, str(error))
+        logger.warning("Сигнал №%s отклонён при проверке структуры=%s; причина=%s", signal_id, changed, error)
     except Exception as error:
-        mark_failed(signal_id, str(error))
-        logger.exception("Ошибка обработки сообщения трейдера №%s", signal_id)
+        changed = mark_retry(signal_id, message.lease_token, str(error), message.attempt_count)
+        logger.exception("Сбой обработки сигнала №%s; задача отправлена на повтор=%s", signal_id, changed)
     else:
-        mark_processed(signal_id)
+        if disposition == "temporary_error":
+            changed = mark_retry(signal_id, message.lease_token, reason, message.attempt_count)
+            logger.warning("Временная ошибка сигнала №%s; отложен=%s; причина=%s", signal_id, changed, reason)
+        elif disposition == "rejected":
+            mark_rejected(signal_id, message.lease_token, reason)
+        else:
+            mark_processed(signal_id, message.lease_token, disposition)
     return True
 
 

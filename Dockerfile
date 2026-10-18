@@ -10,5 +10,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY config.py database.py schema.sql ./
 COPY main ./main
+COPY tests ./tests
 
 CMD ["python", "-m", "main"]

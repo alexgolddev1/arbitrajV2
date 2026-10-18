@@ -138,6 +138,54 @@ def initialize_database(connection: MySQLConnection) -> None:
             cursor.execute(
                 "ALTER TABLE opportunity_lifetimes ADD COLUMN transfer_seconds DECIMAL(10, 2) NULL"
             )
+        trader_migrations = {
+            "trader_signals": {
+                "decision": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
+                "attempt_count": "INT UNSIGNED NOT NULL DEFAULT 0",
+                "next_attempt_at": "DATETIME NULL", "expires_at": "DATETIME NULL",
+                "lease_token": "CHAR(36) NULL", "lease_version": "BIGINT UNSIGNED NOT NULL DEFAULT 0",
+            },
+            "trader_training_settlements": {
+                "route_status": "VARCHAR(24) NOT NULL DEFAULT 'legacy'", "route_assumptions": "JSON NULL",
+                "network_name": "VARCHAR(64) NULL", "transfer_seconds": "DECIMAL(12, 3) NULL",
+                "buy_fee_source": "VARCHAR(16) NOT NULL DEFAULT 'legacy'",
+                "sell_fee_source": "VARCHAR(16) NOT NULL DEFAULT 'legacy'",
+                "buy_fee_currency": "VARCHAR(24) NOT NULL DEFAULT 'USDT'",
+                "buy_fee_base_quantity": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
+                "transfer_fee_amount": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
+                "transfer_fee_currency": "VARCHAR(24) NOT NULL DEFAULT 'USDT'",
+                "transfer_fee_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "bought_quantity": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
+                "quantity_after_fees": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
+                "sold_quantity": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
+                "remaining_quantity": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
+                "expected_sell_proceeds_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "expected_profit_before_reserve_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "price_reserve_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "expected_profit_after_reserve_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "sell_proceeds_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "sell_fees_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "buy_debit_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "purchase_model": "VARCHAR(64) NOT NULL DEFAULT 'legacy'",
+                "position_status": "ENUM('legacy','pending_transfer','ready_to_sell','partial','closed','open') NOT NULL DEFAULT 'legacy'",
+                "planned_sell_at": "DATETIME NULL", "actual_sell_at": "DATETIME NULL",
+                "retry_started_at": "DATETIME NULL", "last_valuation_price": "DECIMAL(38, 18) NULL",
+                "valuation_usd": "DECIMAL(38, 12) NULL", "valued_at": "DATETIME NULL",
+                "claim_token": "CHAR(36) NULL",
+            },
+        }
+        for table_name, columns in trader_migrations.items():
+            for column_name, definition in columns.items():
+                cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE %s", (column_name,))
+                if cursor.fetchone() is None:
+                    cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+        cursor.execute("SHOW COLUMNS FROM trader_training_settlements LIKE 'status'")
+        status_column = cursor.fetchone()
+        if status_column is not None and "partial" not in str(status_column[1]).lower():
+            cursor.execute(
+                "ALTER TABLE trader_training_settlements MODIFY COLUMN status "
+                "ENUM('pending','settling','settled','partial','open','expired') NOT NULL DEFAULT 'pending'"
+            )
         cursor.execute("SHOW COLUMNS FROM calculator_market_pairs LIKE 'market_id'")
         market_id_column = cursor.fetchone()
         if market_id_column is not None and not str(market_id_column[1]).lower().startswith("decimal"):

@@ -16,7 +16,11 @@ from main.treider.trade import process_trade
 logger = logging.getLogger(__name__)
 
 
-def process_opportunity(payload: dict[str, Any], signal_id: int) -> None:
+class TemporaryProcessingError(RuntimeError):
+    """The signal may become processable after an API or database retry."""
+
+
+def process_opportunity(payload: dict[str, Any], signal_id: int) -> tuple[str, str]:
     signal = validate_opportunity_signal(payload)
     initial_spread = Decimal(signal["spread_percent"])
     minimum_spread = CALCULATOR_SPREAD_LEVELS[0]
@@ -35,23 +39,29 @@ def process_opportunity(payload: dict[str, Any], signal_id: int) -> None:
         transfer = check_transfer_network(signal)
     except Exception as error:
         logger.exception("Связка отклонена: ошибка проверки сети; %s; причина=%s", context, error)
-        return
+        raise TemporaryProcessingError(f"временная ошибка проверки сети: {error}") from error
     if not transfer["available"]:
+        if transfer.get("errors"):
+            raise TemporaryProcessingError(
+                f"не удалось проверить сеть; ошибки API: {transfer['errors']}"
+            )
         logger.warning(
-            "Связка неактуальна: общего доступного маршрута перевода нет; %s; валюта=%s; "
+            "Связка отклонена: нет доступного или разрешённого демомаршрута; %s; валюта=%s; "
             "ошибки API сетей=%s",
             context,
             transfer["currency"],
             transfer["errors"],
         )
-        return
+        return "rejected", "нет доступного маршрута"
+    if transfer.get("withdraw_fee") is None:
+        return "rejected", "недостаточно данных: неизвестна комиссия перевода"
 
     logger.info(
         "Маршрут перевода найден: %s → %s, сеть=%s, оценка=%.1f сек., "
-        "допущение по биржам: вывод=%s, ввод=%s; %s",
+        "статус маршрута=%s, допущение по биржам: вывод=%s, ввод=%s; %s",
         transfer["source_exchange"], transfer["destination_exchange"],
         transfer["network"], transfer["estimated_seconds"],
-        transfer["assumed_source"], transfer["assumed_destination"], context,
+        transfer.get("route_status"), transfer["assumed_source"], transfer["assumed_destination"], context,
     )
 
     # Персональные ставки аккаунта — отдельно от комиссии вывода по выбранной сети.
@@ -61,17 +71,18 @@ def process_opportunity(payload: dict[str, Any], signal_id: int) -> None:
             fee_rates[side_name] = get_trade_fee_rates(side["exchange"], side["market_pair"])
         except Exception as error:
             logger.warning(
-                "Не удалось получить торговую комиссию для стороны %s (%s %s): %s; %s",
+                "Нет достоверной комиссии для стороны %s (%s %s): %s; %s",
                 side_name, side["exchange"], side["market_pair"], error, context,
             )
+            raise TemporaryProcessingError(f"нет достоверной комиссии: {error}") from error
         else:
             rates = fee_rates[side_name]
             logger.info(
                 "Торговая комиссия аккаунта: сторона=%s, биржа=%s, пара=%s, "
-                "maker=%.8f%%, taker=%.8f%%, время=%s%s; %s",
+                "maker=%.8f%%, taker=%.8f%%, источник=%s, время=%s%s; %s",
                 side_name, rates.exchange, rates.symbol,
                 rates.maker_rate * 100, rates.taker_rate * 100,
-                rates.checked_at_utc,
+                rates.source, rates.checked_at_utc,
                 f", {rates.details}" if rates.details else "",
                 context,
             )
@@ -87,7 +98,7 @@ def process_opportunity(payload: dict[str, Any], signal_id: int) -> None:
             "Связка неактуальна: не удалось повторно получить spot-котировки; %s; причина=%s",
             context, error,
         )
-        return
+        raise TemporaryProcessingError(f"временная ошибка получения стакана: {error}") from error
 
     change = current_spread - initial_spread
     if current_spread < minimum_spread:
@@ -98,7 +109,7 @@ def process_opportunity(payload: dict[str, Any], signal_id: int) -> None:
             minimum_spread, initial_spread, current_spread, change,
             buy_book.ask, buy_book.exchange, sell_book.bid, sell_book.exchange, context,
         )
-        return
+        return "rejected", "текущий спред ниже минимального"
 
     logger.info(
         "Связка актуальна: исходный спред=%s%%, текущий=%s%%, изменение=%s п.п., "
@@ -107,8 +118,8 @@ def process_opportunity(payload: dict[str, Any], signal_id: int) -> None:
         buy_book.ask, buy_book.exchange, sell_book.bid, sell_book.exchange,
         transfer["network"], context,
     )
-    process_trade(
+    return process_trade(
         signal, signal_id, buy_book, sell_book,
         fee_rates.get("покупка"), fee_rates.get("продажа"),
-        transfer["estimated_seconds"],
+        transfer,
     )

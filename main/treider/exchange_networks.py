@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -28,6 +29,15 @@ from config import (
     OKX_API_KEY,
     OKX_API_PASSPHRASE,
     OKX_API_SECRET,
+    TRANSFER_NETWORK_MAP,
+)
+from main.treider.config import (
+    ALLOW_DISABLED_ROUTE_DEMO,
+    ALLOW_UNCONFIRMED_ROUTE_DEMO,
+    FIXED_TRANSFER_SECONDS,
+    TRANSFER_FEE_AMOUNT,
+    TRANSFER_FEE_CURRENCY,
+    TRANSFER_NETWORK,
 )
 from main.treider.tran_emulation import TransferTimeEmulator
 
@@ -35,10 +45,11 @@ TIMEOUT_SECONDS = 20
 EXCHANGES = ("binance", "bybit", "okx", "mexc")
 NETWORK_ALIASES = {
     "TRON": ("TRON", "TRC20", "TRC-20", "TRX"),
-    "BSC": ("BSC", "BEP20", "BEP-20", "BNB SMART", "BNB CHAIN"),
+    "BSC": ("BSC", "BEP20", "BEP-20", "BNB SMART", "BNB CHAIN", "BEP20BSC"),
     "SOLANA": ("SOLANA", "SOL", "SPL"),
     "TON": ("TON", "TONCOIN", "THE OPEN NETWORK"),
     "ETHEREUM": ("ETHEREUM", "ERC20", "ERC-20", "ETH"),
+    "ARBITRUM": ("ARBITRUM", "ARBITRUM ONE", "ARBITRUMONE", "ARB", "ARBITRUM-ONE"),
     "BITCOIN": ("BITCOIN", "BTC"),
 }
 
@@ -69,13 +80,25 @@ def _network_record(
     contract_address: Any = None,
     raw: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    def enabled_flag(value: Any) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "enabled", "enable"}:
+            return True
+        if normalized in {"0", "false", "no", "disabled", "disable"}:
+            return False
+        return None
+
     return {
         "exchange": exchange,
         "currency": currency.upper(),
         "network_code": str(network_code or ""),
         "network_name": str(network_name or network_code or ""),
-        "deposit_enabled": deposit_enabled,
-        "withdraw_enabled": withdraw_enabled,
+        "deposit_enabled": enabled_flag(deposit_enabled),
+        "withdraw_enabled": enabled_flag(withdraw_enabled),
         "withdraw_fee": fee,
         "min_deposit": min_deposit,
         "min_withdraw": min_withdraw,
@@ -253,14 +276,38 @@ def get_exchange_networks(
 
 
 def _network_profile(record: dict[str, Any]) -> str:
-    """Map exchange-specific chain labels to the transfer emulator's profiles."""
-    label = f"{record.get('network_code', '')} {record.get('network_name', '')}".upper()
-    compact = "".join(character for character in label if character.isalnum())
-    for profile, aliases in NETWORK_ALIASES.items():
-        for alias in aliases:
-            alias_compact = "".join(character for character in alias if character.isalnum())
-            if alias_compact and alias_compact in compact:
-                return profile
+    """Map labels and compound API names without confusing different chains.
+
+    Exchange APIs commonly return labels such as ``Ethereum (ERC20)`` or
+    ``MEME-ERC20``. Match known aliases as complete alphanumeric tokens/phrases,
+    then reject labels that contain aliases from more than one chain (for
+    example ``ETH-ARB``).
+    """
+    def profile_for(value: Any) -> str | None:
+        label_tokens = re.findall(r"[A-Z0-9]+", str(value or "").upper())
+        if not label_tokens:
+            return None
+        label = f" {' '.join(label_tokens)} "
+        matches = {
+            profile
+            for profile, aliases in NETWORK_ALIASES.items()
+            if any(
+                f" {' '.join(re.findall(r'[A-Z0-9]+', alias.upper()))} " in label
+                for alias in aliases
+            )
+        }
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    code_profile = profile_for(record.get("network_code"))
+    name_profile = profile_for(record.get("network_name"))
+    if code_profile and name_profile and code_profile != name_profile:
+        identity = "".join(
+            character for character in f"{record.get('network_code')}:{record.get('network_name')}".upper()
+            if character.isalnum()
+        )
+        return f"UNKNOWN:{identity}"
+    if code_profile or name_profile:
+        return code_profile or name_profile  # Prefer the exchange's network code.
     identity = "".join(
         character for character in str(record.get("network_code") or record.get("network_name") or "UNKNOWN").upper()
         if character.isalnum()
@@ -280,12 +327,9 @@ def build_transfer_routes(
     exchange_data: dict[str, Any],
     *,
     emulator: TransferTimeEmulator | None = None,
+    configured_profile: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Build usable and assumed routes from withdrawal exchange to deposit exchange.
-
-    If one side has no row for a network, create a clearly marked assumption for
-    that side. A network explicitly reported as disabled is never overridden.
-    """
+    """Build explicit shared routes; only use configured assumptions when allowed."""
     source = source_exchange.strip().lower()
     destination = destination_exchange.strip().lower()
     all_networks = exchange_data.get("networks", {})
@@ -294,41 +338,105 @@ def build_transfer_routes(
     source_by_profile: dict[str, list[dict[str, Any]]] = {}
     destination_by_profile: dict[str, list[dict[str, Any]]] = {}
     for row in source_rows:
-        source_by_profile.setdefault(_network_profile(row), []).append(row)
+        profile = _network_profile(row)
+        if not profile.startswith("UNKNOWN:"):
+            source_by_profile.setdefault(profile, []).append(row)
     for row in destination_rows:
-        destination_by_profile.setdefault(_network_profile(row), []).append(row)
+        profile = _network_profile(row)
+        if not profile.startswith("UNKNOWN:"):
+            destination_by_profile.setdefault(profile, []).append(row)
 
     time_emulator = emulator or TransferTimeEmulator()
     routes = []
-    for profile in sorted(set(source_by_profile) | set(destination_by_profile)):
+    profiles = sorted(set(source_by_profile) & set(destination_by_profile))
+    for profile in profiles:
         source_record = _enabled_record(source_by_profile.get(profile, []), "withdraw_enabled")
         destination_record = _enabled_record(destination_by_profile.get(profile, []), "deposit_enabled")
-        if source_record and source_record.get("withdraw_enabled") is False:
+        unavailable = bool(
+            source_record and source_record.get("withdraw_enabled") is False
+            or destination_record and destination_record.get("deposit_enabled") is False
+        )
+        if unavailable and not ALLOW_DISABLED_ROUTE_DEMO:
             continue
-        if destination_record and destination_record.get("deposit_enabled") is False:
-            continue
-
-        source_assumed = source_record is None
-        destination_assumed = destination_record is None
+        source_assumed = destination_assumed = False
         exemplar = source_record or destination_record or {}
+        source_contract = str((source_record or {}).get("contract_address") or "").strip().lower()
+        destination_contract = str((destination_record or {}).get("contract_address") or "").strip().lower()
+        identity_verified = bool(source_contract and destination_contract and source_contract == destination_contract)
+        route_status = "disabled" if unavailable else "confirmed" if identity_verified else "unconfirmed"
         network_name = profile if not profile.startswith("UNKNOWN:") else (
             exemplar.get("network_name") or exemplar.get("network_code") or "UNKNOWN"
         )
+        if route_status == "unconfirmed" and not ALLOW_UNCONFIRMED_ROUTE_DEMO:
+            continue
         routes.append({
             "currency": currency.strip().upper(),
             "source_exchange": source,
             "destination_exchange": destination,
             "network_profile": profile,
             "network_name": network_name,
-            "withdraw_enabled": True if source_assumed else source_record.get("withdraw_enabled"),
-            "deposit_enabled": True if destination_assumed else destination_record.get("deposit_enabled"),
+            "withdraw_enabled": source_record.get("withdraw_enabled"),
+            "deposit_enabled": destination_record.get("deposit_enabled"),
             "source_assumed": source_assumed,
             "destination_assumed": destination_assumed,
-            "assumed": source_assumed or destination_assumed,
+            "assumed": route_status != "confirmed",
+            "route_status": route_status,
+            "identity_verified": identity_verified,
+            "withdraw_fee": (source_record or {}).get("withdraw_fee"),
+            "withdraw_fee_currency": currency.strip().upper(),
+            "fee_required": (source_record or {}).get("withdraw_fee") is not None,
             "estimated_seconds": time_emulator.get_emulated_duration(profile),
+            "time_model": "seeded_random" if time_emulator.random_mode else "fixed",
+            "random_seed": time_emulator.seed,
+            "fixed_delay_seconds": str(FIXED_TRANSFER_SECONDS),
             "source_network": source_record,
             "destination_network": destination_record,
         })
+    requested_profile = (configured_profile or "").strip().upper()
+    if requested_profile and requested_profile not in {route["network_profile"] for route in routes}:
+        explicit_disabled = any(
+            _network_profile(row) == requested_profile
+            and (row.get("withdraw_enabled") is False or row.get("deposit_enabled") is False)
+            for row in source_rows + destination_rows
+        )
+        if explicit_disabled and not ALLOW_DISABLED_ROUTE_DEMO:
+            # A configured network is a constraint, not merely a preference.
+            # Never silently route through a different chain when it is disabled.
+            return []
+        if (
+            explicit_disabled and ALLOW_DISABLED_ROUTE_DEMO
+            or not explicit_disabled and ALLOW_UNCONFIRMED_ROUTE_DEMO
+        ):
+            source_record = _enabled_record(source_by_profile.get(requested_profile, []), "withdraw_enabled")
+            destination_record = _enabled_record(destination_by_profile.get(requested_profile, []), "deposit_enabled")
+            source_contract = str((source_record or {}).get("contract_address") or "").strip().lower()
+            destination_contract = str((destination_record or {}).get("contract_address") or "").strip().lower()
+            identity_verified = bool(source_contract and destination_contract and source_contract == destination_contract)
+            actual_fee = (source_record or {}).get("withdraw_fee")
+            configured_fee = str(TRANSFER_FEE_AMOUNT) if TRANSFER_FEE_AMOUNT is not None else None
+            routes.append({
+                "currency": currency.strip().upper(), "source_exchange": source,
+                "destination_exchange": destination, "network_profile": requested_profile,
+                "network_name": requested_profile,
+                "withdraw_enabled": (source_record or {}).get("withdraw_enabled"),
+                "deposit_enabled": (destination_record or {}).get("deposit_enabled"),
+                "source_assumed": source_record is None,
+                "destination_assumed": destination_record is None,
+                "assumed": not identity_verified,
+                "route_status": "disabled" if explicit_disabled else "confirmed" if identity_verified else "unconfirmed",
+                "identity_verified": identity_verified,
+                "withdraw_fee": actual_fee if actual_fee is not None else configured_fee,
+                "withdraw_fee_currency": (
+                    currency.strip().upper() if actual_fee is not None
+                    else TRANSFER_FEE_CURRENCY or currency.strip().upper()
+                ),
+                "fee_required": actual_fee is not None or configured_fee is not None,
+                "estimated_seconds": time_emulator.get_emulated_duration(requested_profile),
+                "time_model": "seeded_random" if time_emulator.random_mode else "fixed",
+                "random_seed": time_emulator.seed,
+                "fixed_delay_seconds": str(FIXED_TRANSFER_SECONDS),
+                "source_network": source_record, "destination_network": destination_record,
+            })
     return routes
 
 
@@ -341,12 +449,13 @@ def get_transfer_routes(
     source = source_exchange.strip().lower()
     destination = destination_exchange.strip().lower()
     exchange_data = get_exchange_networks(currency, (source, destination))
+    profile = TRANSFER_NETWORK_MAP.get(currency.strip().upper()) or TRANSFER_NETWORK or None
     return {
         "currency": currency.strip().upper(),
         "source_exchange": source,
         "destination_exchange": destination,
         "routes": build_transfer_routes(
-            currency, source, destination, exchange_data
+            currency, source, destination, exchange_data, configured_profile=profile
         ),
         "errors": exchange_data["errors"],
     }

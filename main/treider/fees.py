@@ -27,6 +27,7 @@ from config import (
     OKX_API_SECRET,
 )
 from main.treider.config import FEE_CACHE_TTL_SECONDS, MARKET_DATA_TIMEOUT_SECONDS
+from main.treider.config import CONFIGURED_TAKER_FEES
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,13 @@ class TradeFeeRates:
     taker_rate: Decimal
     checked_at_utc: str
     details: str = ""
+    source: str = "api"
+    buy_taker_rate: Decimal | None = None
+    sell_taker_rate: Decimal | None = None
+
+    def taker_for(self, side: str) -> Decimal:
+        selected = self.buy_taker_rate if side.lower() == "buy" else self.sell_taker_rate
+        return self.taker_rate if selected is None else selected
 
 
 _cache: dict[tuple[str, str], tuple[float, TradeFeeRates]] = {}
@@ -64,25 +72,58 @@ def _rate(value: Any, name: str) -> Decimal:
     return result
 
 
-def _signed_query(url: str, params: dict[str, Any], secret: str) -> Any:
+def _api_error_details(error: Exception) -> str:
+    """Describe an exchange failure without logging signed URLs or credentials."""
+    response = getattr(error, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", "unknown")
+        try:
+            payload = response.json()
+        except (ValueError, TypeError, AttributeError):
+            payload = None
+        if isinstance(payload, dict):
+            code = next(
+                (payload[key] for key in ("code", "retCode", "errorCode") if key in payload),
+                None,
+            )
+            message = next(
+                (payload[key] for key in ("msg", "retMsg", "message", "error") if key in payload),
+                None,
+            )
+            if code is not None or message is not None:
+                return f"HTTP {status}; код={code}; сообщение={message}"
+        reason = getattr(response, "reason", None)
+        return f"HTTP {status}" + (f"; {reason}" if reason else "")
+    if isinstance(error, requests.RequestException):
+        # RequestException.__str__ may contain a URL with a signed query string.
+        return f"сетевая ошибка {type(error).__name__}"
+    return f"{type(error).__name__}: {error}"
+
+
+def _signed_query(
+    url: str, params: dict[str, Any], secret: str, *, api_key: str, header_name: str
+) -> Any:
     query = urlencode(params)
     signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
     response = requests.get(
         url,
         params={**params, "signature": signature},
+        headers={header_name: api_key},
         timeout=MARKET_DATA_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return response.json()
 
 
-def _binance(symbol: str) -> tuple[Decimal, Decimal, str]:
+def _binance(symbol: str) -> tuple[Decimal, Decimal, str, Decimal, Decimal]:
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
         raise RuntimeError("Не заданы ключи Binance для чтения торговой комиссии")
     payload = _signed_query(
         "https://api.binance.com/api/v3/account/commission",
         {"symbol": symbol, "timestamp": int(time.time() * 1000)},
         BINANCE_API_SECRET,
+        api_key=BINANCE_API_KEY,
+        header_name="X-MBX-APIKEY",
     )
     standard = payload.get("standardCommission") or {}
     special = payload.get("specialCommission") or {}
@@ -90,19 +131,25 @@ def _binance(symbol: str) -> tuple[Decimal, Decimal, str]:
     discount = payload.get("discount") or {}
     standard_maker = _rate(standard.get("maker"), "standard maker")
     standard_taker = _rate(standard.get("taker"), "standard taker")
-    maker = standard_maker + _rate(special.get("maker", "0"), "special maker")
-    maker += _rate(tax.get("maker", "0"), "tax maker")
-    taker = standard_taker + _rate(special.get("taker", "0"), "special taker")
-    taker += _rate(tax.get("taker", "0"), "tax taker")
+    maker_special = _rate(special.get("maker", "0"), "special maker")
+    taker_special = _rate(special.get("taker", "0"), "special taker")
+    maker_tax = _rate(tax.get("maker", "0"), "tax maker")
+    taker_tax = _rate(tax.get("taker", "0"), "tax taker")
+    maker = standard_maker + maker_special + maker_tax
+    taker = standard_taker + taker_special + taker_tax
+    buy_rate = taker + _rate(standard.get("buyer", "0"), "standard buyer")
+    buy_rate += _rate(special.get("buyer", "0"), "special buyer")
+    buy_rate += _rate(tax.get("buyer", "0"), "tax buyer")
+    sell_rate = taker + _rate(standard.get("seller", "0"), "standard seller")
+    sell_rate += _rate(special.get("seller", "0"), "special seller")
+    sell_rate += _rate(tax.get("seller", "0"), "tax seller")
     discount_enabled = bool(discount.get("enabledForAccount") and discount.get("enabledForSymbol"))
-    if discount_enabled:
-        multiplier = _rate(discount.get("discount", "1"), "BNB discount")
-        maker -= standard_maker * (Decimal(1) - multiplier)
-        taker -= standard_taker * (Decimal(1) - multiplier)
-    return maker, taker, f"BNB discount enabled={discount_enabled}"
+    # API eligibility is not proof that the account holds enough BNB at execution time.
+    # Deliberately do not apply the discount until BNB balance is checked as part of execution.
+    return maker, taker, f"BNB discount eligible={discount_enabled}; not applied (BNB balance unverified)", buy_rate, sell_rate
 
 
-def _bybit(symbol: str) -> tuple[Decimal, Decimal, str]:
+def _bybit(symbol: str) -> tuple[Decimal, Decimal, str, Decimal, Decimal]:
     if not BYBIT_API_KEY or not BYBIT_API_SECRET:
         raise RuntimeError("Не заданы ключи Bybit для чтения торговой комиссии")
     timestamp = str(int(time.time() * 1000))
@@ -134,10 +181,12 @@ def _bybit(symbol: str) -> tuple[Decimal, Decimal, str]:
     item = next((row for row in rows if row.get("symbol", "").upper() == symbol), None)
     if item is None:
         raise ValueError(f"Bybit не вернул торговую комиссию для {symbol}")
-    return _rate(item.get("makerFeeRate"), "maker"), _rate(item.get("takerFeeRate"), "taker"), ""
+    maker = _rate(item.get("makerFeeRate"), "maker")
+    taker = _rate(item.get("takerFeeRate"), "taker")
+    return maker, taker, "", taker, taker
 
 
-def _okx(symbol: str) -> tuple[Decimal, Decimal, str]:
+def _okx(symbol: str) -> tuple[Decimal, Decimal, str, Decimal, Decimal]:
     if not (OKX_API_KEY and OKX_API_SECRET and OKX_API_PASSPHRASE):
         raise RuntimeError("Не заданы ключи и passphrase OKX для чтения торговой комиссии")
     path = "/api/v5/account/trade-fee"
@@ -167,21 +216,28 @@ def _okx(symbol: str) -> tuple[Decimal, Decimal, str]:
     if not items:
         raise ValueError(f"OKX не вернул торговую комиссию для {symbol}")
     item = items[0]
-    return _rate(item.get("maker"), "maker"), _rate(item.get("taker"), "taker"), ""
+    # OKX fee rates are negative for charges and positive for rebates; app convention is opposite.
+    maker = -_rate(item.get("maker"), "maker")
+    taker = -_rate(item.get("taker"), "taker")
+    return maker, taker, "OKX rates normalized: positive is cost, negative is rebate", taker, taker
 
 
-def _mexc(symbol: str) -> tuple[Decimal, Decimal, str]:
+def _mexc(symbol: str) -> tuple[Decimal, Decimal, str, Decimal, Decimal]:
     if not MEXC_API_KEY or not MEXC_API_SECRET:
         raise RuntimeError("Не заданы ключи MEXC для чтения торговой комиссии")
     payload = _signed_query(
         "https://api.mexc.com/api/v3/tradeFee",
         {"symbol": symbol, "timestamp": int(time.time() * 1000)},
         MEXC_API_SECRET,
+        api_key=MEXC_API_KEY,
+        header_name="X-MEXC-APIKEY",
     )
     if str(payload.get("code")) not in {"0", "200"}:
         raise RuntimeError(f"MEXC вернул ошибку {payload.get('code')}: {payload.get('msg')}")
     data = payload.get("data") or {}
-    return _rate(data.get("makerCommission"), "maker"), _rate(data.get("takerCommission"), "taker"), ""
+    maker = _rate(data.get("makerCommission"), "maker")
+    taker = _rate(data.get("takerCommission"), "taker")
+    return maker, taker, "", taker, taker
 
 
 _FETCHERS = {"binance": _binance, "bybit": _bybit, "okx": _okx, "mexc": _mexc}
@@ -200,7 +256,20 @@ def get_trade_fee_rates(exchange: str, market_pair: str) -> TradeFeeRates:
         if cached and now - cached[0] <= FEE_CACHE_TTL_SECONDS:
             return cached[1]
 
-    maker, taker, details = _FETCHERS[exchange_slug](symbol)
+    try:
+        maker, taker, details, buy_taker, sell_taker = _FETCHERS[exchange_slug](symbol)
+        source = "api"
+    except Exception as error:
+        error_details = _api_error_details(error)
+        configured = CONFIGURED_TAKER_FEES.get(exchange_slug)
+        if configured is None:
+            raise RuntimeError(
+                f"Нет комиссии {exchange_slug} {symbol}: {error_details}; "
+                "настроенная резервная ставка отсутствует"
+            ) from error
+        maker = taker = buy_taker = sell_taker = configured
+        details = f"Использована настроенная ставка; ошибка API: {error_details}"
+        source = "config"
     result = TradeFeeRates(
         exchange=exchange_slug,
         symbol=symbol,
@@ -208,6 +277,9 @@ def get_trade_fee_rates(exchange: str, market_pair: str) -> TradeFeeRates:
         taker_rate=taker,
         checked_at_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         details=details,
+        source=source,
+        buy_taker_rate=buy_taker,
+        sell_taker_rate=sell_taker,
     )
     with _cache_lock:
         _cache[cache_key] = (time.monotonic(), result)

@@ -42,3 +42,51 @@ except InvalidOperation as error:
     raise ValueError("TRADER_INITIAL_BALANCE_USD должен быть числом") from error
 if not INITIAL_BALANCE_USD.is_finite() or INITIAL_BALANCE_USD < 0:
     raise ValueError("TRADER_INITIAL_BALANCE_USD должен быть конечным неотрицательным числом")
+
+
+def _decimal_setting(name: str, default: str) -> Decimal:
+    try:
+        value = Decimal(os.getenv(name, default))
+    except InvalidOperation as error:
+        raise ValueError(f"{name} должен быть десятичным числом") from error
+    if not value.is_finite():
+        raise ValueError(f"{name} должен быть конечным числом")
+    return value
+
+
+# Явные ставки taker для демо. Пустое значение означает, что запасной ставки нет.
+CONFIGURED_TAKER_FEES: dict[str, Decimal | None] = {}
+for _exchange in ("BINANCE", "BYBIT", "OKX", "MEXC"):
+    _raw_fee = os.getenv(f"TRADER_{_exchange}_TAKER_FEE", "").strip()
+    CONFIGURED_TAKER_FEES[_exchange.lower()] = (
+        _decimal_setting(f"TRADER_{_exchange}_TAKER_FEE", _raw_fee)
+        if _raw_fee else None
+    )
+
+# Исследовательский деморежим допускает предполагаемый маршрут без подтверждения API.
+ALLOW_UNCONFIRMED_ROUTE_DEMO = os.getenv("TRADER_ALLOW_UNCONFIRMED_ROUTE_DEMO", "1").strip() == "1"
+ALLOW_DISABLED_ROUTE_DEMO = os.getenv("TRADER_ALLOW_DISABLED_ROUTE_DEMO", "0").strip() == "1"
+FIXED_TRANSFER_SECONDS = _decimal_setting("TRADER_FIXED_TRANSFER_SECONDS", "300")
+RANDOM_TRANSFER_TIME = os.getenv("TRADER_RANDOM_TRANSFER_TIME", "0").strip() == "1"
+TRANSFER_RANDOM_SEED = os.getenv("TRADER_TRANSFER_RANDOM_SEED", "").strip()
+TRANSFER_NETWORK = os.getenv("TRADER_TRANSFER_NETWORK", "").strip().upper()
+_transfer_fee_raw = os.getenv("TRADER_TRANSFER_FEE_AMOUNT", "").strip()
+TRANSFER_FEE_AMOUNT = (
+    _decimal_setting("TRADER_TRANSFER_FEE_AMOUNT", _transfer_fee_raw)
+    if _transfer_fee_raw else None
+)
+TRANSFER_FEE_CURRENCY = os.getenv("TRADER_TRANSFER_FEE_CURRENCY", "").strip().upper()
+MIN_NET_PROFIT_USDT = _decimal_setting("TRADER_MIN_NET_PROFIT_USDT", "0")
+PRICE_MOVE_RESERVE_PERCENT = _decimal_setting("TRADER_PRICE_MOVE_RESERVE_PERCENT", "0")
+SETTLEMENT_RETRY_SECONDS = max(1, int(os.getenv("TRADER_SETTLEMENT_RETRY_SECONDS", "15")))
+SETTLEMENT_MAX_WAIT_SECONDS = max(SETTLEMENT_RETRY_SECONDS, int(os.getenv("TRADER_SETTLEMENT_MAX_WAIT_SECONDS", "3600")))
+SIGNAL_MAX_AGE_SECONDS = max(1, int(os.getenv("TRADER_SIGNAL_MAX_AGE_SECONDS", "300")))
+SIGNAL_MAX_ATTEMPTS = max(1, int(os.getenv("TRADER_SIGNAL_MAX_ATTEMPTS", "5")))
+BUY_FEE_CURRENCY = {
+    exchange: os.getenv(f"TRADER_{exchange.upper()}_BUY_FEE_CURRENCY", "quote").strip().lower()
+    for exchange in ("binance", "bybit", "okx", "mexc")
+}
+if any(value not in {"base", "quote"} for value in BUY_FEE_CURRENCY.values()):
+    raise ValueError("TRADER_*_BUY_FEE_CURRENCY принимает только base или quote")
+if MIN_NET_PROFIT_USDT < 0 or PRICE_MOVE_RESERVE_PERCENT < 0 or TRANSFER_FEE_AMOUNT is not None and TRANSFER_FEE_AMOUNT < 0:
+    raise ValueError("Порог прибыли, резерв и комиссия перевода не могут быть отрицательными")
