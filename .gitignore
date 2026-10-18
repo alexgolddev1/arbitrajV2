@@ -1,0 +1,26 @@
+# Виртуальные окружения Python
+.venv/
+venv/
+
+# Кэш и скомпилированные файлы Python
+__pycache__/
+*.py[cod]
+
+# Локальные данные и дампы БД
+/data/
+*.db
+*.sqlite
+*.sqlite3
+*.sql.gz
+*.dump
+
+# Логи выполнения (сохраняем placeholder)
+/log/*
+!/log/.gitkeep
+
+# Временные файлы и мусор ОС
+/tmp/
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
