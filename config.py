@@ -26,6 +26,17 @@ CMC_API_URL = os.getenv(
 )
 CMC_REQUEST_TIMEOUT_SECONDS = (10, 45)
 
+# РљРѕС‚РёСЂСѓСЋС‰Р°СЏ РІР°Р»СЋС‚Р° РґР»СЏ СЂС‹РЅРєРѕРІ СЃРєСЂРёРЅРµСЂР°. РџСѓСЃС‚РѕРµ Р·РЅР°С‡РµРЅРёРµ РѕС‚РєР»СЋС‡Р°РµС‚ С„РёР»СЊС‚СЂ.
+SCREENER_QUOTE_SYMBOLS = tuple(
+    symbol.strip().upper()
+    for symbol in os.getenv(
+        "SCREENER_QUOTE_SYMBOLS",
+        os.getenv("SCREENER_QUOTE_SYMBOL", "USDT,USDC"),
+    ).split(",")
+    if symbol.strip()
+)
+SCREENER_QUOTE_SYMBOLS_CSV = ",".join(SCREENER_QUOTE_SYMBOLS)
+
 # Параметры калькулятора. Список бирж задаётся slug через запятую в .env.
 CALCULATOR_API_URL = os.getenv(
     "CALCULATOR_API_URL",

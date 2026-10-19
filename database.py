@@ -22,6 +22,7 @@ from config import (
     DB_RETRY_DELAY_SECONDS,
     DB_USER,
     DEFAULT_CONFIG,
+    SCREENER_QUOTE_SYMBOLS_CSV,
 )
 
 logger = logging.getLogger(__name__)
@@ -283,7 +284,9 @@ def get_calculator_sources(connection: MySQLConnection) -> list[dict[str, Any]]:
             "SELECT market_id, base_currency_slug, base_symbol, quote_symbol "
             "FROM market_pairs "
             "WHERE base_currency_slug IS NOT NULL AND base_currency_slug <> '' "
-            "AND quote_symbol IS NOT NULL AND quote_symbol <> ''"
+            "AND quote_symbol IS NOT NULL AND quote_symbol <> '' "
+            "AND (%s = '' OR FIND_IN_SET(UPPER(quote_symbol), %s) > 0)",
+            (SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
         )
         rows = cursor.fetchall()
     return [
@@ -308,7 +311,9 @@ def get_websocket_markets(connection: MySQLConnection) -> list[dict[str, Any]]:
             "FROM calculator_market_pairs AS venue "
             "JOIN market_pairs AS source ON source.market_id = venue.source_market_id "
             "WHERE LOWER(venue.category) = 'spot' AND venue.price IS NOT NULL AND venue.price > 0 "
-            "ORDER BY venue.source_market_id, venue.exchange_slug, venue.rank_no"
+            "AND (%s = '' OR FIND_IN_SET(UPPER(source.quote_symbol), %s) > 0) "
+            "ORDER BY venue.source_market_id, venue.exchange_slug, venue.rank_no",
+            (SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
         )
         rows = cursor.fetchall()
     # One instrument per exchange per source pair avoids duplicate comparisons.

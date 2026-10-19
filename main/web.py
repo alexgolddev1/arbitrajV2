@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
-from config import BUY_PRICE_MUST_BE_LOWER, CALCULATOR_SPREAD_LEVELS
+from config import BUY_PRICE_MUST_BE_LOWER, CALCULATOR_SPREAD_LEVELS, SCREENER_QUOTE_SYMBOLS_CSV
 from database import connect_db, initialize_database, read_config
 
 logger = logging.getLogger(__name__)
@@ -112,9 +112,10 @@ def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
                 "FROM opportunity_lifetimes AS life "
                 "JOIN market_pairs AS source ON source.market_id = life.source_market_id "
                 "WHERE life.is_active = 1 AND life.threshold_percent = %s "
+                "AND (%s = '' OR FIND_IN_SET(UPPER(source.quote_symbol), %s) > 0) "
                 f"AND life.buy_price {price_direction} life.sell_price "
                 "ORDER BY life.spread_percent DESC, source.market_id",
-                (CALCULATOR_SPREAD_LEVELS[0],),
+                (CALCULATOR_SPREAD_LEVELS[0], SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
             )
             rows = cursor.fetchall()
         return rows, int(config["interval_minutes"])
@@ -388,6 +389,22 @@ def _count_trader_positions(
     return counters
 
 
+def _history_live_button(row: dict[str, Any]) -> str:
+    attrs = {
+        "pair": row["source_pair"],
+        "buy_exchange": row["buy_exchange"],
+        "buy_pair": row["buy_market_pair"],
+        "sell_exchange": row["sell_exchange"],
+        "sell_pair": row["sell_market_pair"],
+    }
+    data = " ".join(
+        f'data-{key.replace("_", "-")}="{html.escape(str(value or ""), quote=True)}"'
+        for key, value in attrs.items()
+    )
+    label = html.escape(str(row["source_pair"]), quote=True)
+    return f'<button class="live-pair-button" type="button" title="Открыть цены в реальном времени" aria-label="Открыть котировки {label}" {data}>⋮</button>'
+
+
 def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
     connection = connect_db()
     try:
@@ -395,7 +412,11 @@ def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
             cursor.execute(
                 "SELECT history_id, source_pair, spread_percent, low_exchange, low_market_pair, low_price, "
                 "high_exchange, high_market_pair, high_price, observed_at "
-                "FROM opportunity_history ORDER BY observed_at DESC, history_id DESC LIMIT 500"
+                "FROM opportunity_history AS history "
+                "JOIN market_pairs AS source ON source.market_id = history.source_market_id "
+                "WHERE (%s = '' OR FIND_IN_SET(UPPER(source.quote_symbol), %s) > 0) "
+                "ORDER BY observed_at DESC, history_id DESC LIMIT 500",
+                (SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
             )
             rows = cursor.fetchall()
             cursor.execute(
@@ -420,10 +441,12 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
                 "SELECT lifetime_id, source_market_id, source_pair, threshold_percent, spread_percent, max_spread_percent, "
                 "buy_exchange, buy_market_pair, buy_price, sell_exchange, sell_market_pair, sell_price, "
                 "started_at, last_confirmed_at, ended_at, duration_seconds, is_active "
-                "FROM opportunity_lifetimes WHERE is_active = %s "
+                "FROM opportunity_lifetimes AS life "
+                "JOIN market_pairs AS source ON source.market_id = life.source_market_id "
+                "WHERE life.is_active = %s AND (%s = '' OR FIND_IN_SET(UPPER(source.quote_symbol), %s) > 0) "
                 f"AND (is_active = 0 OR buy_price {price_direction} sell_price) "
                 "ORDER BY started_at DESC, lifetime_id DESC LIMIT 500",
-                (int(is_active),),
+                (int(is_active), SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
             )
             return cursor.fetchall()
     finally:
@@ -493,7 +516,7 @@ def _render_history(
         total_duration = f"{total_seconds_label} сек. ({total_minutes:.1f} мин.; {episode_count} {episode_word})"
         lifetime_rows_list.append(
             "<tr>"
-            f"<td>{html.escape(str(row['source_pair']))}</td>"
+            f"<td>{_history_live_button(row)} {html.escape(str(row['source_pair']))}</td>"
             f"<td>{threshold}</td><td class=spread>{spread}</td>"
             f"<td>{_market_cell(row['buy_exchange'], row['buy_market_pair'], row['buy_price'])}</td>"
             f"<td>{_market_cell(row['sell_exchange'], row['sell_market_pair'], row['sell_price'])}</td>"
@@ -520,6 +543,13 @@ def _render_history(
   th, td {{ padding: 11px 14px; text-align: left; border-bottom: 1px solid #26334a; white-space: nowrap; }}
   th {{ color: #9fb4d0; font-size: .82rem; text-transform: uppercase; }} .spread {{ color: #67e8a5; font-weight: 700; }}
   a.market-link {{ color: inherit; text-decoration: none; }} a.market-link:hover {{ color: #7dd3fc; text-decoration: underline; }}
+  .live-pair-button {{ margin-right: 8px; width: 28px; height: 30px; padding: 0; border: 1px solid #334155; border-radius: 6px; background: #0b1220; color: #9fb4d0; font-size: 1.25rem; cursor: pointer; }}
+  .live-pair-button:hover {{ border-color: #38bdf8; color: #7dd3fc; }}
+  .live-modal {{ position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center; padding: 16px; background: #020617cc; }} .live-modal[hidden] {{ display: none; }}
+  .live-dialog {{ width: min(760px, 100%); padding: 20px; border: 1px solid #334155; border-radius: 14px; background: #111b2e; }}
+  .live-head {{ display: flex; justify-content: space-between; align-items: center; }} .live-head h2 {{ margin-top: 0; }}
+  .live-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }} .live-card {{ padding: 14px; border: 1px solid #26334a; border-radius: 10px; background: #0b1220; }}
+  .live-card p {{ color: #9fb4d0; }} .live-card strong {{ color: #e5e7eb; }} .live-status {{ color: #fbbf24; }} .live-status.connected {{ color: #67e8a5; }} .live-status.error {{ color: #f87171; }}
 </style></head><body>
 <header><h1>{page_title}</h1><div class="muted">{('Текущие подтверждённые ситуации · список обновляется автоматически' if active_view else f'Последние 500 наблюдений · данные хранятся 30 дней · обновлено {refreshed_at}')}</div>
 <nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a><a href="/trader">Трейдер</a></nav></header>
@@ -527,7 +557,13 @@ def _render_history(
 <tbody>{counter_rows}</tbody></table></div>
 </section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность эпизода</th><th>Суммарное подтверждённое время</th></tr></thead>
 <tbody id="lifetimes-body">{lifetime_rows}</tbody></table></div>
-</main><script>
+</main>
+<div id="history-live-modal" class="live-modal" hidden><section class="live-dialog" role="dialog" aria-modal="true">
+  <div class="live-head"><h2 id="history-live-title"></h2><button id="history-live-close" type="button" aria-label="Закрыть">×</button></div>
+  <div class="live-grid"><article class="live-card"><h3 id="history-buy-title"></h3><p>Bid: <strong id="history-buy-bid">—</strong></p><p>Ask: <strong id="history-buy-ask">—</strong></p><div id="history-buy-status" class="live-status">Подключение…</div></article>
+  <article class="live-card"><h3 id="history-sell-title"></h3><p>Bid: <strong id="history-sell-bid">—</strong></p><p>Ask: <strong id="history-sell-ask">—</strong></p><div id="history-sell-status" class="live-status">Подключение…</div></article></div><h3 id="history-live-spread">Спред: ожидаем котировки</h3>
+</section></div>
+<script>
 function updateLiveDurations() {{
   const now = performance.now();
   document.querySelectorAll('.live-duration[data-elapsed-seconds]').forEach(cell => {{
@@ -544,6 +580,26 @@ function updateLiveDurations() {{
   }});
 }}
 updateLiveDurations(); setInterval(updateLiveDurations, 1000);
+const historyLiveModal = document.getElementById('history-live-modal');
+let historyLiveSockets = [], historyLiveTimers = [], historyLiveQuotes = {{}};
+function historyLiveStatus(side, text, state) {{ const n = document.getElementById('history-' + side + '-status'); n.textContent = text; n.className = 'live-status' + (state ? ' ' + state : ''); }}
+function historyStopLive() {{ historyLiveTimers.forEach(clearInterval); historyLiveTimers = []; historyLiveSockets.forEach(s => {{ try {{ s.close(); }} catch (_) {{}} }}); historyLiveSockets = []; historyLiveQuotes = {{}}; }}
+function historyReceive(side, bid, ask) {{ bid = Number(bid); ask = Number(ask); if (!(bid > 0) || !(ask > 0)) return; historyLiveQuotes[side] = {{bid, ask}}; document.getElementById('history-' + side + '-bid').textContent = bid; document.getElementById('history-' + side + '-ask').textContent = ask; historyLiveStatus(side, 'Обновлено ' + new Date().toLocaleTimeString(), 'connected'); if (historyLiveQuotes.buy && historyLiveQuotes.sell) {{ const a = historyLiveQuotes.buy.ask, b = historyLiveQuotes.sell.bid, spread = (b-a)/a*100; document.getElementById('history-live-spread').textContent = 'Спред по ask покупки и bid продажи: ' + (spread >= 0 ? '+' : '') + spread.toFixed(8) + '%'; }} }}
+function historyParseMexc(buffer) {{ const bytes = new Uint8Array(buffer), state = {{i: 0}}, values = {{}}; function read() {{ let v=0, shift=0, b; do {{ b=bytes[state.i++]; v+=(b&127)*2**shift; shift+=7; }} while ((b&128) && state.i<bytes.length && shift<56); return v; }} function fields(data, save) {{ let i=0; while(i<data.length) {{ const tagState={{i}}, tag=readAt(data,tagState); i=tagState.i; const f=Math.floor(tag/8), w=tag%8; if(w===2) {{ const lenState={{i}},len=readAt(data,lenState); i=lenState.i; const part=data.subarray(i,i+len); i+=len; if(save) values[f]=new TextDecoder().decode(part); else if(f>=1&&f<=4) values[f]=new TextDecoder().decode(part); }} else if(w===0) {{ const st={{i}}; readAt(data,st); i=st.i; }} else if(w===1) i+=8; else if(w===5) i+=4; else throw Error('Неверный protobuf MEXC'); }} }} function readAt(data,st) {{ let v=0,sh=0,b; do {{ b=data[st.i++]; v+=(b&127)*2**sh; sh+=7; }} while((b&128)&&st.i<data.length&&sh<56); return v; }}
+  // Вложенное поле 315 содержит bid/ask; outer protobuf также содержит бинарные служебные поля.
+  let i=0; while(i<bytes.length) {{ const tag=readAt(bytes,{{i}}); const st={{i: 0}}; st.i=i; const actual=readAt(bytes,st); i=st.i; const f=Math.floor(actual/8),w=actual%8; if(w===2) {{ const st2={{i}}; const len=readAt(bytes,st2); i=st2.i; const part=bytes.subarray(i,i+len); i+=len; if(f===315) fields(part,false); }} else if(w===0) {{ const st3={{i}}; readAt(bytes,st3); i=st3.i; }} else if(w===1) i+=8; else if(w===5) i+=4; else throw Error('Неверный protobuf MEXC'); }} return values; }}
+function historyConnectLive(side, exchange, pair) {{ const p=String(pair).toUpperCase().split(/[\/_-]/); if(p.length!==2) {{ historyLiveStatus(side,'Некорректная пара','error'); return; }} const symbol=p.join(''), slug=String(exchange).toLowerCase(); let url,sub;
+  if(slug==='binance') url='wss://stream.binance.com:9443/ws/'+symbol.toLowerCase()+'@bookTicker';
+  else if(slug==='bybit') {{ url='wss://stream.bybit.com/v5/public/spot'; sub=s=>s.send(JSON.stringify({{op:'subscribe',args:['tickers.'+symbol]}})); }}
+  else if(slug==='okx') {{ url='wss://ws.okx.com:8443/ws/v5/public'; sub=s=>s.send(JSON.stringify({{op:'subscribe',args:[{{channel:'tickers',instId:p[0]+'-'+p[1]}}]}})); }}
+  else if(slug==='mexc') {{ url='wss://wbs-api.mexc.com/ws'; sub=s=>{{s.binaryType='arraybuffer';s.send(JSON.stringify({{method:'SUBSCRIPTION',params:['spot@public.aggre.bookTicker.v3.api.pb@100ms@'+symbol]}}));historyLiveTimers.push(setInterval(()=>{{if(s.readyState===WebSocket.OPEN)s.send(JSON.stringify({{method:'PING'}}));}},20000));}}; }}
+  else {{ historyLiveStatus(side,'Биржа не поддерживается: '+exchange,'error'); return; }}
+  historyLiveStatus(side,'Подключение…'); const s=new WebSocket(url); historyLiveSockets.push(s); s.onopen=()=>{{if(historyLiveModal.hidden){{s.close();return;}}if(sub)sub(s);if(slug==='bybit'||slug==='okx')historyLiveTimers.push(setInterval(()=>{{if(s.readyState===WebSocket.OPEN)s.send(slug==='bybit'?JSON.stringify({{op:'ping'}}):'ping');}},20000));}};
+  s.onmessage=e=>{{try{{if(slug==='binance'){{const d=JSON.parse(e.data);historyReceive(side,d.b,d.a);}}else if(slug==='bybit'){{const d=JSON.parse(e.data);if(d.data)historyReceive(side,d.data.bid1Price,d.data.ask1Price);}}else if(slug==='okx'){{const d=JSON.parse(e.data);if(d.data&&d.data.length)historyReceive(side,d.data[0].bidPx,d.data[0].askPx);}}else if(slug==='mexc'&&e.data instanceof ArrayBuffer){{const d=historyParseMexc(e.data);historyReceive(side,d[1],d[3]);}}}}catch(err){{historyLiveStatus(side,'Ошибка данных: '+err.message,'error');}}}}; s.onerror=()=>historyLiveStatus(side,'Ошибка подключения','error'); }}
+document.addEventListener('click',e=>{{const b=e.target.closest('.live-pair-button');if(b){{historyStopLive();const d=b.dataset;historyLiveModal.hidden=false;document.getElementById('history-live-title').textContent=d.pair+' · WebSocket';document.getElementById('history-buy-title').textContent=d.buyExchange+' · '+d.buyPair;document.getElementById('history-sell-title').textContent=d.sellExchange+' · '+d.sellPair;['buy','sell'].forEach(x=>{{document.getElementById('history-'+x+'-bid').textContent='—';document.getElementById('history-'+x+'-ask').textContent='—';historyLiveStatus(x,'Подключение…');}});document.getElementById('history-live-spread').textContent='Спред: ожидаем котировки';historyConnectLive('buy',d.buyExchange,d.buyPair);historyConnectLive('sell',d.sellExchange,d.sellPair);}}if(e.target===historyLiveModal)historyCloseLive();}});
+function historyCloseLive(){{historyLiveModal.hidden=true;historyStopLive();}}
+document.getElementById('history-live-close').addEventListener('click',historyCloseLive);
+document.addEventListener('keydown',e=>{{if(e.key==='Escape'&&!historyLiveModal.hidden)historyCloseLive();}});
 async function refreshLifetimeHistory() {{
   try {{
     const response = await fetch('{"/api/active-situations" if active_view else "/api/history-lifetimes"}', {{cache: 'no-store'}});
@@ -577,8 +633,19 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
             band_index = index
         band = f"band-{band_index}"
         elapsed_seconds = _elapsed_seconds_since(row["started_at"])
+        buy_exchange = str(row["exchange_name"] or "")
+        buy_pair = str(row["venue_pair"] or "")
+        sell_exchange = str(row["sell_exchange"] or "")
+        sell_pair = str(row["sell_market_pair"] or "")
         table_rows.append(
             f'<tr data-source-id="{html.escape(str(row["source_market_id"]))}" data-band="{band}">'
+            f'<td><button class="live-pair-button" type="button" title="Открыть цены в реальном времени" '
+            f'aria-label="Открыть WebSocket-котировки пары {html.escape(str(source_pair), quote=True)}" '
+            f'data-pair="{html.escape(str(source_pair), quote=True)}" '
+            f'data-buy-exchange="{html.escape(buy_exchange, quote=True)}" '
+            f'data-buy-pair="{html.escape(buy_pair, quote=True)}" '
+            f'data-sell-exchange="{html.escape(sell_exchange, quote=True)}" '
+            f'data-sell-pair="{html.escape(sell_pair, quote=True)}">⋮</button></td>'
             f"<td>{html.escape(str(source_pair))}<small>ID {html.escape(str(row['source_market_id']))}</small></td>"
             f"<td class=spread>+{_fmt(row['price_difference_percent'])}%</td>"
             f"<td>{_market_link(row['exchange_name'], row['venue_pair'], row['exchange_name'])}</td>"
@@ -614,7 +681,7 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
     else:
         body = (
             '<div class="table-wrap"><table><thead><tr>'
-            '<th>Исходная пара</th><th>Подтверждённый спред</th>'
+            '<th aria-label="Действия"></th><th>Исходная пара</th><th>Подтверждённый спред</th>'
             '<th>Купить на</th><th>Пара</th><th>Ask</th><th>Продать на</th><th>Пара</th><th>Bid</th>'
             '<th>Котировки</th><th>Возможность с (Киев)</th><th>Длительность</th>'
             '</tr></thead><tbody>' + "".join(table_rows) + "</tbody></table></div>"
@@ -640,7 +707,7 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
     main {{ padding: 24px 4vw; }}
     .summary {{ margin-bottom: 16px; color: #cbd5e1; }}
     .table-wrap {{ overflow-x: auto; border: 1px solid #26334a; border-radius: 10px; }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 980px; background: #111b2e; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 1020px; background: #111b2e; }}
     th, td {{ padding: 12px 14px; text-align: left; border-bottom: 1px solid #26334a; white-space: nowrap; }}
     th {{ color: #9fb4d0; font-size: .82rem; text-transform: uppercase; }}
     tr:last-child td {{ border-bottom: 0; }}
@@ -658,6 +725,19 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
     .filters label {{ cursor: pointer; white-space: nowrap; }} .filters input {{ accent-color: #38bdf8; vertical-align: middle; }}
     .filter-summary {{ margin: -8px 0 12px; color: #9ca3af; font-size: .85rem; }}
     tr[hidden] {{ display: none; }}
+    .live-pair-button {{ width: 30px; height: 34px; padding: 0; border: 1px solid #334155; border-radius: 7px; background: #0b1220; color: #9fb4d0; font-size: 1.35rem; line-height: 1; cursor: pointer; }}
+    .live-pair-button:hover, .live-pair-button:focus-visible {{ border-color: #38bdf8; color: #7dd3fc; outline: none; }}
+    .live-modal {{ position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center; padding: 16px; background: #020617cc; }}
+    .live-modal[hidden] {{ display: none; }}
+    .live-dialog {{ width: min(760px, 100%); padding: 20px; border: 1px solid #334155; border-radius: 14px; background: #111b2e; box-shadow: 0 24px 80px #000a; }}
+    .live-dialog-header {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; }}
+    .live-dialog-header h2 {{ margin: 0; }} .live-close {{ border: 0; background: transparent; color: #cbd5e1; font-size: 1.8rem; cursor: pointer; }}
+    .live-quote-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }}
+    .live-quote-card {{ padding: 14px; border: 1px solid #26334a; border-radius: 10px; background: #0b1220; }}
+    .live-quote-card h3 {{ margin: 0 0 10px; }} .live-quote-card p {{ margin: 6px 0; color: #9fb4d0; }}
+    .live-quote-card strong {{ color: #e5e7eb; font-variant-numeric: tabular-nums; }}
+    .live-connection {{ color: #fbbf24; }} .live-connection.connected {{ color: #67e8a5; }} .live-connection.error {{ color: #f87171; }}
+    .live-current-spread {{ margin-top: 14px; font-size: 1.1rem; font-weight: 700; }}
     nav {{ display: flex; gap: 10px; margin-top: 14px; }}
     nav a {{ padding: 8px 12px; border: 1px solid #334155; border-radius: 8px; color: #7dd3fc; text-decoration: none; }}
     nav a.active {{ background: #1e3a5f; }}
@@ -671,6 +751,16 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
   <div class="muted">Длительность активных возможностей обновляется каждую секунду · данные пересчитываются по расписанию</div></header>
   <main><div class="summary">Позиций: {distinct_positions} · Биржевых строк: {len(rows)} · Страница обновлена: {refreshed_at}</div>
   {body}</main>
+<div id="live-modal" class="live-modal" hidden>
+  <section class="live-dialog" role="dialog" aria-modal="true" aria-labelledby="live-pair-title">
+    <div class="live-dialog-header"><h2 id="live-pair-title"></h2><button id="live-close" class="live-close" type="button" aria-label="Закрыть">×</button></div>
+    <div class="live-quote-grid">
+      <article class="live-quote-card"><h3 id="live-buy-title"></h3><p>Bid: <strong id="live-buy-bid">—</strong></p><p>Ask: <strong id="live-buy-ask">—</strong></p><div id="live-buy-status" class="live-connection">Подключение…</div></article>
+      <article class="live-quote-card"><h3 id="live-sell-title"></h3><p>Bid: <strong id="live-sell-bid">—</strong></p><p>Ask: <strong id="live-sell-ask">—</strong></p><div id="live-sell-status" class="live-connection">Подключение…</div></article>
+    </div>
+    <div id="live-spread" class="live-current-spread">Спред: ожидаем котировки обеих бирж</div>
+  </section>
+</div>
 <script>
 function updateLiveDurations() {{
   const now = performance.now();
@@ -737,6 +827,171 @@ async function refreshWorkerStatus() {{
 }}
 refreshWorkerStatus();
 setInterval(refreshWorkerStatus, 1000);
+const liveModal = document.getElementById('live-modal');
+const liveSockets = [];
+const liveHeartbeatTimers = [];
+let liveQuotes = {{}};
+function parseLivePair(pair) {{
+  const parts = String(pair || '').toUpperCase().split(/[\/_-]/);
+  if (parts.length !== 2 || !/^[A-Z0-9]+$/.test(parts[0]) || !/^[A-Z0-9]+$/.test(parts[1])) return null;
+  const match = parts[0].match(/^(\d+)(?=[A-Z])/);
+  return {{base: parts[0], quote: parts[1], unitCount: match ? Number(match[1]) : 1}};
+}}
+function setLiveStatus(side, message, state) {{
+  const element = document.getElementById('live-' + side + '-status');
+  element.textContent = message;
+  element.className = 'live-connection' + (state ? ' ' + state : '');
+}}
+function formatLivePrice(value) {{
+  return new Intl.NumberFormat('en-US', {{maximumSignificantDigits: 14}}).format(value);
+}}
+function updateLiveSpread() {{
+  const buy = liveQuotes.buy, sell = liveQuotes.sell;
+  const output = document.getElementById('live-spread');
+  if (!buy || !sell) {{ output.textContent = 'Спред: ожидаем котировки обеих бирж'; return; }}
+  const buyAsk = buy.ask / buy.unitCount;
+  const sellBid = sell.bid / sell.unitCount;
+  const spread = (sellBid - buyAsk) / buyAsk * 100;
+  output.textContent = 'Спред по ask покупки и bid продажи: ' + (spread >= 0 ? '+' : '') + spread.toFixed(8) + '%';
+  output.style.color = spread >= 0 ? '#67e8a5' : '#f87171';
+}}
+function receiveLiveQuote(side, bid, ask, unitCount) {{
+  const bidPrice = Number(bid), askPrice = Number(ask);
+  if (!Number.isFinite(bidPrice) || !Number.isFinite(askPrice) || bidPrice <= 0 || askPrice <= 0) return;
+  liveQuotes[side] = {{bid: bidPrice, ask: askPrice, unitCount: unitCount}};
+  document.getElementById('live-' + side + '-bid').textContent = formatLivePrice(bidPrice);
+  document.getElementById('live-' + side + '-ask').textContent = formatLivePrice(askPrice);
+  setLiveStatus(side, 'Котировка обновлена ' + new Date().toLocaleTimeString(), 'connected');
+  updateLiveSpread();
+}}
+function readProtoVarint(bytes, state) {{
+  let value = 0, shift = 0;
+  while (state.offset < bytes.length && shift <= 49) {{
+    const byte = bytes[state.offset++];
+    value += (byte & 127) * Math.pow(2, shift);
+    if ((byte & 128) === 0) return value;
+    shift += 7;
+  }}
+  throw new Error('Повреждённое protobuf-сообщение MEXC');
+}}
+function readProtoFields(bytes, callback) {{
+  const state = {{offset: 0}};
+  while (state.offset < bytes.length) {{
+    const tag = readProtoVarint(bytes, state);
+    const field = Math.floor(tag / 8), wire = tag % 8;
+    if (wire === 2) {{
+      const length = readProtoVarint(bytes, state);
+      const end = state.offset + length;
+      if (end > bytes.length) throw new Error('Обрезанное protobuf-сообщение MEXC');
+      callback(field, wire, bytes.subarray(state.offset, end));
+      state.offset = end;
+    }} else if (wire === 0) {{
+      callback(field, wire, readProtoVarint(bytes, state));
+    }} else if (wire === 1) {{ state.offset += 8;
+    }} else if (wire === 5) {{ state.offset += 4;
+    }} else {{ throw new Error('Неизвестный protobuf-формат MEXC'); }}
+  }}
+}}
+function decodeMexcBookTicker(buffer) {{
+  let symbol = '', ticker = {{}};
+  const decoder = new TextDecoder();
+  readProtoFields(new Uint8Array(buffer), (field, wire, value) => {{
+    if (wire !== 2) return;
+    if (field === 3) symbol = decoder.decode(value);
+    if (field === 315) {{
+      readProtoFields(value, (tickerField, tickerWire, tickerValue) => {{
+        if (tickerWire === 2 && tickerField >= 1 && tickerField <= 4) {{
+          ticker[tickerField] = decoder.decode(tickerValue);
+        }}
+      }});
+    }}
+  }});
+  return {{symbol: symbol, bid: ticker[1], bidSize: ticker[2], ask: ticker[3], askSize: ticker[4]}};
+}}
+function stopLiveSockets() {{
+  liveHeartbeatTimers.forEach(timer => clearInterval(timer));
+  liveHeartbeatTimers.length = 0;
+  liveSockets.forEach(socket => {{ try {{ socket.close(); }} catch (_) {{}} }});
+  liveSockets.length = 0;
+  liveQuotes = {{}};
+}}
+function connectLiveExchange(side, exchange, pair) {{
+  const parsed = parseLivePair(pair);
+  if (!parsed) {{ setLiveStatus(side, 'Некорректная торговая пара', 'error'); return; }}
+  const symbol = parsed.base + parsed.quote;
+  const slug = String(exchange || '').toLowerCase();
+  let url = '', subscribe = null;
+  if (slug === 'binance') url = 'wss://stream.binance.com:9443/ws/' + symbol.toLowerCase() + '@bookTicker';
+  else if (slug === 'bybit') {{
+    url = 'wss://stream.bybit.com/v5/public/spot';
+    subscribe = socket => socket.send(JSON.stringify({{op: 'subscribe', args: ['tickers.' + symbol]}}));
+  }} else if (slug === 'okx') {{
+    url = 'wss://ws.okx.com:8443/ws/v5/public';
+    subscribe = socket => socket.send(JSON.stringify({{op: 'subscribe', args: [{{channel: 'tickers', instId: parsed.base + '-' + parsed.quote}}]}}));
+  }} else if (slug === 'mexc') {{
+    url = 'wss://wbs-api.mexc.com/ws';
+    subscribe = socket => {{
+      socket.binaryType = 'arraybuffer';
+      socket.send(JSON.stringify({{method: 'SUBSCRIPTION', params: ['spot@public.aggre.bookTicker.v3.api.pb@100ms@' + symbol]}}));
+      liveHeartbeatTimers.push(setInterval(() => {{ if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({{method: 'PING'}})); }}, 20000));
+    }};
+  }} else {{ setLiveStatus(side, 'Биржа не поддерживается: ' + exchange, 'error'); return; }}
+  setLiveStatus(side, 'Подключение к ' + exchange + '…', '');
+  try {{
+    const socket = new WebSocket(url);
+    liveSockets.push(socket);
+    socket.onopen = () => {{
+      if (liveModal.hidden) {{ socket.close(); return; }}
+      setLiveStatus(side, 'Соединение открыто, ждём котировку…', '');
+      if (subscribe) subscribe(socket);
+      if (slug === 'bybit' || slug === 'okx') liveHeartbeatTimers.push(setInterval(() => {{
+        if (socket.readyState === WebSocket.OPEN) socket.send(slug === 'bybit' ? JSON.stringify({{op: 'ping'}}) : 'ping');
+      }}, 20000));
+    }};
+    socket.onmessage = event => {{
+      try {{
+        if (slug === 'binance') {{
+          const data = JSON.parse(event.data);
+          receiveLiveQuote(side, data.b, data.a, parsed.unitCount);
+        }} else if (slug === 'bybit') {{
+          const data = JSON.parse(event.data);
+          if (data.data) receiveLiveQuote(side, data.data.bid1Price, data.data.ask1Price, parsed.unitCount);
+        }} else if (slug === 'okx') {{
+          const data = JSON.parse(event.data);
+          if (data.data && data.data.length) receiveLiveQuote(side, data.data[0].bidPx, data.data[0].askPx, parsed.unitCount);
+        }} else if (slug === 'mexc' && event.data instanceof ArrayBuffer) {{
+          const data = decodeMexcBookTicker(event.data);
+          receiveLiveQuote(side, data.bid, data.ask, parsed.unitCount);
+        }}
+      }} catch (error) {{ setLiveStatus(side, 'Ошибка разбора котировки: ' + error.message, 'error'); }}
+    }};
+    socket.onerror = () => setLiveStatus(side, 'Ошибка подключения к ' + exchange, 'error');
+    socket.onclose = () => {{ if (!liveModal.hidden) setLiveStatus(side, 'Соединение закрыто', 'error'); }};
+  }} catch (error) {{ setLiveStatus(side, 'Не удалось открыть WebSocket: ' + error.message, 'error'); }}
+}}
+function openLiveModal(button) {{
+  stopLiveSockets();
+  const pair = button.dataset.pair;
+  liveModal.hidden = false;
+  document.getElementById('live-pair-title').textContent = pair + ' · котировки WebSocket';
+  document.getElementById('live-buy-title').textContent = button.dataset.buyExchange + ' · ' + button.dataset.buyPair;
+  document.getElementById('live-sell-title').textContent = button.dataset.sellExchange + ' · ' + button.dataset.sellPair;
+  ['buy', 'sell'].forEach(side => {{
+    document.getElementById('live-' + side + '-bid').textContent = '—';
+    document.getElementById('live-' + side + '-ask').textContent = '—';
+    setLiveStatus(side, 'Подключение…', '');
+  }});
+  document.getElementById('live-spread').textContent = 'Спред: ожидаем котировки обеих бирж';
+  document.getElementById('live-spread').style.color = '';
+  connectLiveExchange('buy', button.dataset.buyExchange, button.dataset.buyPair);
+  connectLiveExchange('sell', button.dataset.sellExchange, button.dataset.sellPair);
+  document.getElementById('live-close').focus();
+}}
+function closeLiveModal() {{ liveModal.hidden = true; stopLiveSockets(); }}
+document.querySelectorAll('.live-pair-button').forEach(button => button.addEventListener('click', () => openLiveModal(button)));
+document.getElementById('live-close').addEventListener('click', closeLiveModal);
+liveModal.addEventListener('click', event => {{ if (event.target === liveModal) closeLiveModal(); }});
+document.addEventListener('keydown', event => {{ if (event.key === 'Escape' && !liveModal.hidden) closeLiveModal(); }});
 </script>
 </body>
 </html>"""

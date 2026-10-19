@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any, TypedDict
+
+from config import SCREENER_QUOTE_SYMBOLS
 
 
 class TradeSide(TypedDict):
@@ -97,8 +100,22 @@ def validate_opportunity_signal(payload: dict[str, Any]) -> OpportunitySignal:
         raise ValueError(f"В JSON возможности нет обязательных полей: {', '.join(sorted(missing))}")
     if payload["event"] != "opportunity_matured":
         raise ValueError(f"Неизвестный тип сообщения трейдера: {payload['event']}")
+    source_parts = re.split(r"[/_\-]", str(payload["source_pair"]).strip().upper())
+    if len(source_parts) != 2 or not all(source_parts):
+        raise ValueError(f"Некорректная пара в JSON-сигнале: {payload['source_pair']}")
+    source_quote = source_parts[1]
+    if SCREENER_QUOTE_SYMBOLS and source_quote not in SCREENER_QUOTE_SYMBOLS:
+        allowed = ", ".join(SCREENER_QUOTE_SYMBOLS)
+        raise ValueError(
+            f"котируемая валюта {source_quote} не в списке разрешённых: {allowed}"
+        )
     for side_name in ("buy", "sell"):
         side = payload[side_name]
         if not isinstance(side, dict) or not {"exchange", "market_pair", "price"}.issubset(side):
             raise ValueError(f"В JSON возможности неверно заполнено поле {side_name}")
+        market_parts = re.split(r"[/_\-]", str(side["market_pair"]).strip().upper())
+        if len(market_parts) != 2 or market_parts[1] != source_quote:
+            raise ValueError(
+                f"котируемая валюта пары {side_name} не совпадает с {payload['source_pair']}"
+            )
     return payload  # type: ignore[return-value]

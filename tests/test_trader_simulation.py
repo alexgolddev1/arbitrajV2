@@ -83,6 +83,63 @@ class FeeTests(unittest.TestCase):
         self.assertNotIn("secret-signature", details)
 
 
+class SignalValidationTests(unittest.TestCase):
+    def _payload(self, pair: str = "ABC/USDT") -> dict:
+        return {
+            "event": "opportunity_matured",
+            "lifetime_id": 1,
+            "source_market_id": 1,
+            "source_pair": pair,
+            "threshold_percent": "1",
+            "spread_percent": "1.2",
+            "max_spread_percent": "1.2",
+            "buy": {"exchange": "binance", "market_pair": pair, "price": "1"},
+            "sell": {"exchange": "mexc", "market_pair": pair, "price": "1.01"},
+            "network": "ETHEREUM",
+            "estimated_transfer_seconds": 300,
+            "opportunity_started_at_utc": "2026-10-19T00:00:00+00:00",
+            "lifetime_seconds": 15,
+        }
+
+    def test_rejects_quote_currency_outside_screener_allowlist(self) -> None:
+        from main.treider.signals import validate_opportunity_signal
+
+        with self.assertRaisesRegex(ValueError, "TRY"):
+            validate_opportunity_signal(self._payload("ZIL/TRY"))
+
+    def test_accepts_configured_usdc_quote(self) -> None:
+        from main.treider.signals import validate_opportunity_signal
+
+        self.assertEqual(
+            validate_opportunity_signal(self._payload("ABC/USDC"))["source_pair"],
+            "ABC/USDC",
+        )
+
+
+class WebSocketQuoteFilterTests(unittest.TestCase):
+    @patch("main.calculator.websocket_monitor.get_websocket_markets")
+    @patch("main.calculator.websocket_monitor.connect_db")
+    def test_monitor_loads_usdt_usdc_and_drops_try(self, connect_db: Mock, load_rows: Mock) -> None:
+        from main.calculator.websocket_monitor import _load_instruments
+
+        connection = Mock()
+        connect_db.return_value = connection
+        load_rows.return_value = [
+            {
+                "market_pair": f"ZIL/{quote}", "source_quote_symbol": quote,
+                "exchange_slug": "binance", "source_market_id": index,
+                "source_pair": f"ZIL/{quote}", "source_base_symbol": "ZIL",
+                "exchange_name": "Binance",
+            }
+            for index, quote in enumerate(("USDT", "USDC", "TRY"), start=1)
+        ]
+
+        instruments = _load_instruments()
+
+        self.assertEqual([item.source_pair for item in instruments], ["ZIL/USDT", "ZIL/USDC"])
+        connection.close.assert_called_once_with()
+
+
 class MarketAndRouteTests(unittest.TestCase):
     @patch("main.treider.market_data._get_json")
     def test_mexc_spot_book_keeps_last_price_separate_from_best_bid(self, get_json: Mock) -> None:
@@ -160,6 +217,30 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(exchange_networks._network_profile({"network_code": "Arbitrum One", "network_name": "ARB"}), "ARBITRUM")
         self.assertEqual(exchange_networks._network_profile({"network_code": "ETH-ARB", "network_name": "unknown"}), "UNKNOWN:ETHARB")
         self.assertTrue(exchange_networks._network_profile({"network_code": "ARB", "network_name": "Ethereum"}).startswith("UNKNOWN:"))
+
+    @patch.object(exchange_networks, "ALLOW_UNCONFIRMED_ROUTE_DEMO", True)
+    @patch.object(exchange_networks, "ALLOW_DISABLED_ROUTE_DEMO", False)
+    def test_quick_polygon_route_matches_binance_and_mexc_labels(self) -> None:
+        networks = {
+            "binance": [{
+                "network_code": "MATIC", "network_name": "Polygon POS",
+                "withdraw_enabled": True, "deposit_enabled": True,
+            }],
+            "mexc": [{
+                "network_code": "MATIC", "network_name": "Quickswap",
+                "withdraw_enabled": True, "deposit_enabled": True,
+            }],
+        }
+
+        self.assertEqual(exchange_networks._network_profile(networks["binance"][0]), "POLYGON")
+        self.assertEqual(exchange_networks._network_profile(networks["mexc"][0]), "POLYGON")
+        routes = exchange_networks.build_transfer_routes(
+            "QUICK", "binance", "mexc", {"networks": networks},
+        )
+
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["network_profile"], "POLYGON")
+        self.assertEqual(routes[0]["route_status"], "unconfirmed")
 
     def test_compound_ethereum_labels_match_but_mixed_chain_labels_do_not(self) -> None:
         self.assertEqual(

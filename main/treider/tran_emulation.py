@@ -17,6 +17,7 @@ class TransferTimeEmulator:
         "TRON": {"avg": Decimal(180), "min": Decimal(60), "max": Decimal(350)},
         "BSC": {"avg": Decimal(120), "min": Decimal(45), "max": Decimal(240)},
         "SOLANA": {"avg": Decimal(30), "min": Decimal(10), "max": Decimal(90)},
+        "POLYGON": {"avg": Decimal(120), "min": Decimal(30), "max": Decimal(300)},
         "TON": {"avg": Decimal(40), "min": Decimal(15), "max": Decimal(120)},
         "ETHEREUM": {"avg": Decimal(600), "min": Decimal(240), "max": Decimal(1800)},
         "ARBITRUM": {"avg": Decimal(90), "min": Decimal(20), "max": Decimal(240)},

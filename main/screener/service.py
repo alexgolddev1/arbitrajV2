@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 
 from database import (
     connect_db,
@@ -36,6 +37,8 @@ def update_market_data() -> int:
         selected = 0
         stored = 0
         filtered_out = 0
+        received_quote_counts: Counter[str] = Counter()
+        selected_quote_counts: Counter[str] = Counter()
 
         while start <= stop:
             limit = min(page_size, stop - start + 1)
@@ -46,8 +49,16 @@ def update_market_data() -> int:
             payload = fetch_page(config, start, limit)
             markets = payload["data"]["marketPairs"]
             found += len(markets)
+            received_quote_counts.update(
+                str(market.get("quoteSymbol") or "UNKNOWN").strip().upper()
+                for market in markets
+            )
             selected_markets = filter_markets(markets)
             selected += len(selected_markets)
+            selected_quote_counts.update(
+                str(market.get("quoteSymbol") or "UNKNOWN").strip().upper()
+                for market in selected_markets
+            )
             filtered_out += len(markets) - len(selected_markets)
             rows = [
                 market_values(market)
@@ -69,6 +80,11 @@ def update_market_data() -> int:
             "Обновление завершено: получено %s, прошло фильтр объёма %s, "
             "отфильтровано %s, записано в БД %s, удалено устаревших %s",
             found, selected, filtered_out, stored, deleted,
+        )
+        logger.info(
+            "CoinMarketCap quoteSymbol: получено %s; прошло фильтры: %s",
+            dict(sorted(received_quote_counts.items())),
+            dict(sorted(selected_quote_counts.items())),
         )
         return stored
     finally:

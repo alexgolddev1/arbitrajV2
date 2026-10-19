@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from websockets.asyncio.client import connect
 
-from config import CALCULATOR_SPREAD_LEVELS, TRANSFER_NETWORK_MAP
+from config import CALCULATOR_SPREAD_LEVELS, SCREENER_QUOTE_SYMBOLS, TRANSFER_NETWORK_MAP
 from database import (
     connect_db,
     finalize_interrupted_lifetimes,
@@ -124,7 +124,10 @@ def _load_instruments() -> list[Instrument]:
             continue
         exchange = str(row["exchange_slug"]).lower()
         base, quote_symbol = pair
-        if quote_symbol != str(row["source_quote_symbol"]).upper():
+        if (
+            quote_symbol != str(row["source_quote_symbol"]).upper()
+            or SCREENER_QUOTE_SYMBOLS and quote_symbol not in SCREENER_QUOTE_SYMBOLS
+        ):
             continue
         symbol = f"{base}{quote_symbol}"
         if exchange == "okx":

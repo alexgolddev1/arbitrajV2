@@ -5,13 +5,19 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from config import MAX_VOLUME_USD, MIN_VOLUME_USD
+from config import MAX_VOLUME_USD, MIN_VOLUME_USD, SCREENER_QUOTE_SYMBOLS
 
 
 def filter_markets(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep markets whose rolling 24-hour USD volume is within the inclusive range."""
+    """Keep markets with the configured quote asset and allowed 24-hour USD volume."""
     selected = []
     for market in markets:
+        if (
+            SCREENER_QUOTE_SYMBOLS
+            and str(market.get("quoteSymbol") or "").strip().upper()
+            not in SCREENER_QUOTE_SYMBOLS
+        ):
+            continue
         volume = market.get("volumeUsd")
         if volume is None:
             continue
