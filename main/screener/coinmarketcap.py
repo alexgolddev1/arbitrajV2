@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
 import requests
 from config import CMC_API_URL, CMC_REQUEST_TIMEOUT_SECONDS
+
+logger = logging.getLogger(__name__)
+
+_TRANSIENT_HTTP_STATUSES = {500, 502, 503, 504}
+_MAX_REQUEST_ATTEMPTS = 3
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -76,12 +83,47 @@ def fetch_page(config: dict[str, str], start: int, limit: int) -> dict[str, Any]
         "limit": limit,
         "includeUntracked": config["includeUntracked"],
     }
-    response = requests.get(
-        CMC_API_URL,
-        params=params,
-        headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-        timeout=CMC_REQUEST_TIMEOUT_SECONDS,
-    )
+    response = None
+    for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                CMC_API_URL,
+                params=params,
+                headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+                timeout=CMC_REQUEST_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as error:
+            if attempt >= _MAX_REQUEST_ATTEMPTS:
+                logger.error(
+                    "CoinMarketCap request failed after %s attempts: slug=%s start=%s limit=%s error=%s",
+                    attempt, config["slug"], start, limit, error,
+                )
+                raise
+            logger.warning(
+                "CoinMarketCap request error, retrying (%s/%s): slug=%s start=%s limit=%s error=%s",
+                attempt, _MAX_REQUEST_ATTEMPTS, config["slug"], start, limit, error,
+            )
+            time.sleep(attempt)
+            continue
+
+        if response.status_code in _TRANSIENT_HTTP_STATUSES:
+            body_preview = response.text[:2000].replace("\n", " ").replace("\r", " ")
+            if attempt >= _MAX_REQUEST_ATTEMPTS:
+                logger.error(
+                    "CoinMarketCap returned HTTP %s after %s attempts: slug=%s start=%s limit=%s body=%r",
+                    response.status_code, attempt, config["slug"], start, limit, body_preview,
+                )
+                response.raise_for_status()
+            logger.warning(
+                "CoinMarketCap returned HTTP %s, retrying (%s/%s): slug=%s start=%s limit=%s body=%r",
+                response.status_code, attempt, _MAX_REQUEST_ATTEMPTS,
+                config["slug"], start, limit, body_preview,
+            )
+            time.sleep(attempt)
+            continue
+        break
+
+    assert response is not None
     response.raise_for_status()
     # Parse in memory with Decimal to preserve API numeric precision; no JSON is stored.
     payload = json.loads(response.text, parse_float=Decimal)

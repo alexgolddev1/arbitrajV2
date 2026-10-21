@@ -69,6 +69,17 @@ if (
         "CALCULATOR_SPREAD_LEVELS должен содержать минимум два положительных возрастающих значения, например 0.85,1,1.5"
     )
 CALCULATOR_MIN_SPREAD_PERCENT = CALCULATOR_SPREAD_LEVELS[0]
+CALCULATOR_SPREAD_RESET_PERCENT = Decimal(
+    os.getenv("CALCULATOR_SPREAD_RESET_PERCENT", "0.8")
+)
+if (
+    not CALCULATOR_SPREAD_RESET_PERCENT.is_finite()
+    or CALCULATOR_SPREAD_RESET_PERCENT < 0
+    or CALCULATOR_SPREAD_RESET_PERCENT >= CALCULATOR_MIN_SPREAD_PERCENT
+):
+    raise ValueError(
+        "CALCULATOR_SPREAD_RESET_PERCENT должен быть неотрицательным и ниже минимального порога сигнала"
+    )
 CALCULATOR_REQUEST_DELAY_SECONDS = float(
     os.getenv("CALCULATOR_REQUEST_DELAY_SECONDS", "0.2")
 )

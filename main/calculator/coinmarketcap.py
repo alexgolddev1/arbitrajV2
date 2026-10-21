@@ -26,6 +26,8 @@ from config import (
 logger = logging.getLogger(__name__)
 _request_schedule_lock = threading.Lock()
 _next_request_at = 0.0
+_TRANSIENT_HTTP_STATUSES = {500, 502, 503, 504}
+_MAX_REQUEST_ATTEMPTS = 3
 
 
 def _wait_for_request_slot() -> None:
@@ -56,7 +58,6 @@ def fetch_currency_markets(
     found_exchanges: set[str] = set()
     start = 1
     while True:
-        _wait_for_request_slot()
         logger.debug(
             "Запрос CoinMarketCap: slug=%s, start=%s, limit=%s",
             slug, start, CALCULATOR_PAGE_SIZE,
@@ -71,25 +72,51 @@ def fetch_currency_markets(
             "direction": CALCULATOR_DIRECTION,
             "spotUntracked": CALCULATOR_SPOT_UNTRACKED,
         }
-        response = requests.get(
-            CALCULATOR_API_URL,
-            params=params,
-            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-            timeout=CMC_REQUEST_TIMEOUT_SECONDS,
-        )
-        if not response.ok:
-            # CMC/proxy errors (e.g. 502) often include a useful body, while
-            # raise_for_status() otherwise leaves only the status and URL in logs.
-            body = response.text[:2000]
-            logger.error(
-                "Ответ CoinMarketCap с ошибкой: slug=%s, start=%s, HTTP %s, URL=%s, body=%r%s",
-                slug,
-                start,
-                response.status_code,
-                response.url,
-                body,
-                " … [тело обрезано]" if len(response.text) > 2000 else "",
-            )
+        response = None
+        for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+            _wait_for_request_slot()
+            try:
+                response = requests.get(
+                    CALCULATOR_API_URL,
+                    params=params,
+                    headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+                    timeout=CMC_REQUEST_TIMEOUT_SECONDS,
+                )
+            except requests.RequestException as error:
+                if attempt >= _MAX_REQUEST_ATTEMPTS:
+                    logger.exception(
+                        "Сбой запроса CoinMarketCap после %s попыток: slug=%s, start=%s",
+                        attempt, slug, start,
+                    )
+                    raise
+                logger.warning(
+                    "Сбой запроса CoinMarketCap, повтор %s/%s через %s сек.: slug=%s, start=%s, ошибка=%s",
+                    attempt, _MAX_REQUEST_ATTEMPTS, attempt, slug, start, error,
+                )
+                time.sleep(attempt)
+                continue
+
+            if not response.ok:
+                # CMC/proxy errors often include a useful body for diagnosis.
+                body = response.text[:2000]
+                retryable = response.status_code in _TRANSIENT_HTTP_STATUSES
+                logger.log(
+                    logging.WARNING if retryable and attempt < _MAX_REQUEST_ATTEMPTS else logging.ERROR,
+                    "Ответ CoinMarketCap с ошибкой: slug=%s, start=%s, HTTP %s, URL=%s, body=%r%s%s",
+                    slug,
+                    start,
+                    response.status_code,
+                    response.url,
+                    body,
+                    " … [тело обрезано]" if len(response.text) > 2000 else "",
+                    (f"; повтор {attempt}/{_MAX_REQUEST_ATTEMPTS} через {attempt} сек."
+                     if retryable and attempt < _MAX_REQUEST_ATTEMPTS else ""),
+                )
+                if retryable and attempt < _MAX_REQUEST_ATTEMPTS:
+                    time.sleep(attempt)
+                    continue
+            break
+        assert response is not None
         response.raise_for_status()
         payload = json.loads(response.text, parse_float=Decimal)
         status = payload.get("status", {})

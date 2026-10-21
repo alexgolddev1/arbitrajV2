@@ -15,7 +15,12 @@ from urllib.parse import quote
 
 from websockets.asyncio.client import connect
 
-from config import CALCULATOR_SPREAD_LEVELS, SCREENER_QUOTE_SYMBOLS, TRANSFER_NETWORK_MAP
+from config import (
+    CALCULATOR_SPREAD_LEVELS,
+    CALCULATOR_SPREAD_RESET_PERCENT,
+    SCREENER_QUOTE_SYMBOLS,
+    TRANSFER_NETWORK_MAP,
+)
 from database import (
     connect_db,
     finalize_interrupted_lifetimes,
@@ -75,6 +80,7 @@ class Episode:
     network: str
     transfer_seconds: float
     trader_signal_sent: bool = False
+    below_entry_threshold: bool = False
 
 
 @dataclass
@@ -92,6 +98,7 @@ class PendingEpisode:
     sell_exchange: str
     sell_market_pair: str
     sell_price: Decimal
+    below_entry_threshold: bool = False
 
 
 def _symbol_pair(market_pair: str) -> tuple[str, str] | None:
@@ -460,6 +467,7 @@ class OpportunityConfirmer:
                         pending.sell_exchange = sell[0].exchange_name
                         pending.sell_market_pair = sell[0].market_pair
                         pending.sell_price = sell[1].bid
+                        pending.below_entry_threshold = False
 
                     if time.monotonic() - pending.started_monotonic >= pending.transfer_seconds:
                         del self.pending[episode_key]
@@ -480,6 +488,7 @@ class OpportunityConfirmer:
                     episode.sell_market_pair = sell[0].market_pair
                     episode.sell_price = sell[1].bid
                     episode.sell_size = sell[1].bid_size
+                    episode.below_entry_threshold = False
                     # Life is measured independently of the simulated transfer countdown.
                     elapsed_seconds = time.monotonic() - episode.started_monotonic
                     if (
@@ -513,6 +522,44 @@ class OpportunityConfirmer:
                             buy[0].source_pair,
                             threshold,
                             elapsed_seconds,
+                        )
+            elif (
+                spread >= CALCULATOR_SPREAD_RESET_PERCENT
+                and (episode is not None or pending is not None)
+            ):
+                if episode is not None:
+                    first_hysteresis_tick = not episode.below_entry_threshold
+                    episode.below_entry_threshold = True
+                    episode.last_confirmed_at = now
+                    episode.spread = spread
+                    episode.max_spread = max(episode.max_spread, spread)
+                    episode.buy_price = buy[1].ask
+                    episode.buy_size = buy[1].ask_size
+                    episode.sell_price = sell[1].bid
+                    episode.sell_size = sell[1].bid_size
+                    elapsed_seconds = time.monotonic() - episode.started_monotonic
+                    if first_hysteresis_tick:
+                        logger.info(
+                            "Кандидат %s временно ниже порога %.4f%%, но спред %.4f%% не пересёк "
+                            "границу сброса %.4f%%; эпизод сохранён, жизнь %.1f сек., сигнал трейдеру %s",
+                            buy[0].source_pair, threshold, spread,
+                            CALCULATOR_SPREAD_RESET_PERCENT, elapsed_seconds,
+                            "уже отправлен" if episode.trader_signal_sent else "ещё не отправлен",
+                        )
+                elif pending is not None:
+                    first_hysteresis_tick = not pending.below_entry_threshold
+                    pending.below_entry_threshold = True
+                    pending.last_confirmed_at = now
+                    pending.spread = spread
+                    pending.max_spread = max(pending.max_spread, spread)
+                    pending.buy_price = buy[1].ask
+                    pending.sell_price = sell[1].bid
+                    if first_hysteresis_tick:
+                        logger.info(
+                            "Кандидат %s временно ниже порога %.4f%%, но спред %.4f%% не пересёк "
+                            "границу сброса %.4f%%; ожидание подтверждения продолжается",
+                            buy[0].source_pair, threshold, spread,
+                            CALCULATOR_SPREAD_RESET_PERCENT,
                         )
             elif pending is not None:
                 if episode is not None:
