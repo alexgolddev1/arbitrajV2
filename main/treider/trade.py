@@ -20,6 +20,7 @@ from main.treider.config import (
     PRICE_MOVE_RESERVE_PERCENT,
     SETTLEMENT_MAX_WAIT_SECONDS,
     SETTLEMENT_RETRY_SECONDS,
+    SAME_ROUTE_REENTRY_COOLDOWN_SECONDS,
     SIGNAL_MAX_AGE_SECONDS,
     STOP_LOSS_PERCENT,
     TRAINING_MODE,
@@ -215,6 +216,31 @@ def _prepare_training_trade(
             if existing is not None:
                 connection.commit()
                 return None, f"сигнал уже запущен в тренировке (статус {existing['status']})"
+
+            if SAME_ROUTE_REENTRY_COOLDOWN_SECONDS > 0:
+                cursor.execute(
+                    "SELECT settled_at FROM trader_training_settlements "
+                    "WHERE source_pair = %s AND status = 'settled' AND position_status = 'closed' "
+                    "AND settled_at >= UTC_TIMESTAMP() - INTERVAL %s SECOND "
+                    "AND ((LOWER(buy_exchange) = LOWER(%s) AND LOWER(sell_exchange) = LOWER(%s)) "
+                    "OR (LOWER(buy_exchange) = LOWER(%s) AND LOWER(sell_exchange) = LOWER(%s))) "
+                    "ORDER BY settled_at DESC LIMIT 1",
+                    (signal["source_pair"], SAME_ROUTE_REENTRY_COOLDOWN_SECONDS,
+                     buy.exchange, sell.exchange, sell.exchange, buy.exchange),
+                )
+                recent = cursor.fetchone()
+                if recent is not None:
+                    connection.commit()
+                    settled_at = recent["settled_at"]
+                    if settled_at.tzinfo is None:
+                        settled_at = settled_at.replace(tzinfo=timezone.utc)
+                    elapsed = max(0.0, (datetime.now(timezone.utc) - settled_at).total_seconds())
+                    remaining = max(0.0, SAME_ROUTE_REENTRY_COOLDOWN_SECONDS - elapsed)
+                    return None, (
+                        f"повторный вход по {signal['source_pair']} на биржах "
+                        f"{buy.exchange} и {sell.exchange} запрещён таймером повторного входа; "
+                        f"осталось {remaining:.0f} сек."
+                    )
 
             balance = Decimal(str(account["balance_usd"]))
             cursor.execute(

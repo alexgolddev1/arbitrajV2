@@ -6,12 +6,17 @@ from decimal import Decimal, InvalidOperation
 
 # Минимальное непрерывное время жизни возможности до отправки JSON трейдеру.
 MIN_OPPORTUNITY_LIFETIME_SECONDS = max(
-    1, float(os.getenv("TRADER_MIN_OPPORTUNITY_LIFETIME_SECONDS", "15"))
+    1, float(os.getenv("TRADER_MIN_OPPORTUNITY_LIFETIME_SECONDS", "3"))
 )
 
 # Частота проверки очереди сообщений MySQL; это не таймер жизни возможности.
 SIGNAL_POLL_INTERVAL_SECONDS = max(
     0.1, float(os.getenv("TRADER_SIGNAL_POLL_INTERVAL_SECONDS", "0.5"))
+)
+
+# При простое очереди периодически подбирать свежие активные WebSocket-возможности.
+ACTIVE_OPPORTUNITY_FALLBACK_SECONDS = max(
+    5, float(os.getenv("TRADER_ACTIVE_OPPORTUNITY_FALLBACK_SECONDS", "6"))
 )
 
 # Таймаут REST-перепроверки публичных стаканов на биржах.
@@ -89,6 +94,10 @@ SETTLEMENT_RETRY_SECONDS = max(1, int(os.getenv("TRADER_SETTLEMENT_RETRY_SECONDS
 SETTLEMENT_MAX_WAIT_SECONDS = max(SETTLEMENT_RETRY_SECONDS, int(os.getenv("TRADER_SETTLEMENT_MAX_WAIT_SECONDS", "3600")))
 SIGNAL_MAX_AGE_SECONDS = max(1, int(os.getenv("TRADER_SIGNAL_MAX_AGE_SECONDS", "300")))
 SIGNAL_MAX_ATTEMPTS = max(1, int(os.getenv("TRADER_SIGNAL_MAX_ATTEMPTS", "5")))
+# Не входить повторно в ту же пару и на ту же пару бирж после закрытия позиции.
+SAME_ROUTE_REENTRY_COOLDOWN_SECONDS = max(
+    0, int(os.getenv("TRADER_SAME_ROUTE_REENTRY_COOLDOWN_SECONDS", "300"))
+)
 BUY_FEE_CURRENCY = {
     exchange: os.getenv(f"TRADER_{exchange.upper()}_BUY_FEE_CURRENCY", "quote").strip().lower()
     for exchange in ("binance", "bybit", "okx", "mexc")

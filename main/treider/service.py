@@ -7,10 +7,20 @@ import time
 
 from database import connect_db, initialize_database
 from main.treider.account import initialize_trader_account
-from main.treider.config import SIGNAL_MAX_ATTEMPTS, SIGNAL_POLL_INTERVAL_SECONDS
+from main.treider.config import (
+    ACTIVE_OPPORTUNITY_FALLBACK_SECONDS,
+    SIGNAL_MAX_ATTEMPTS,
+    SIGNAL_POLL_INTERVAL_SECONDS,
+)
 from main.treider.logging_setup import configure_logging
 from main.treider.processor import TemporaryProcessingError, process_opportunity
-from main.treider.queue import claim_next, mark_processed, mark_rejected, mark_retry
+from main.treider.queue import (
+    claim_next,
+    enqueue_active_opportunity_fallbacks,
+    mark_processed,
+    mark_rejected,
+    mark_retry,
+)
 from main.treider.trade import process_due_training_trade
 
 logger = logging.getLogger(__name__)
@@ -64,11 +74,18 @@ def run() -> None:
     configure_logging()
     _initialize()
     logger.info("Трейдер ожидает JSON-сообщения от скринера")
+    last_signal_at = time.monotonic()
     try:
         while True:
             try:
                 did_settle = process_due_training_trade()
                 did_consume = _consume_one()
+                now = time.monotonic()
+                if did_consume:
+                    last_signal_at = now
+                elif now - last_signal_at >= ACTIVE_OPPORTUNITY_FALLBACK_SECONDS:
+                    enqueue_active_opportunity_fallbacks()
+                    last_signal_at = now
                 if not did_settle and not did_consume:
                     time.sleep(SIGNAL_POLL_INTERVAL_SECONDS)
             except Exception:

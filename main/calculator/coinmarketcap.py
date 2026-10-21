@@ -77,6 +77,19 @@ def fetch_currency_markets(
             headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
             timeout=CMC_REQUEST_TIMEOUT_SECONDS,
         )
+        if not response.ok:
+            # CMC/proxy errors (e.g. 502) often include a useful body, while
+            # raise_for_status() otherwise leaves only the status and URL in logs.
+            body = response.text[:2000]
+            logger.error(
+                "Ответ CoinMarketCap с ошибкой: slug=%s, start=%s, HTTP %s, URL=%s, body=%r%s",
+                slug,
+                start,
+                response.status_code,
+                response.url,
+                body,
+                " … [тело обрезано]" if len(response.text) > 2000 else "",
+            )
         response.raise_for_status()
         payload = json.loads(response.text, parse_float=Decimal)
         status = payload.get("status", {})

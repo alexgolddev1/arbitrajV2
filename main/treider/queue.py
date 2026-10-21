@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Mapping
 
 from database import connect_db
-from main.treider.config import SIGNAL_MAX_AGE_SECONDS, SIGNAL_MAX_ATTEMPTS
+from main.treider.config import (
+    ACTIVE_OPPORTUNITY_FALLBACK_SECONDS,
+    SIGNAL_MAX_AGE_SECONDS,
+    SIGNAL_MAX_ATTEMPTS,
+)
+from main.treider.signals import build_opportunity_signal
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,6 +49,74 @@ def enqueue(opportunity_key: str, payload: Mapping[str, Any]) -> bool:
         raise
     finally:
         connection.close()
+
+
+def enqueue_active_opportunity_fallbacks() -> int:
+    """Queue fresh active opportunities when their normal JSON signal is absent/idle."""
+    connection = connect_db()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT life.lifetime_id, life.source_market_id, life.source_pair, "
+                "life.threshold_percent, life.spread_percent, life.max_spread_percent, "
+                "life.buy_exchange, life.buy_market_pair, life.buy_price, "
+                "life.sell_exchange, life.sell_market_pair, life.sell_price, "
+                "life.started_at, life.last_confirmed_at, life.transfer_seconds "
+                "FROM opportunity_lifetimes AS life "
+                "WHERE life.is_active = 1 "
+                "AND life.last_confirmed_at >= UTC_TIMESTAMP() - INTERVAL 20 SECOND "
+                "AND life.threshold_percent = (SELECT MAX(active.threshold_percent) "
+                "FROM opportunity_lifetimes AS active "
+                "WHERE active.source_market_id = life.source_market_id AND active.is_active = 1) "
+                "AND NOT EXISTS (SELECT 1 FROM trader_signals AS pending "
+                "WHERE CAST(JSON_UNQUOTE(JSON_EXTRACT(pending.payload, '$.lifetime_id')) AS UNSIGNED) = life.lifetime_id "
+                "AND pending.status IN ('pending', 'processing')) "
+                "AND NOT EXISTS (SELECT 1 FROM trader_training_settlements AS position "
+                "WHERE position.source_pair = life.source_pair "
+                "AND position.status IN ('pending', 'settling', 'partial', 'open')) "
+                "ORDER BY life.last_confirmed_at DESC, life.spread_percent DESC LIMIT 50"
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    now = datetime.now(timezone.utc)
+    bucket = int(now.timestamp() // ACTIVE_OPPORTUNITY_FALLBACK_SECONDS)
+    queued = 0
+    for row in rows:
+        threshold = Decimal(str(row["threshold_percent"])).normalize()
+        started_at = row["started_at"]
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        lifetime_seconds = max(0.0, (now - started_at).total_seconds())
+        signal_key, payload = build_opportunity_signal(
+            lifetime_id=int(row["lifetime_id"]),
+            source_market_id=int(row["source_market_id"]),
+            source_pair=str(row["source_pair"]),
+            threshold_percent=threshold,
+            spread_percent=Decimal(str(row["spread_percent"])),
+            max_spread_percent=Decimal(str(row["max_spread_percent"])),
+            buy_exchange=str(row["buy_exchange"]),
+            buy_market_pair=str(row["buy_market_pair"]),
+            buy_price=Decimal(str(row["buy_price"])),
+            buy_size=Decimal(0),
+            sell_exchange=str(row["sell_exchange"]),
+            sell_market_pair=str(row["sell_market_pair"]),
+            sell_price=Decimal(str(row["sell_price"])),
+            sell_size=Decimal(0),
+            network="UNKNOWN",
+            estimated_transfer_seconds=float(row["transfer_seconds"] or 300),
+            started_at_utc=started_at.isoformat(sep=" "),
+            lifetime_seconds=lifetime_seconds,
+        )
+        fallback_key = f"{signal_key}:fallback:{bucket}"
+        if enqueue(fallback_key, payload):
+            queued += 1
+            logger.info(
+                "Резервный сигнал из активных WebSocket-ситуаций: %s, порог %.4f%%, жизнь %.1f сек.",
+                row["source_pair"], threshold, lifetime_seconds,
+            )
+    return queued
 
 
 def claim_next() -> ClaimedSignal | None:
