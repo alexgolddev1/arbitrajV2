@@ -14,7 +14,7 @@ from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
 from config import BUY_PRICE_MUST_BE_LOWER, CALCULATOR_SPREAD_LEVELS, SCREENER_QUOTE_SYMBOLS_CSV
-from database import connect_db, initialize_database, read_config
+from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database, read_config
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -433,6 +433,8 @@ def _load_history() -> tuple[list[dict[str, Any]], dict[int, dict[str, int]]]:
 
 
 def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
+    if is_active:
+        finalize_stale_opportunity_lifetimes(180)
     connection = connect_db()
     try:
         price_direction = "<" if BUY_PRICE_MUST_BE_LOWER else ">"

@@ -17,6 +17,8 @@ from main.treider.config import (
     FRACTIONAL_QUANTITY_DECIMAL_PLACES,
     INTEGER_QUANTITY_PRICE_THRESHOLD_USD,
     MIN_NET_PROFIT_USDT,
+    MAX_LOSS_BALANCE_PERCENT,
+    MAX_LOSS_PROFIT_RATIO,
     PRICE_MOVE_RESERVE_PERCENT,
     SETTLEMENT_MAX_WAIT_SECONDS,
     SETTLEMENT_RETRY_SECONDS,
@@ -87,6 +89,35 @@ def _round_buy_quantity(quantity: Decimal, unit_price: Decimal) -> Decimal:
     )
     step = Decimal(1).scaleb(-decimals)
     return (quantity / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _max_loss_budget(cursor: Any, available_balance: Decimal) -> tuple[Decimal, str]:
+    """Limit a new loss to one quarter of the latest four winning trades."""
+    cursor.execute(
+        "SELECT realized_profit_usd FROM trader_training_settlements "
+        "WHERE status = 'settled' AND position_status = 'closed' "
+        "AND realized_profit_usd > 0 ORDER BY settled_at DESC, settlement_id DESC LIMIT 4"
+    )
+    profits = [Decimal(str(row["realized_profit_usd"])) for row in cursor.fetchall()]
+    if profits:
+        return sum(profits, Decimal(0)) * MAX_LOSS_PROFIT_RATIO, f"последние {len(profits)} прибыльных сделок"
+    return available_balance * MAX_LOSS_BALANCE_PERCENT / Decimal(100), "процент доступного баланса"
+
+
+def _risk_limited_stop_price(
+    estimate: TradeEstimate,
+    buy_price: Decimal,
+    sell_fee_rate: Decimal,
+    loss_budget: Decimal,
+) -> Decimal:
+    """Return a stop limit that prevents a completed trade exceeding its loss budget."""
+    sellable_quantity = estimate.quantity_after_fees
+    net_sell_factor = Decimal(1) - sell_fee_rate
+    if sellable_quantity <= 0 or net_sell_factor <= 0:
+        raise ValueError("Нельзя рассчитать ограничение убытка без объёма продажи и ставки комиссии")
+    buy_debit = estimate.buy_cost_usd + estimate.buy_fee_usd + estimate.transfer_fee_usd
+    risk_floor = (buy_debit - loss_budget) / (sellable_quantity * net_sell_factor)
+    return max(calculate_stop_loss_price(buy_price), risk_floor, Decimal("0.000000000000000001"))
 
 
 def _estimate_trade(
@@ -301,7 +332,21 @@ def _prepare_training_trade(
                 return estimate, "недостаточно данных: неизвестна комиссия перевода"
             buy_debit = estimate.buy_cost_usd + estimate.buy_fee_usd + estimate.transfer_fee_usd
             take_profit_price = Decimal(str(signal["sell"]["price"]))
-            stop_loss_price = calculate_stop_loss_price(buy.ask)
+            loss_budget, loss_budget_source = _max_loss_budget(cursor, available)
+            stop_loss_price = _risk_limited_stop_price(
+                estimate, buy.ask, sell_fees.taker_for("sell"), loss_budget
+            )
+            if stop_loss_price >= take_profit_price:
+                connection.commit()
+                return estimate, (
+                    f"стоп с ограничением риска ({stop_loss_price}) не ниже TP ({take_profit_price}); "
+                    f"допустимый убыток {loss_budget} USDT ({loss_budget_source})"
+                )
+            logger.info(
+                "Ограничение риска сделки: максимум убытка=%s USDT (%s), защитная цена продажи=%s; %s, сигнал=%s",
+                loss_budget, loss_budget_source, stop_loss_price,
+                signal["source_pair"], signal_id,
+            )
             assumptions = dict(transfer or {})
             assumptions["buy_fee_source"] = buy_fees.source
             assumptions["sell_fee_source"] = sell_fees.source
@@ -309,6 +354,9 @@ def _prepare_training_trade(
             assumptions["purchase_model"] = "marketable-limit-at-best-ask; capped-by-visible-best-ask-size"
             assumptions["take_profit_source"] = "signal.sell.price"
             assumptions["stop_loss_percent"] = str(STOP_LOSS_PERCENT)
+            assumptions["max_loss_usd"] = str(loss_budget)
+            assumptions["max_loss_source"] = loss_budget_source
+            assumptions["max_loss_profit_ratio"] = str(MAX_LOSS_PROFIT_RATIO)
             cursor.execute(
                 "INSERT INTO trader_training_settlements ("
                 "signal_id, source_pair, buy_exchange, buy_market_pair, sell_exchange, sell_market_pair, "
@@ -449,7 +497,8 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             )
             if trigger == "take_profit"
             else fetch_market_sell_execution(
-                trade["sell_exchange"], trade["sell_market_pair"], quantity
+                trade["sell_exchange"], trade["sell_market_pair"], quantity,
+                minimum_price=stop_loss_price,
             )
         )
         if execution.filled_quantity <= 0:

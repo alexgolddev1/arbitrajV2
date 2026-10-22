@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 
-from database import connect_db, initialize_database
+from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database
 from main.treider.account import initialize_trader_account
 from main.treider.config import (
     ACTIVE_OPPORTUNITY_FALLBACK_SECONDS,
@@ -75,12 +75,18 @@ def run() -> None:
     _initialize()
     logger.info("Трейдер ожидает JSON-сообщения от скринера")
     last_signal_at = time.monotonic()
+    last_lifetime_cleanup_at = 0.0
     try:
         while True:
             try:
                 did_settle = process_due_training_trade()
                 did_consume = _consume_one()
                 now = time.monotonic()
+                if now - last_lifetime_cleanup_at >= 30:
+                    closed = finalize_stale_opportunity_lifetimes(180)
+                    if closed:
+                        logger.info("Закрыто устаревших WebSocket-ситуаций без проверки более 180 секунд: %s", closed)
+                    last_lifetime_cleanup_at = now
                 if did_consume:
                     last_signal_at = now
                 elif now - last_signal_at >= ACTIVE_OPPORTUNITY_FALLBACK_SECONDS:

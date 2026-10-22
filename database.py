@@ -397,6 +397,25 @@ def touch_opportunity_lifetimes(rows: list[tuple[Any, ...]]) -> None:
         connection.close()
 
 
+def finalize_stale_opportunity_lifetimes(stale_seconds: int = 180) -> int:
+    """Close active episodes whose last confirmed quote is too old."""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE opportunity_lifetimes SET ended_at = last_confirmed_at, "
+                "duration_seconds = GREATEST(0, ROUND(TIMESTAMPDIFF(MICROSECOND, started_at, last_confirmed_at) / 1000000, 3)), "
+                "is_active = 0 WHERE is_active = 1 "
+                "AND last_confirmed_at < TIMESTAMPADD(SECOND, -%s, UTC_TIMESTAMP())",
+                (max(1, int(stale_seconds)),),
+            )
+            count = cursor.rowcount
+        connection.commit()
+        return count
+    finally:
+        connection.close()
+
+
 def finalize_interrupted_lifetimes() -> int:
     """Close active episodes at their last confirmed quote after a process restart."""
     connection = connect_db()

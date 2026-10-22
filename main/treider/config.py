@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 
 # Минимальное непрерывное время жизни возможности до отправки JSON трейдеру.
 MIN_OPPORTUNITY_LIFETIME_SECONDS = max(
-    1, float(os.getenv("TRADER_MIN_OPPORTUNITY_LIFETIME_SECONDS", "3"))
+    1, float(os.getenv("TRADER_MIN_OPPORTUNITY_LIFETIME_SECONDS", "15"))
 )
 
 # Частота проверки очереди сообщений MySQL; это не таймер жизни возможности.
@@ -90,6 +90,10 @@ MIN_NET_PROFIT_USDT = _decimal_setting("TRADER_MIN_NET_PROFIT_USDT", "0")
 PRICE_MOVE_RESERVE_PERCENT = _decimal_setting("TRADER_PRICE_MOVE_RESERVE_PERCENT", "0")
 # Стоп-лосс в процентах от цены покупки; изменяйте значение здесь.
 STOP_LOSS_PERCENT = Decimal("0.5")
+# Cap one realized loss at 25% of the last four winning trades combined.
+# Until there is a profitable history, use a small balance-based risk budget.
+MAX_LOSS_PROFIT_RATIO = _decimal_setting("TRADER_MAX_LOSS_PROFIT_RATIO", "0.25")
+MAX_LOSS_BALANCE_PERCENT = _decimal_setting("TRADER_MAX_LOSS_BALANCE_PERCENT", "0.5")
 SETTLEMENT_RETRY_SECONDS = max(1, int(os.getenv("TRADER_SETTLEMENT_RETRY_SECONDS", "15")))
 SETTLEMENT_MAX_WAIT_SECONDS = max(SETTLEMENT_RETRY_SECONDS, int(os.getenv("TRADER_SETTLEMENT_MAX_WAIT_SECONDS", "3600")))
 SIGNAL_MAX_AGE_SECONDS = max(1, int(os.getenv("TRADER_SIGNAL_MAX_AGE_SECONDS", "300")))
@@ -105,6 +109,8 @@ BUY_FEE_CURRENCY = {
 if any(value not in {"base", "quote"} for value in BUY_FEE_CURRENCY.values()):
     raise ValueError("TRADER_*_BUY_FEE_CURRENCY принимает только base или quote")
 if (MIN_NET_PROFIT_USDT < 0 or PRICE_MOVE_RESERVE_PERCENT < 0
+        or MAX_LOSS_PROFIT_RATIO <= 0 or MAX_LOSS_PROFIT_RATIO > 1
+        or MAX_LOSS_BALANCE_PERCENT <= 0 or MAX_LOSS_BALANCE_PERCENT >= 100
         or STOP_LOSS_PERCENT < 0 or STOP_LOSS_PERCENT >= 100
         or TRANSFER_FEE_AMOUNT is not None and TRANSFER_FEE_AMOUNT < 0):
     raise ValueError("Порог прибыли, резерв и комиссия перевода не могут быть отрицательными; стоп-лосс должен быть от 0 до 100 процентов")
