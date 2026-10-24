@@ -554,7 +554,7 @@ def _prepare_training_trade(
                 "planned_sell_at, retry_started_at"
                 ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', "
                 "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "'marketable-limit-at-best-ask', 'pending_transfer', %s, %s, NULL)",
+                "%s, 'marketable-limit-at-best-ask', 'pending_transfer', %s, %s, NULL)",
                 (
                     signal_id, signal["source_pair"], buy.exchange, buy.market_pair,
                     sell.exchange, sell.market_pair, estimate.quantity, estimate.buy_average_price, take_profit_price, stop_loss_price,
