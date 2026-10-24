@@ -210,10 +210,11 @@ def initialize_database(connection: MySQLConnection) -> None:
                 cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE %s", (column_name,))
                 if cursor.fetchone() is None:
                     cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-        for column_name in ("daily_pnl_usd", "cumulative_pnl_usd"):
+        for column_name in ("daily_pnl_usd", "cumulative_pnl_usd", "max_drawdown_usd", "max_drawdown_percent"):
             cursor.execute(f"SHOW COLUMNS FROM trader_demo_daily_reports LIKE %s", (column_name,))
             if cursor.fetchone() is None:
-                cursor.execute(f"ALTER TABLE trader_demo_daily_reports ADD COLUMN {column_name} DECIMAL(38, 12) NULL")
+                definition = "DECIMAL(20, 12) NULL" if column_name.endswith("percent") else "DECIMAL(38, 12) NULL"
+                cursor.execute(f"ALTER TABLE trader_demo_daily_reports ADD COLUMN {column_name} {definition}")
         cursor.execute("SHOW COLUMNS FROM trader_capital_movements LIKE 'exchange_slug'")
         if cursor.fetchone() is None:
             cursor.execute(

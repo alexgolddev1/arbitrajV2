@@ -11,11 +11,37 @@ from unittest.mock import MagicMock, patch
 from main.web import (
     _aggregate_lifetime_groups, _count_trader_positions, _record_capital_movement,
     _demo_operation_csv, _render_history, _render_page, _render_replay_page,
-    _render_trader_page, _value_trader_positions,
+    _render_trader_page, _value_trader_positions, _drawdown_metrics,
 )
 
 
 class TraderHistoryTests(unittest.TestCase):
+    def test_drawdown_reports_current_and_historical_maximum_separately(self) -> None:
+        current, maximum, percent, peak = _drawdown_metrics(
+            Decimal("100"),
+            [(Decimal("100"), Decimal("0"), True),
+             (Decimal("80"), Decimal("0"), True),
+             (Decimal("100"), Decimal("0"), True)],
+            Decimal("100"), Decimal("0"), True, baseline_complete=True,
+        )
+
+        self.assertEqual(current, Decimal("0"))
+        self.assertEqual(maximum, Decimal("20"))
+        self.assertEqual(percent, Decimal("20"))
+        self.assertEqual(peak, Decimal("100"))
+
+    def test_incomplete_equity_cannot_set_drawdown_peak(self) -> None:
+        current, maximum, _, peak = _drawdown_metrics(
+            Decimal("100"),
+            [(Decimal("150"), Decimal("0"), False),
+             (Decimal("90"), Decimal("0"), True)],
+            Decimal("90"), Decimal("0"), False, baseline_complete=True,
+        )
+
+        self.assertIsNone(current)
+        self.assertEqual(maximum, Decimal("10"))
+        self.assertEqual(peak, Decimal("100"))
+
     def test_replay_page_compares_scenarios_and_displays_data_gaps(self) -> None:
         page = _render_replay_page(
             {"run_id": "run-1", "git_commit": "abc"},

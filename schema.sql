@@ -214,6 +214,8 @@ CREATE TABLE IF NOT EXISTS trader_demo_daily_reports (
     closed_trade_count INT UNSIGNED NOT NULL DEFAULT 0,
     drawdown_usd DECIMAL(38, 12) NULL,
     drawdown_percent DECIMAL(20, 12) NULL,
+    max_drawdown_usd DECIMAL(38, 12) NULL,
+    max_drawdown_percent DECIMAL(20, 12) NULL,
     position_value_usd DECIMAL(38, 12) NULL,
     transfer_value_usd DECIMAL(38, 12) NULL,
     valuation_complete TINYINT(1) NOT NULL DEFAULT 0,

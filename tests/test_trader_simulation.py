@@ -582,6 +582,7 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertIn("уже запущен", reason)
         self.assertFalse(any("INSERT INTO trader_training_settlements" in call.args[0] for call in cursor.execute.call_args_list))
 
+    @patch("main.treider.trade._persist_sale_dust")
     @patch("main.treider.trade.fetch_spot_market_rules")
     @patch("main.treider.trade.get_trade_fee_rates")
     @patch("main.treider.trade.fetch_market_sell_execution")
@@ -589,6 +590,7 @@ class TradeCalculationTests(unittest.TestCase):
     @patch("main.treider.trade.fetch_spot_book")
     def test_partial_sell_credits_only_filled_part_and_preserves_remainder(
         self, spot_book: Mock, connect: Mock, sell_execution: Mock, fee_rates: Mock, market_rules: Mock,
+        persist_dust: Mock,
     ) -> None:
         from main.treider import trade
 
@@ -612,13 +614,13 @@ class TradeCalculationTests(unittest.TestCase):
             proceeds=Decimal("20"), filled_quantity=Decimal("2"), remaining_quantity=Decimal("1"),
             average_price=Decimal("10"), best_bid=Decimal("10"), levels_used=1,
         )
-        spot_book.return_value = SimpleNamespace(bid=Decimal("9"))
+        spot_book.return_value = SimpleNamespace(bid=Decimal("9"), bid_size=Decimal("3"))
         fee_rates.return_value = fees.TradeFeeRates(
             "mexc", "ABCUSDT", Decimal(0), Decimal("0.001"), "now",
             sell_taker_rate=Decimal("0.001"),
         )
         market_rules.return_value = SimpleNamespace(
-            quantity_step=Decimal("0.1"), min_quantity=Decimal("0.1"), min_notional=Decimal("1"),
+            quantity_step=Decimal("0.1"), min_quantity=Decimal("0.1"), min_notional=Decimal("25"),
         )
         trade._settle_training_trade({
             "settlement_id": 2, "signal_id": 17, "source_pair": "ABC/USDT",
@@ -636,6 +638,7 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertEqual(values[9], Decimal("69.98000000"))
         self.assertEqual(values[16], Decimal("1"))
         sell_execution.assert_called_once_with("mexc", "ABC/USDT", Decimal("3"))
+        persist_dust.assert_not_called()
 
 
 class SettlementClaimTests(unittest.TestCase):
@@ -846,9 +849,67 @@ class PersistenceTests(unittest.TestCase):
         result = replay_scenario(run, events, [])
 
         self.assertEqual(result["fees_usd"], Decimal("0.21"))
-        self.assertEqual(result["equity_usd"], Decimal("101.79"))
+        self.assertEqual(result["equity_usd"], Decimal("101.680"))
         self.assertFalse(result["gaps"])
         self.assertTrue(result["complete"])
+
+    def test_replay_equity_liquidates_full_bid_depth_on_matching_exchange(self) -> None:
+        from datetime import datetime, timezone
+        from main.treider.replay import _equity
+
+        events = [{"event_type": "buy", "exchange_slug": "binance", "asset": "ABC",
+                   "market_pair": "ABC/USDT"}]
+        at = datetime(2026, 10, 24, 10, tzinfo=timezone.utc)
+        gaps: list[str] = []
+        value = _equity(
+            {("binance", "ABC"): Decimal("10")},
+            {("binance", "ABC/USDT"): ({"bids": [["10", "1"], ["1", "9"]]}, at)},
+            {("binance", "ABC/USDT"): (Decimal(0), "USDT")}, events, at, Decimal(1), gaps,
+        )
+
+        self.assertEqual(value, Decimal("19"))
+        self.assertFalse(gaps)
+
+    def test_replay_equity_does_not_borrow_another_exchange_book(self) -> None:
+        from datetime import datetime, timezone
+        from main.treider.replay import _equity
+
+        events = [{"event_type": "buy", "exchange_slug": "binance", "asset": "ABC",
+                   "market_pair": "ABC/USDT"}]
+        at = datetime(2026, 10, 24, 10, tzinfo=timezone.utc)
+        gaps: list[str] = []
+        value = _equity(
+            {("binance", "ABC"): Decimal("10")},
+            {("mexc", "ABC/USDT"): ({"bids": [["10", "10"]]}, at)},
+            {("binance", "ABC/USDT"): (Decimal(0), "USDT")}, events, at, Decimal(1), gaps,
+        )
+
+        self.assertEqual(value, Decimal(0))
+        self.assertTrue(any("no bid book" in gap for gap in gaps))
+
+    def test_replay_equity_marks_stale_and_insufficient_books_incomplete(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from main.treider.replay import _equity
+
+        events = [{"event_type": "buy", "exchange_slug": "binance", "asset": "ABC",
+                   "market_pair": "ABC/USDT"}]
+        at = datetime(2026, 10, 24, 10, tzinfo=timezone.utc)
+        fees = {("binance", "ABC/USDT"): (Decimal(0), "USDT")}
+        stale_gaps: list[str] = []
+        _equity(
+            {("binance", "ABC"): Decimal("10")},
+            {("binance", "ABC/USDT"): ({"bids": [["10", "10"]]}, at - timedelta(seconds=31))},
+            fees, events, at, Decimal(1), stale_gaps,
+        )
+        shallow_gaps: list[str] = []
+        _equity(
+            {("binance", "ABC"): Decimal("10")},
+            {("binance", "ABC/USDT"): ({"bids": [["10", "1"]]}, at)},
+            fees, events, at, Decimal(1), shallow_gaps,
+        )
+
+        self.assertTrue(any("stale bid book" in gap for gap in stale_gaps))
+        self.assertTrue(any("insufficient bid depth" in gap for gap in shallow_gaps))
 
     def test_replay_transfer_coin_fee_moves_and_deducts_exchange_balances(self) -> None:
         from main.treider.replay import replay_scenario

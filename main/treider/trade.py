@@ -832,6 +832,14 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
         if executable_quantity <= 0 or executable_quantity < sell_rules.min_quantity:
             _persist_sale_dust(trade_id, quantity, trade.get("claim_token"))
             return
+        if current_sell_book.bid <= 0 or current_sell_book.bid_size <= 0:
+            raise InsufficientLiquidity("No executable bid liquidity; keep position for retry")
+        # Exchange filters apply to the submitted order size, not to how much
+        # the current book happens to fill. A thin book is a retryable partial.
+        if (sell_rules.min_notional is not None
+                and executable_quantity * current_sell_book.bid < sell_rules.min_notional):
+            _persist_sale_dust(trade_id, quantity, trade.get("claim_token"))
+            return
         execution = (
             fetch_limit_sell_execution(
                 trade["sell_exchange"], trade["sell_market_pair"], executable_quantity, take_profit_price
@@ -846,10 +854,6 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
         proceeds = execution.proceeds
         sell_rate = sell_fees.taker_for("sell")
         sell_fee = proceeds * sell_rate
-        if (execution.filled_quantity < sell_rules.min_quantity
-                or (sell_rules.min_notional is not None and proceeds < sell_rules.min_notional)):
-            _persist_sale_dust(trade_id, quantity, trade.get("claim_token"))
-            return
     except InsufficientLiquidity as error:
         _retry_settlement(trade_id, str(error), trade.get("claim_token"))
         logger.warning(

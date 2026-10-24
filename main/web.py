@@ -392,40 +392,86 @@ def _capture_demo_daily_report(connection: Any, run: dict[str, Any], stats: dict
         day_start_equity = (Decimal(str(previous["equity_usd"])) if previous and previous.get("equity_usd") is not None
                             else starting_equity)
         daily_pnl = equity - day_start_equity - day_flows
+        complete = bool(run.get("baseline_complete") and stats.get("valuation_complete")
+                        and not stats.get("valuation_stale") and not int(fees.get("unvalued_fees") or 0))
         cursor.execute(
             "INSERT INTO trader_demo_equity_snapshots (run_id, equity_usd, valuation_complete, valuation_stale) "
             "VALUES (%s, %s, %s, %s)",
-            (run_id, equity, int(bool(stats.get("valuation_complete"))), int(bool(stats.get("valuation_stale")))),
+            (run_id, equity, int(complete), int(bool(stats.get("valuation_stale")))),
         )
         cursor.execute(
-            "SELECT MAX(equity_usd) AS peak FROM trader_demo_equity_snapshots WHERE run_id = %s",
-            (run_id,),
+            "SELECT snap.captured_at_utc, snap.equity_usd, "
+            "COALESCE((SELECT SUM(flow.amount_usd) FROM trader_capital_movements AS flow "
+            "WHERE flow.created_at >= %s AND flow.created_at <= snap.captured_at_utc), 0) AS cumulative_flows "
+            "FROM trader_demo_equity_snapshots AS snap WHERE snap.run_id = %s "
+            "AND snap.valuation_complete = 1 AND snap.valuation_stale = 0 AND snap.equity_usd IS NOT NULL "
+            "ORDER BY snap.captured_at_utc, snap.snapshot_id",
+            (run["started_at_utc"], run_id),
         )
-        peak_row = cursor.fetchone() or {}
-        peak = max(equity, Decimal(str(peak_row["peak"]))) if peak_row.get("peak") is not None else equity
-        drawdown = max(Decimal(0), peak - equity)
-        complete = bool(run.get("baseline_complete") and stats.get("valuation_complete")
-                        and not stats.get("valuation_stale") and not int(fees.get("unvalued_fees") or 0))
+        equity_history = cursor.fetchall()
+        drawdown, max_drawdown, max_drawdown_percent, peak = _drawdown_metrics(
+            starting_equity,
+            [(Decimal(str(row["equity_usd"])), Decimal(str(row.get("cumulative_flows") or 0)), True)
+             for row in equity_history],
+            equity, Decimal(str(all_flows.get("net_flows") or 0)), complete,
+            baseline_complete=bool(run.get("baseline_complete")),
+        )
         cursor.execute(
             "INSERT INTO trader_demo_daily_reports (run_id, report_day_kyiv, equity_usd, pnl_usd, daily_pnl_usd, "
             "cumulative_pnl_usd, fees_usd, "
             "trade_count, closed_trade_count, drawdown_usd, drawdown_percent, position_value_usd, transfer_value_usd, "
-            "valuation_complete, valuation_stale) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "valuation_complete, valuation_stale, max_drawdown_usd, max_drawdown_percent) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON DUPLICATE KEY UPDATE equity_usd = VALUES(equity_usd), pnl_usd = VALUES(pnl_usd), "
             "daily_pnl_usd = VALUES(daily_pnl_usd), cumulative_pnl_usd = VALUES(cumulative_pnl_usd), "
             "fees_usd = VALUES(fees_usd), trade_count = VALUES(trade_count), closed_trade_count = VALUES(closed_trade_count), "
             "drawdown_usd = VALUES(drawdown_usd), drawdown_percent = VALUES(drawdown_percent), "
+            "max_drawdown_usd = VALUES(max_drawdown_usd), max_drawdown_percent = VALUES(max_drawdown_percent), "
             "position_value_usd = VALUES(position_value_usd), transfer_value_usd = VALUES(transfer_value_usd), "
             "valuation_complete = VALUES(valuation_complete), valuation_stale = VALUES(valuation_stale), "
             "captured_at_utc = UTC_TIMESTAMP(6)",
             (run_id, report_day, equity, cumulative_pnl, daily_pnl, cumulative_pnl,
              Decimal(str(fees.get("fees_usd") or 0)),
              int(trade_counts.get("trade_count") or 0), int(trade_counts.get("closed_trade_count") or 0),
-             drawdown, drawdown / peak * Decimal(100) if peak > 0 else Decimal(0),
+             drawdown, drawdown / peak * Decimal(100) if drawdown is not None and peak and peak > 0 else None,
              stats.get("position_value_usd") or 0, stats.get("transfer_value_usd") or 0,
-             int(complete), int(bool(stats.get("valuation_stale")))),
+             int(complete), int(bool(stats.get("valuation_stale"))), max_drawdown,
+             max_drawdown_percent),
         )
     connection.commit()
+
+
+def _drawdown_metrics(
+    starting_equity: Decimal,
+    history: list[tuple[Decimal, Decimal, bool]],
+    current_equity: Decimal,
+    current_net_flows: Decimal,
+    current_valid: bool,
+    *, baseline_complete: bool,
+) -> tuple[Decimal | None, Decimal | None, Decimal | None, Decimal | None]:
+    """Return current and maximum drawdown from flow-adjusted, trusted Equity points."""
+    if not baseline_complete:
+        return None, None, None, None
+    peak = starting_equity
+    max_drawdown = Decimal(0)
+    max_percent = Decimal(0)
+    for equity, flows, valid in history:
+        if not valid:
+            continue
+        point = equity - flows
+        drawdown = max(peak - point, Decimal(0))
+        max_drawdown = max(max_drawdown, drawdown)
+        if peak > 0:
+            max_percent = max(max_percent, drawdown / peak * Decimal(100))
+        peak = max(peak, point)
+    current_adjusted = current_equity - current_net_flows
+    current_drawdown = max(Decimal(0), peak - current_adjusted) if current_valid else None
+    if current_valid:
+        max_drawdown = max(max_drawdown, current_drawdown or Decimal(0))
+        if peak > 0:
+            max_percent = max(max_percent, (current_drawdown or Decimal(0)) / peak * Decimal(100))
+        peak = max(peak, current_adjusted)
+    return current_drawdown, max_drawdown, max_percent, peak
 
 
 def _load_demo_runs(connection: Any) -> list[dict[str, Any]]:
@@ -439,8 +485,9 @@ def _load_demo_runs(connection: Any) -> list[dict[str, Any]]:
         cursor.execute(
             "SELECT run_id, report_day_kyiv, equity_usd, pnl_usd, daily_pnl_usd, cumulative_pnl_usd, "
             "fees_usd, trade_count, closed_trade_count, "
-            "drawdown_usd, drawdown_percent, position_value_usd, transfer_value_usd, valuation_complete, "
-            "valuation_stale, captured_at_utc FROM trader_demo_daily_reports "
+            "drawdown_usd, drawdown_percent, max_drawdown_usd, max_drawdown_percent, "
+            "position_value_usd, transfer_value_usd, valuation_complete, valuation_stale, captured_at_utc "
+            "FROM trader_demo_daily_reports "
             "ORDER BY report_day_kyiv DESC, run_id LIMIT 1000"
         )
         reports = cursor.fetchall()
@@ -684,7 +731,9 @@ def _render_trader_page(
                 + '</td><td>' + _fmt_fixed(report.get("cumulative_pnl_usd") if report.get("cumulative_pnl_usd") is not None else report.get("pnl_usd"), 3)
                 + '</td><td>' + _fmt_fixed(report.get("fees_usd"), 3) + '</td><td>' + _fmt(report.get("trade_count"))
                 + ' / ' + _fmt(report.get("closed_trade_count")) + '</td><td>' + _fmt_fixed(report.get("drawdown_usd"), 3)
-                + ' (' + _fmt_fixed(report.get("drawdown_percent"), 2) + '%)</td><td>'
+                + ' (' + _fmt_fixed(report.get("drawdown_percent"), 2) + '%) / max. '
+                + _fmt_fixed(report.get("max_drawdown_usd"), 3)
+                + ' (' + _fmt_fixed(report.get("max_drawdown_percent"), 2) + '%)</td><td>'
                 + _fmt_fixed(report.get("position_value_usd"), 3) + ' / '
                 + _fmt_fixed(report.get("transfer_value_usd"), 3) + '</td><td>'
                 + ('полная' if report.get("valuation_complete") else 'неполная')
@@ -746,7 +795,7 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 <div class="card"><span>Подтверждённые маршруты</span><strong>{_fmt(stats.get('confirmed_routes') or 0)}</strong></div>
 <div class="card"><span>Предполагаемые маршруты</span><strong>{_fmt(stats.get('assumed_routes') or 0)}</strong></div>
 </section><h2>Демопрогон</h2><section class="cards">{run_details}</section><h2>Статистика по стратегиям и прогонам</h2><section class="cards">{strategy_cards}</section>
-<h2>Дневной отчёт · Europe/Kyiv</h2><div class="table-wrap"><table><thead><tr><th>День</th><th>Прогон / commit</th><th>Equity</th><th>PnL за день</th><th>PnL с начала</th><th>Комиссии</th><th>Сделок / закрыто</th><th>Просадка</th><th>В позициях / переводе</th><th>Оценка</th></tr></thead><tbody>{''.join(daily_report_rows)}</tbody></table></div>
+<h2>Дневной отчёт · Europe/Kyiv</h2><div class="table-wrap"><table><thead><tr><th>День</th><th>Прогон / commit</th><th>Equity</th><th>PnL за день</th><th>PnL с начала</th><th>Комиссии</th><th>Сделок / закрыто</th><th>Текущая / максимальная просадка</th><th>В позициях / переводе</th><th>Оценка</th></tr></thead><tbody>{''.join(daily_report_rows)}</tbody></table></div>
 {capital_form}<h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
 <th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
 </tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div>
