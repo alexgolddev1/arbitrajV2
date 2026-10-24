@@ -274,6 +274,8 @@ def _estimate_trade(
         step = withdraw_step(source_network)
         min_withdraw_value = transfer.get("min_withdraw")
         if min_withdraw_value in (None, ""):
+            min_withdraw_value = (transfer.get("source_network") or {}).get("min_withdraw")
+        if min_withdraw_value in (None, ""):
             raise ValueError("Неизвестно минимальное количество вывода для маршрута")
         withdrawal_quantity = floor_to_step(buy_net_quantity, step)
         if withdrawal_quantity < _required_rule_decimal(min_withdraw_value, "min_withdraw"):
@@ -681,6 +683,28 @@ def _retry_settlement(trade_id: int, reason: str, claim_token: str | None = None
         connection.close()
 
 
+def _persist_sale_dust(trade_id: int, quantity: Decimal, claim_token: str | None) -> None:
+    """Retain a non-tradable sell remainder as an explicitly tracked coin balance."""
+    connection = connect_db()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE trader_training_settlements SET sale_dust_quantity = sale_dust_quantity + %s, "
+                "remaining_quantity = 0, status = 'settled', position_status = 'closed', "
+                "settled_at = UTC_TIMESTAMP(), claimed_at = NULL, claim_token = NULL "
+                "WHERE settlement_id = %s AND status = 'settling' AND claim_token = %s",
+                (quantity, trade_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Sale dust update lost settlement lease")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def _settle_training_trade(trade: dict[str, Any]) -> None:
     trade_id = int(trade["settlement_id"])
     # Rows from before per-exchange accounting have no reliable coin location.
@@ -803,13 +827,18 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
                 raise
             finally:
                 connection.close()
+        sell_rules = fetch_spot_market_rules(trade["sell_exchange"], trade["sell_market_pair"], market_order=True)
+        executable_quantity = floor_to_step(quantity, sell_rules.quantity_step)
+        if executable_quantity <= 0 or executable_quantity < sell_rules.min_quantity:
+            _persist_sale_dust(trade_id, quantity, trade.get("claim_token"))
+            return
         execution = (
             fetch_limit_sell_execution(
-                trade["sell_exchange"], trade["sell_market_pair"], quantity, take_profit_price
+                trade["sell_exchange"], trade["sell_market_pair"], executable_quantity, take_profit_price
             )
             if trigger == "take_profit"
             else fetch_market_sell_execution(
-                trade["sell_exchange"], trade["sell_market_pair"], quantity,
+                trade["sell_exchange"], trade["sell_market_pair"], executable_quantity,
             )
         )
         if execution.filled_quantity <= 0:
@@ -817,6 +846,10 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
         proceeds = execution.proceeds
         sell_rate = sell_fees.taker_for("sell")
         sell_fee = proceeds * sell_rate
+        if (execution.filled_quantity < sell_rules.min_quantity
+                or (sell_rules.min_notional is not None and proceeds < sell_rules.min_notional)):
+            _persist_sale_dust(trade_id, quantity, trade.get("claim_token"))
+            return
     except InsufficientLiquidity as error:
         _retry_settlement(trade_id, str(error), trade.get("claim_token"))
         logger.warning(
@@ -843,7 +876,8 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             account = cursor.fetchone()
             cursor.execute(
                 "SELECT status, claim_token, position_status, remaining_quantity, sold_quantity, "
-                "sell_proceeds_accumulated_usd, sell_fees_accumulated_usd, buy_debit_usd, "
+                "sell_proceeds_accumulated_usd, sell_fees_accumulated_usd, buy_debit_usd, bought_quantity, "
+                "cost_basis_sold_usd, cost_basis_remaining_usd, "
                 "settlement_attempts, planned_sell_at, asset_exchange FROM trader_training_settlements "
                 "WHERE settlement_id = %s FOR UPDATE",
                 (trade_id,),
@@ -869,7 +903,17 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             accumulated_proceeds = Decimal(str(state["sell_proceeds_accumulated_usd"])) + proceeds
             accumulated_sell_fees = Decimal(str(state["sell_fees_accumulated_usd"])) + sell_fee
             buy_debit = Decimal(str(state["buy_debit_usd"]))
-            realized_profit = accumulated_proceeds - accumulated_sell_fees - buy_debit
+            bought_quantity = Decimal(str(state.get("bought_quantity") or trade.get("quantity") or 0))
+            sold_before = Decimal(str(state.get("sold_quantity") or 0))
+            remaining_cost = Decimal(str(state.get("cost_basis_remaining_usd") or 0))
+            if remaining_cost <= 0 and bought_quantity > 0:
+                remaining_cost = buy_debit * old_remaining / (old_remaining + sold_before)
+            cost_sold = remaining_cost if remaining <= 0 else (
+                remaining_cost * filled / old_remaining if old_remaining > 0 else Decimal(0)
+            )
+            remaining_cost -= cost_sold
+            accumulated_cost_sold = Decimal(str(state.get("cost_basis_sold_usd") or 0)) + cost_sold
+            realized_profit = accumulated_proceeds - accumulated_sell_fees - accumulated_cost_sold
             balance_after = (balance_before + proceeds - sell_fee).quantize(Decimal("0.00000001"))
             if per_exchange:
                 asset = _base_currency(trade["source_pair"])
@@ -920,6 +964,7 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
                 "realized_sell_proceeds_usd = %s, sell_fee_usd = %s, realized_profit_usd = %s, "
                 "settlement_balance_before_usd = %s, balance_after_usd = %s, settled_at = %s, "
                 "sell_proceeds_accumulated_usd = %s, sell_fees_accumulated_usd = %s, "
+                "cost_basis_sold_usd = %s, cost_basis_remaining_usd = %s, "
                 "sold_quantity = sold_quantity + %s, remaining_quantity = %s, actual_sell_at = UTC_TIMESTAMP(), "
                 "last_valuation_price = %s, valuation_usd = %s, valued_at = UTC_TIMESTAMP(), "
                 "settle_after_utc = %s, last_error = %s "
@@ -927,7 +972,7 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
                 (next_status, next_position_status, sell_fees.source, execution.average_price, sell_rate,
                  accumulated_proceeds, accumulated_sell_fees, realized_profit, balance_before,
                  balance_after, datetime.now(timezone.utc).replace(tzinfo=None) if next_status == "settled" else None,
-                 accumulated_proceeds, accumulated_sell_fees, filled, remaining,
+                 accumulated_proceeds, accumulated_sell_fees, accumulated_cost_sold, remaining_cost, filled, remaining,
                  execution.best_bid, remaining * execution.best_bid if remaining > 0 else Decimal(0),
                  next_retry if remaining > 0 else trade["settle_after_utc"],
                  None if remaining <= 0 else f"частично исполнено; остаток {remaining}",

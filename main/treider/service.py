@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database
@@ -24,6 +25,7 @@ from main.treider.queue import (
 from main.treider.trade import process_due_training_trade, set_demo_run_id
 
 logger = logging.getLogger(__name__)
+DEMO_EQUITY_INTERVAL_SECONDS = max(1.0, float(os.getenv("TRADER_DEMO_EQUITY_INTERVAL_SECONDS", "60")))
 
 
 def _initialize() -> None:
@@ -77,12 +79,17 @@ def run() -> None:
     logger.info("Трейдер ожидает JSON-сообщения от скринера")
     last_signal_at = time.monotonic()
     last_lifetime_cleanup_at = 0.0
+    last_equity_capture_at = 0.0
     try:
         while True:
             try:
                 did_settle = process_due_training_trade()
                 did_consume = _consume_one()
                 now = time.monotonic()
+                if now - last_equity_capture_at >= DEMO_EQUITY_INTERVAL_SECONDS:
+                    from main.web import _load_trader_dashboard
+                    _load_trader_dashboard(capture_equity=True)
+                    last_equity_capture_at = now
                 if now - last_lifetime_cleanup_at >= 30:
                     closed = finalize_stale_opportunity_lifetimes(180)
                     if closed:

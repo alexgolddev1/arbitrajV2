@@ -24,10 +24,9 @@ def _json(value: Any) -> Any:
     return value
 
 
-def select_snapshot(
-    event: dict[str, Any], snapshots: list[dict[str, Any]], side: str, delay_seconds: Decimal,
-) -> dict[str, Any] | None:
-    """Zero delay uses the event's contemporaneous book; delays require a later recorded book."""
+def select_snapshot(event: dict[str, Any], snapshots: list[dict[str, Any]], side: str,
+                    delay_seconds: Decimal) -> dict[str, Any] | None:
+    """Zero delay uses the event's book; delays require a later recorded book."""
     if delay_seconds <= 0:
         embedded = _json(event.get("book_snapshot"))
         if isinstance(embedded, dict) and side in embedded:
@@ -50,10 +49,8 @@ def select_snapshot(
     return {**selected, "_replay_observed_at_utc": observed.isoformat()}
 
 
-def _fill(levels: Any, quantity: Decimal, depth_factor: Decimal, *, buying: bool) -> tuple[Decimal, Decimal]:
-    remaining = quantity
-    total = Decimal(0)
-    filled = Decimal(0)
+def _fill(levels: Any, quantity: Decimal, depth_factor: Decimal) -> tuple[Decimal, Decimal]:
+    remaining, total, filled = quantity, Decimal(0), Decimal(0)
     for level in levels or []:
         if not isinstance(level, (list, tuple)) or len(level) < 2:
             continue
@@ -69,25 +66,59 @@ def _fill(levels: Any, quantity: Decimal, depth_factor: Decimal, *, buying: bool
     return filled, total
 
 
-def replay_scenario(
-    run: dict[str, Any], events: list[dict[str, Any]], snapshots: list[dict[str, Any]], *,
-    delay_seconds: Decimal = Decimal(0), buy_fee_percent: Decimal | None = None,
-    sell_fee_percent: Decimal | None = None, depth_reduction_percent: Decimal = Decimal(0),
-) -> dict[str, Any]:
+def _pair_for_asset(events: list[dict[str, Any]], exchange: str, asset: str) -> str | None:
+    event = next((row for row in events if row.get("event_type") in {"buy", "sell"}
+                  and str(row.get("exchange_slug", "")).lower() == exchange
+                  and str(row.get("asset", "")).upper() == asset), None)
+    return str(event["market_pair"]).upper() if event else None
+
+
+def _equity(balances: dict[tuple[str, str], Decimal], marks: dict[tuple[str, str], Decimal],
+            events: list[dict[str, Any]], gaps: list[str]) -> Decimal:
+    total = Decimal(0)
+    for (exchange, asset), amount in balances.items():
+        if asset in {"USDT", "USDC", "USD"}:
+            total += amount
+        elif amount:
+            pair = _pair_for_asset(events, exchange, asset)
+            mark = marks.get((exchange, pair)) if pair else None
+            if mark is None:
+                for (mark_exchange, market_pair), candidate in marks.items():
+                    if market_pair.split("/", 1)[0].split("_", 1)[0].split("-", 1)[0] == asset:
+                        mark = candidate
+                        break
+            if mark is None:
+                gaps.append(f"unpriced {asset} balance on {exchange}")
+            else:
+                total += amount * mark
+    return total
+
+
+def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots: list[dict[str, Any]], *,
+                    delay_seconds: Decimal = Decimal(0), buy_fee_percent: Decimal | None = None,
+                    sell_fee_percent: Decimal | None = None,
+                    depth_reduction_percent: Decimal = Decimal(0)) -> dict[str, Any]:
     if delay_seconds < 0 or not Decimal(0) <= depth_reduction_percent < Decimal(100):
-        raise ValueError("Задержка должна быть неотрицательной, уменьшение глубины — от 0 до 100%")
+        raise ValueError("Delay must be non-negative and depth reduction must be from 0 to 100%")
     if any(rate is not None and (not rate.is_finite() or rate < 0 or rate >= 100)
            for rate in (buy_fee_percent, sell_fee_percent)):
-        raise ValueError("Комиссия должна быть от 0 до 100%")
+        raise ValueError("Commission must be from 0 to 100%")
     depth_factor = Decimal(1) - depth_reduction_percent / Decimal(100)
     starting = Decimal(str(run.get("starting_equity_usd") or 0))
-    cash = starting
-    positions: dict[tuple[int, str], Decimal] = {}
-    marks: dict[tuple[str, str], Decimal] = {}
-    fee_by_settlement: dict[int, list[dict[str, Any]]] = {}
-    for event in events:
-        if event.get("event_type") == "commission":
-            fee_by_settlement.setdefault(int(event["settlement_id"]), []).append(event)
+    balances: dict[tuple[str, str], Decimal] = {}
+    starting_rows = run.get("starting_balances") or []
+    if isinstance(starting_rows, str):
+        starting_rows = _json(starting_rows) or []
+    for row in starting_rows:
+        exchange = row.get("exchange")
+        if exchange:
+            key = (str(exchange).lower(), str(row.get("asset") or "USDT").upper())
+            balances[key] = balances.get(key, Decimal(0)) + Decimal(str(row.get("balance") or 0))
+    if not balances:
+        balances[("legacy", "USDT")] = starting
+
+    commission_events = {str(row.get("event_key")): row for row in events
+                         if row.get("event_type") == "commission"}
     ordered = []
     for event in events:
         kind = event.get("event_type")
@@ -95,111 +126,138 @@ def replay_scenario(
         if kind in {"buy", "sell"}:
             side = "buy" if kind == "buy" else "sell"
             selected = select_snapshot(event, snapshots, side, delay_seconds)
-            event_time = (_dt(selected.get("_replay_observed_at_utc", event["event_at_utc"]))
-                          if selected else _dt(event["event_at_utc"]) + timedelta(seconds=float(delay_seconds)))
+            at = (_dt(selected["_replay_observed_at_utc"]) if selected and selected.get("_replay_observed_at_utc")
+                  else _dt(event["event_at_utc"]) + timedelta(seconds=float(delay_seconds)))
         else:
-            event_time = _dt(event["event_at_utc"]) + timedelta(seconds=float(delay_seconds))
-        ordered.append((event_time, int(event.get("event_id") or 0), event, selected))
+            at = _dt(event["event_at_utc"]) + timedelta(seconds=float(delay_seconds))
+        ordered.append((at, int(event.get("event_id") or 0), event, selected))
     ordered.sort(key=lambda item: (item[0], item[1]))
-    points: list[tuple[datetime, Decimal]] = []
+
     gaps: list[str] = []
     if not run.get("baseline_complete", True):
-        gaps.append("Стартовые остатки содержат неоценённые или неоднозначные активы")
+        gaps.append("starting balances include unvalued or unallocated assets")
     if not any(row.get("event_type") in {"buy", "sell"} for row in events):
-        gaps.append("В журнале нет исполнений для replay")
-    fee_total = Decimal(0)
-    net_capital_flows = Decimal(0)
-    completed = 0
-    for event_time, _, event, snapshot in ordered:
-        event_type = event.get("event_type")
-        if event_type == "capital_movement":
+        gaps.append("journal has no executions for replay")
+    points: list[tuple[datetime, Decimal]] = []
+    marks: dict[tuple[str, str], Decimal] = {}
+    net_flows, fee_total, completed = Decimal(0), Decimal(0), 0
+    for at, _, event, snapshot in ordered:
+        kind = event.get("event_type")
+        exchange = str(event.get("exchange_slug") or "").lower()
+        asset = str(event.get("asset") or "").upper()
+        if kind == "capital_movement":
             amount = Decimal(str(event.get("amount_usd") or 0))
-            cash += amount
-            net_capital_flows += amount
-            points.append((event_time, cash))
-            continue
-        if event_type == "commission" and ":commission:transfer" in str(event.get("event_key", "")):
-            transfer_fee = Decimal(str(event.get("quote_amount") or 0))
-            cash -= transfer_fee
-            fee_total += transfer_fee
-            points.append((event_time, cash))
-            continue
-        if event_type not in {"buy", "sell"}:
-            continue
-        side = "buy" if event_type == "buy" else "sell"
-        if not snapshot:
-            gaps.append(f"{event.get('event_key')}: нет снимка для задержки {delay_seconds}s")
-            continue
-        levels = snapshot.get("asks" if side == "buy" else "bids", [])
-        quantity = Decimal(str(event.get("quantity") or 0))
-        filled, notional = _fill(levels, quantity, depth_factor, buying=side == "buy")
-        if filled <= 0:
-            gaps.append(f"{event.get('event_key')}: недостаточно глубины")
-            continue
-        if filled < quantity:
-            gaps.append(f"{event.get('event_key')}: частичное исполнение {filled}/{quantity}")
-        settlement_id = int(event["settlement_id"])
-        asset = str(event.get("asset") or "")
-        position_key = (settlement_id, asset)
-        exchange_pair = (str(event.get("exchange_slug", "")).lower(), str(event.get("market_pair", "")).upper())
-        bid_levels = snapshot.get("bids") or []
-        ask_levels = snapshot.get("asks") or []
-        if bid_levels:
-            marks[exchange_pair] = Decimal(str(bid_levels[0][0]))
-        elif ask_levels:
-            marks[exchange_pair] = Decimal(str(ask_levels[0][0]))
-        commissions = fee_by_settlement.get(settlement_id, [])
-        fee_event = next((row for row in commissions if ("buy" if "buy" in str(row.get("event_key")) else "sell") == side
-                          and (side == "buy" or str(row.get("event_key", "")).startswith(f"{settlement_id}:commission:sell:"))), None)
-        historical_fee = Decimal(0)
-        fee_asset = "USDT"
-        if fee_event:
-            historical_fee = Decimal(str(fee_event.get("fee_amount") or 0))
-            fee_asset = str(fee_event.get("fee_asset") or "USDT")
-        if side == "buy":
-            if fee_asset == asset:
-                fee_rate = (buy_fee_percent / Decimal(100) if buy_fee_percent is not None
-                            else historical_fee / quantity if quantity else Decimal(0))
-                fee = filled * fee_rate
-                net_quantity = filled - fee
-                cash -= notional
+            balances[(exchange or "legacy", "USDT")] = balances.get((exchange or "legacy", "USDT"), Decimal(0)) + amount
+            net_flows += amount
+        elif kind == "transfer_sent" or kind == "transfer_received":
+            quantity = Decimal(str(event.get("quantity") or 0))
+            key = (exchange, asset)
+            if kind == "transfer_sent" and balances.get(key, Decimal(0)) < -quantity:
+                gaps.append(f"{event.get('event_key')}: insufficient {asset} on {exchange}")
+            balances[key] = balances.get(key, Decimal(0)) + quantity
+            in_transit = ("in_transit", asset)
+            if kind == "transfer_sent":
+                balances[in_transit] = balances.get(in_transit, Decimal(0)) - quantity
             else:
-                fee_rate = (buy_fee_percent / Decimal(100) if buy_fee_percent is not None
-                            else historical_fee / Decimal(str(event.get("quote_amount") or notional)) if event.get("quote_amount") or notional else Decimal(0))
-                fee = notional * fee_rate
-                net_quantity = filled
-                cash -= notional + fee
-            positions[position_key] = positions.get(position_key, Decimal(0)) + net_quantity
-        else:
-            available = positions.get(position_key, Decimal(0))
-            if filled > available:
-                gaps.append(f"{event.get('event_key')}: продажа ограничена остатком replay {available}/{filled}")
-                filled, notional = _fill(levels, available, depth_factor, buying=False)
-                if filled <= 0:
-                    continue
-            fee_rate = (sell_fee_percent / Decimal(100) if sell_fee_percent is not None
-                        else historical_fee / Decimal(str(event.get("quote_amount") or notional)) if event.get("quote_amount") or notional else Decimal(0))
-            fee = notional * fee_rate
-            cash += notional - fee
-            positions[position_key] = max(Decimal(0), positions.get(position_key, Decimal(0)) - filled)
-        fee_total += fee
-        valuation = cash
-        for (position_trade, coin), amount in positions.items():
-            if amount <= 0:
+                transit_amount = quantity
+                if balances.get(in_transit, Decimal(0)) < transit_amount:
+                    gaps.append(f"{event.get('event_key')}: received more {asset} than was sent")
+                balances[in_transit] = max(Decimal(0), balances.get(in_transit, Decimal(0)) - transit_amount)
+        elif kind == "commission" and ":commission:transfer" in str(event.get("event_key", "")):
+            fee_asset = str(event.get("fee_asset") or asset or "USDT").upper()
+            fee = Decimal(str(event.get("fee_amount") or 0))
+            key = (exchange, fee_asset)
+            if balances.get(key, Decimal(0)) < fee:
+                gaps.append(f"{event.get('event_key')}: insufficient {fee_asset} for transfer fee on {exchange}")
+            balances[key] = balances.get(key, Decimal(0)) - fee
+            quote_fee = event.get("quote_amount")
+            if quote_fee is None:
+                gaps.append(f"{event.get('event_key')}: transfer fee has no USD valuation")
+            else:
+                fee_total += Decimal(str(quote_fee))
+        elif kind in {"buy", "sell"}:
+            side = "buy" if kind == "buy" else "sell"
+            key = str(event.get("event_key") or "")
+            fee_key = (f"{event.get('settlement_id')}:commission:buy" if side == "buy"
+                       else key.replace(f"{event.get('settlement_id')}:sell:",
+                                        f"{event.get('settlement_id')}:commission:sell:", 1))
+            fee_event = commission_events.get(fee_key)
+            if not snapshot:
+                gaps.append(f"{key}: no book snapshot for delay {delay_seconds}s")
+                points.append((at, _equity(balances, marks, events, gaps)))
                 continue
-            trade = next((row for row in events if int(row.get("settlement_id") or 0) == position_trade and row.get("event_type") == "buy"), None)
-            if trade:
-                key = (str(trade.get("exchange_slug", "")).lower(), str(trade.get("market_pair", "")).upper())
-                if key in marks:
-                    valuation += amount * marks[key]
+            pair = str(event.get("market_pair") or "").upper()
+            levels = snapshot.get("asks" if side == "buy" else "bids", [])
+            requested = Decimal(str(event.get("quantity") or 0))
+            filled, notional = _fill(levels, requested, depth_factor)
+            if filled <= 0:
+                gaps.append(f"{key}: insufficient book depth")
+                points.append((at, _equity(balances, marks, events, gaps)))
+                continue
+            if filled < requested:
+                gaps.append(f"{key}: partial execution {filled}/{requested}")
+            bids = snapshot.get("bids") or []
+            asks = snapshot.get("asks") or []
+            mark = Decimal(str((bids or asks)[0][0])) if bids or asks else None
+            if mark is not None:
+                marks[(exchange, pair)] = mark
+            historical_fee = Decimal(str((fee_event or {}).get("fee_amount") or 0))
+            fee_asset = str((fee_event or {}).get("fee_asset") or "USDT").upper()
+            quote = str(event.get("quote_asset") or "USDT").upper()
+            fee_value_usd = Decimal(0)
+            if side == "buy":
+                if fee_asset == asset:
+                    fee = filled * (buy_fee_percent / 100 if buy_fee_percent is not None
+                                    else historical_fee / requested if requested else 0)
+                    net_coin = filled - fee
+                    quote_cost = notional
+                    if fee and mark is None:
+                        gaps.append(f"{key}: base-asset buy fee has no USD mark")
+                    fee_value_usd = fee * (mark or Decimal(0))
                 else:
-                    gaps.append(f"{position_trade}: нет цены для оценки {coin}")
-        points.append((event_time, valuation))
-        if side == "sell" and positions.get(position_key, Decimal(0)) == 0:
-            completed += 1
-    peak = starting
-    max_drawdown = Decimal(0)
-    final_equity = starting
+                    fee = notional * (buy_fee_percent / 100 if buy_fee_percent is not None
+                                      else historical_fee / Decimal(str(event.get("quote_amount") or notional))
+                                      if event.get("quote_amount") or notional else 0)
+                    net_coin, quote_cost = filled, notional + fee
+                    fee_value_usd = fee
+                cash_key = (exchange, quote)
+                if balances.get(cash_key, Decimal(0)) < quote_cost:
+                    gaps.append(f"{key}: insufficient {quote} on {exchange}")
+                    points.append((at, _equity(balances, marks, events, gaps)))
+                    continue
+                balances[cash_key] = balances.get(cash_key, Decimal(0)) - quote_cost
+                balances[(exchange, asset)] = balances.get((exchange, asset), Decimal(0)) + net_coin
+            else:
+                coin_key = (exchange, asset)
+                available = balances.get(coin_key, Decimal(0))
+                if filled > available:
+                    gaps.append(f"{key}: sell exceeds available {asset} on {exchange}")
+                    filled, notional = _fill(levels, available, depth_factor)
+                if fee_asset == asset:
+                    fee = filled * (sell_fee_percent / 100 if sell_fee_percent is not None
+                                    else historical_fee / requested if requested else 0)
+                    if fee and mark is None:
+                        gaps.append(f"{key}: base-asset sell fee has no USD mark")
+                    fee_value_usd = fee * (mark or Decimal(0))
+                    cash_proceeds = notional
+                else:
+                    fee = notional * (sell_fee_percent / 100 if sell_fee_percent is not None
+                                      else historical_fee / Decimal(str(event.get("quote_amount") or notional))
+                                      if event.get("quote_amount") or notional else 0)
+                    fee_value_usd = fee
+                    cash_proceeds = notional - fee
+                balances[coin_key] = max(Decimal(0), available - filled - (fee if fee_asset == asset else 0))
+                balances[(exchange, quote)] = balances.get((exchange, quote), Decimal(0)) + cash_proceeds
+                if balances[coin_key] == 0:
+                    completed += 1
+            fee_total += fee_value_usd
+        elif kind == "commission":
+            # Buy and sell commissions are included with their exact execution above.
+            pass
+        equity = _equity(balances, marks, events, gaps)
+        points.append((at, equity))
+
+    peak, max_drawdown, final_equity = starting, Decimal(0), starting
     daily: dict[str, Decimal] = {}
     for at, equity in points:
         peak = max(peak, equity)
@@ -208,7 +266,7 @@ def replay_scenario(
         daily[at.astimezone(timezone.utc).date().isoformat()] = equity
     return {
         "equity_usd": final_equity,
-        "pnl_usd": final_equity - starting - net_capital_flows,
+        "pnl_usd": final_equity - starting - net_flows,
         "max_drawdown_usd": max_drawdown,
         "fees_usd": fee_total,
         "closed_positions": completed,

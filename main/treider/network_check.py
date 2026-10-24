@@ -98,6 +98,9 @@ def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
         return {"available": False, "route_status": "unconfirmed", "currency": currency,
                 "source_exchange": source, "destination_exchange": destination,
                 "errors": result.get("errors") or {}}
+    min_withdraw = selected.get("min_withdraw")
+    if min_withdraw in (None, ""):
+        min_withdraw = (selected.get("source_network") or {}).get("min_withdraw")
     return {
         "available": True,
         "route_status": selected.get("route_status", "unconfirmed"),
@@ -115,6 +118,7 @@ def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
         "random_seed": selected.get("random_seed"),
         "fixed_delay_seconds": selected.get("fixed_delay_seconds"),
         "source_network": selected.get("source_network"),
+        "min_withdraw": min_withdraw,
         "destination_network": selected.get("destination_network"),
         "assumed_source": bool(selected.get("source_assumed")),
         "assumed_destination": bool(selected.get("destination_assumed")),

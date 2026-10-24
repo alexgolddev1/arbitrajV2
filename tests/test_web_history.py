@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import csv
+import json
+import io
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
@@ -42,7 +45,8 @@ class TraderHistoryTests(unittest.TestCase):
 
         self.assertIn("event_id,event_key,run_id,settlement_id,signal_id,event_type,event_at_utc", exported)
         self.assertIn("application_realized_profit_usd", exported)
-        self.assertIn('"snapshot_type":"best_quote"', exported)
+        row = next(csv.DictReader(io.StringIO(exported)))
+        self.assertEqual(json.loads(row["book_snapshot"])["snapshot_type"], "best_quote")
         self.assertNotIn("must-not-export", exported)
 
     @patch("main.web.fetch_market_sell_execution")
@@ -54,6 +58,7 @@ class TraderHistoryTests(unittest.TestCase):
         result = _value_trader_positions([
             {
                 "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT",
+                "buy_market_pair": "ABC/USDT",
                 "remaining_quantity": Decimal("2"), "expected_sell_taker_fee_rate": Decimal("0.01"),
                 "position_status": "pending_transfer",
             },

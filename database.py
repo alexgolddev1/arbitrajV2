@@ -193,6 +193,9 @@ def initialize_database(connection: MySQLConnection) -> None:
                 "sell_proceeds_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "sell_fees_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "buy_debit_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "cost_basis_sold_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "cost_basis_remaining_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "sale_dust_quantity": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
                 "purchase_model": "VARCHAR(64) NOT NULL DEFAULT 'legacy'",
                 "position_status": "ENUM('legacy','pending_transfer','ready_to_sell','partial','stop_loss','closed','open') NOT NULL DEFAULT 'legacy'",
                 "asset_exchange": "VARCHAR(32) NULL", "transfer_completed_at": "DATETIME NULL",
@@ -207,6 +210,10 @@ def initialize_database(connection: MySQLConnection) -> None:
                 cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE %s", (column_name,))
                 if cursor.fetchone() is None:
                     cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+        for column_name in ("daily_pnl_usd", "cumulative_pnl_usd"):
+            cursor.execute(f"SHOW COLUMNS FROM trader_demo_daily_reports LIKE %s", (column_name,))
+            if cursor.fetchone() is None:
+                cursor.execute(f"ALTER TABLE trader_demo_daily_reports ADD COLUMN {column_name} DECIMAL(38, 12) NULL")
         cursor.execute("SHOW COLUMNS FROM trader_capital_movements LIKE 'exchange_slug'")
         if cursor.fetchone() is None:
             cursor.execute(

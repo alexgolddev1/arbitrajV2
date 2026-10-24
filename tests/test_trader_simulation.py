@@ -166,7 +166,7 @@ class MarketAndRouteTests(unittest.TestCase):
         cursor.fetchall.return_value = []
 
         estimate, stop_price, _, _, error = trade._select_trade_estimate(
-            cursor, buy, sell, rates, sell_rates, Decimal("100"),
+            cursor, 17, buy, sell, rates, sell_rates, Decimal("100"),
             {"withdraw_fee": "0", "withdraw_fee_currency": "ABC", "withdraw_step": "0.01", "min_withdraw": "0.01"},
             Decimal("11"),
         )
@@ -582,12 +582,13 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertIn("уже запущен", reason)
         self.assertFalse(any("INSERT INTO trader_training_settlements" in call.args[0] for call in cursor.execute.call_args_list))
 
+    @patch("main.treider.trade.fetch_spot_market_rules")
     @patch("main.treider.trade.get_trade_fee_rates")
     @patch("main.treider.trade.fetch_market_sell_execution")
     @patch("main.treider.trade.connect_db")
     @patch("main.treider.trade.fetch_spot_book")
     def test_partial_sell_credits_only_filled_part_and_preserves_remainder(
-        self, spot_book: Mock, connect: Mock, sell_execution: Mock, fee_rates: Mock,
+        self, spot_book: Mock, connect: Mock, sell_execution: Mock, fee_rates: Mock, market_rules: Mock,
     ) -> None:
         from main.treider import trade
 
@@ -616,6 +617,9 @@ class TradeCalculationTests(unittest.TestCase):
             "mexc", "ABCUSDT", Decimal(0), Decimal("0.001"), "now",
             sell_taker_rate=Decimal("0.001"),
         )
+        market_rules.return_value = SimpleNamespace(
+            quantity_step=Decimal("0.1"), min_quantity=Decimal("0.1"), min_notional=Decimal("1"),
+        )
         trade._settle_training_trade({
             "settlement_id": 2, "signal_id": 17, "source_pair": "ABC/USDT",
             "buy_exchange": "binance", "buy_market_pair": "ABC/USDT", "buy_price": Decimal("10"),
@@ -628,9 +632,9 @@ class TradeCalculationTests(unittest.TestCase):
         values = updates[0].args[1]
         self.assertEqual(values[0], "partial")
         self.assertEqual(values[1], "stop_loss")
-        self.assertEqual(values[7], Decimal("-10.020"))
+        self.assertEqual(values[7], Decimal("-0.020"))
         self.assertEqual(values[9], Decimal("69.98000000"))
-        self.assertEqual(values[14], Decimal("1"))
+        self.assertEqual(values[16], Decimal("1"))
         sell_execution.assert_called_once_with("mexc", "ABC/USDT", Decimal("3"))
 
 
@@ -708,6 +712,23 @@ class RetryTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    @patch("main.treider.network_check._fetch_routes")
+    def test_route_keeps_minimum_withdraw_from_source_network(self, fetch_routes: Mock) -> None:
+        from main.treider.network_check import check_transfer_network
+
+        fetch_routes.return_value = {"routes": [{
+            "route_status": "confirmed", "network_profile": "ERC20", "network_name": "Ethereum",
+            "source_network": {"exchange": "binance", "min_withdraw": "0.25"},
+            "destination_network": {},
+        }]}
+
+        result = check_transfer_network({
+            "source_pair": "ABC/USDT", "buy": {"exchange": "binance"}, "sell": {"exchange": "okx"},
+        })
+
+        self.assertEqual(result["min_withdraw"], "0.25")
+        self.assertEqual(result["source_network"]["min_withdraw"], "0.25")
+
     @patch("main.treider.account._git_commit", return_value="a" * 40)
     @patch("main.treider.account._demo_config_snapshot", return_value={"strategy": "tp_sl"})
     def test_demo_run_restart_reuses_same_commit_and_configuration(
@@ -751,7 +772,8 @@ class PersistenceTests(unittest.TestCase):
         self.assertTrue(any("status = 'superseded'" in statement for statement in statements))
         self.assertTrue(any("INSERT INTO trader_demo_run_state" in statement for statement in statements))
         inserted_run = next(call for call in cursor.execute.call_args_list if "INSERT INTO trader_demo_runs (run_id" in call.args[0] and "INSERT IGNORE" not in call.args[0])
-        self.assertIn('"balance":"73"', inserted_run.args[1][4])
+        starting_balances = __import__("json").loads(inserted_run.args[1][4])
+        self.assertIn({"exchange": "binance", "asset": "USDT", "balance": "73"}, starting_balances)
 
     def test_replay_latency_never_selects_a_snapshot_before_execution_time(self) -> None:
         from main.treider.replay import select_snapshot
@@ -775,7 +797,8 @@ class PersistenceTests(unittest.TestCase):
     def test_replay_reports_missing_delayed_books_and_degraded_depth(self) -> None:
         from main.treider.replay import replay_scenario
 
-        run = {"starting_equity_usd": Decimal("100"), "baseline_complete": True}
+        run = {"starting_equity_usd": Decimal("100"), "baseline_complete": True,
+               "starting_balances": [{"exchange": "binance", "asset": "USDT", "balance": "100"}]}
         events = [{
             "event_id": 1, "event_key": "1:buy", "settlement_id": 1, "event_type": "buy",
             "event_at_utc": "2026-10-24T10:00:00+00:00", "exchange_slug": "binance",
@@ -789,9 +812,75 @@ class PersistenceTests(unittest.TestCase):
         reduced = replay_scenario(run, events, [], depth_reduction_percent=Decimal("50"))
 
         self.assertFalse(missing["complete"])
-        self.assertTrue(any("нет снимка" in gap for gap in missing["gaps"]))
+        self.assertTrue(any("no book snapshot" in gap for gap in missing["gaps"]))
         self.assertFalse(reduced["complete"])
-        self.assertTrue(any("частичное исполнение" in gap for gap in reduced["gaps"]))
+        self.assertTrue(any("partial execution" in gap for gap in reduced["gaps"]))
+
+    def test_replay_marks_remaining_coin_and_matches_sell_fee_by_event_key(self) -> None:
+        from main.treider.replay import replay_scenario
+
+        run = {
+            "starting_equity_usd": Decimal("100"), "baseline_complete": True,
+            "starting_balances": [{"exchange": "binance", "asset": "USDT", "balance": "100"}],
+        }
+        events = [
+            {"event_id": 1, "event_key": "8:buy", "settlement_id": 8, "event_type": "buy",
+             "event_at_utc": "2026-10-24T10:00:00Z", "exchange_slug": "binance",
+             "market_pair": "ABC/USDT", "asset": "ABC", "quantity": "2", "quote_amount": "20",
+             "book_snapshot": {"buy": {"snapshot_type": "depth", "asks": [["10", "2"]], "bids": [["9", "2"]]}}},
+            {"event_id": 2, "event_key": "8:commission:buy", "settlement_id": 8, "event_type": "commission",
+             "event_at_utc": "2026-10-24T10:00:01Z", "exchange_slug": "binance", "fee_amount": "0.1",
+             "fee_asset": "USDT", "quote_amount": "0.1"},
+            {"event_id": 3, "event_key": "8:sell:1", "settlement_id": 8, "event_type": "sell",
+             "event_at_utc": "2026-10-24T10:00:02Z", "exchange_slug": "binance",
+             "market_pair": "ABC/USDT", "asset": "ABC", "quantity": "1", "quote_amount": "11",
+             "book_snapshot": {"sell": {"snapshot_type": "depth", "bids": [["11", "1"]]}}},
+            {"event_id": 4, "event_key": "8:commission:sell:1", "settlement_id": 8, "event_type": "commission",
+             "event_at_utc": "2026-10-24T10:00:03Z", "exchange_slug": "binance", "fee_amount": "0.11",
+             "fee_asset": "USDT", "quote_amount": "0.11"},
+            {"event_id": 5, "event_key": "8:commission:sell:unrelated", "settlement_id": 8, "event_type": "commission",
+             "event_at_utc": "2026-10-24T10:00:04Z", "exchange_slug": "binance", "fee_amount": "9",
+             "fee_asset": "USDT", "quote_amount": "9"},
+        ]
+
+        result = replay_scenario(run, events, [])
+
+        self.assertEqual(result["fees_usd"], Decimal("0.21"))
+        self.assertEqual(result["equity_usd"], Decimal("101.79"))
+        self.assertFalse(result["gaps"])
+        self.assertTrue(result["complete"])
+
+    def test_replay_transfer_coin_fee_moves_and_deducts_exchange_balances(self) -> None:
+        from main.treider.replay import replay_scenario
+
+        run = {"starting_equity_usd": Decimal("100"), "baseline_complete": True,
+               "starting_balances": [{"exchange": "binance", "asset": "USDT", "balance": "100"}]}
+        events = [
+            {"event_id": 1, "event_key": "9:buy", "settlement_id": 9, "event_type": "buy",
+             "event_at_utc": "2026-10-24T10:00:00Z", "exchange_slug": "binance", "market_pair": "ABC/USDT",
+             "asset": "ABC", "quantity": "2", "quote_amount": "20",
+             "book_snapshot": {"buy": {"snapshot_type": "depth", "asks": [["10", "2"]], "bids": [["9", "2"]]}}},
+            {"event_id": 2, "event_key": "9:transfer_sent", "settlement_id": 9, "event_type": "transfer_sent",
+             "event_at_utc": "2026-10-24T10:00:01Z", "exchange_slug": "binance", "asset": "ABC", "quantity": "-1.9"},
+            {"event_id": 3, "event_key": "9:transfer_received", "settlement_id": 9, "event_type": "transfer_received",
+             "event_at_utc": "2026-10-24T10:00:02Z", "exchange_slug": "mexc", "asset": "ABC", "quantity": "1.9"},
+            {"event_id": 4, "event_key": "9:commission:transfer", "settlement_id": 9, "event_type": "commission",
+             "event_at_utc": "2026-10-24T10:00:03Z", "exchange_slug": "binance", "asset": "ABC",
+             "fee_amount": "0.1", "fee_asset": "ABC", "quote_amount": "1"},
+            {"event_id": 5, "event_key": "9:sell:1.9", "settlement_id": 9, "event_type": "sell",
+             "event_at_utc": "2026-10-24T10:00:04Z", "exchange_slug": "mexc", "market_pair": "ABC/USDT",
+             "asset": "ABC", "quantity": "1.9", "quote_amount": "20.9",
+             "book_snapshot": {"sell": {"snapshot_type": "depth", "bids": [["11", "1.9"]]}}},
+            {"event_id": 6, "event_key": "9:commission:sell:1.9", "settlement_id": 9, "event_type": "commission",
+             "event_at_utc": "2026-10-24T10:00:05Z", "exchange_slug": "mexc", "fee_amount": "0.209",
+             "fee_asset": "USDT", "quote_amount": "0.209"},
+        ]
+
+        result = replay_scenario(run, events, [])
+
+        self.assertEqual(result["equity_usd"], Decimal("100.691"))
+        self.assertEqual(result["fees_usd"], Decimal("1.209"))
+        self.assertFalse(any("insufficient" in gap for gap in result["gaps"]))
 
     @patch("main.treider.trade.connect_db")
     def test_demo_balance_read_is_scoped_to_requested_exchange(self, connect: Mock) -> None:

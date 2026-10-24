@@ -207,6 +207,8 @@ CREATE TABLE IF NOT EXISTS trader_demo_daily_reports (
     report_day_kyiv DATE NOT NULL,
     equity_usd DECIMAL(38, 12) NULL,
     pnl_usd DECIMAL(38, 12) NULL,
+    daily_pnl_usd DECIMAL(38, 12) NULL,
+    cumulative_pnl_usd DECIMAL(38, 12) NULL,
     fees_usd DECIMAL(38, 12) NOT NULL DEFAULT 0,
     trade_count INT UNSIGNED NOT NULL DEFAULT 0,
     closed_trade_count INT UNSIGNED NOT NULL DEFAULT 0,
@@ -220,6 +222,18 @@ CREATE TABLE IF NOT EXISTS trader_demo_daily_reports (
     PRIMARY KEY (run_id, report_day_kyiv),
     CONSTRAINT fk_trader_demo_daily_run
         FOREIGN KEY (run_id) REFERENCES trader_demo_runs (run_id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS trader_demo_equity_snapshots (
+    snapshot_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    run_id CHAR(36) NOT NULL,
+    captured_at_utc DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+    equity_usd DECIMAL(38, 12) NULL,
+    valuation_complete TINYINT(1) NOT NULL DEFAULT 0,
+    valuation_stale TINYINT(1) NOT NULL DEFAULT 0,
+    INDEX idx_trader_equity_run_time (run_id, captured_at_utc),
+    CONSTRAINT fk_trader_equity_run FOREIGN KEY (run_id) REFERENCES trader_demo_runs (run_id)
         ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
