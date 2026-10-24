@@ -68,6 +68,34 @@ def _fill(levels: Any, quantity: Decimal, depth_factor: Decimal) -> tuple[Decima
     return filled, total
 
 
+def _scaled_levels(levels: Any, depth_factor: Decimal) -> list[list[Decimal]]:
+    scaled = []
+    for level in levels or []:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        price, size = Decimal(str(level[0])), Decimal(str(level[1])) * depth_factor
+        if price > 0 and size > 0:
+            scaled.append([price, size])
+    return scaled
+
+
+def _consume(levels: list[list[Decimal]], quantity: Decimal) -> tuple[Decimal, Decimal]:
+    remaining, total, filled = quantity, Decimal(0), Decimal(0)
+    for level in levels:
+        price, size = level
+        amount = min(size, remaining)
+        if amount <= 0:
+            continue
+        level[1] -= amount
+        total += amount * price
+        filled += amount
+        remaining -= amount
+        if remaining <= 0:
+            break
+    levels[:] = [level for level in levels if level[1] > 0]
+    return filled, total
+
+
 def _pair_for_asset(events: list[dict[str, Any]], exchange: str, asset: str) -> str | None:
     event = next((row for row in events if row.get("event_type") in {"buy", "sell"}
                   and str(row.get("exchange_slug", "")).lower() == exchange
@@ -76,7 +104,7 @@ def _pair_for_asset(events: list[dict[str, Any]], exchange: str, asset: str) -> 
 
 
 def _equity(balances: dict[tuple[str, str], Decimal],
-            books: dict[tuple[str, str], tuple[dict[str, Any], datetime]],
+            books: dict[tuple[str, str], dict[str, Any]],
             exit_fees: dict[tuple[str, str], tuple[Decimal, str]], events: list[dict[str, Any]],
             at: datetime, depth_factor: Decimal, gaps: list[str]) -> Decimal:
     total = Decimal(0)
@@ -84,20 +112,27 @@ def _equity(balances: dict[tuple[str, str], Decimal],
         if asset in {"USDT", "USDC", "USD"}:
             total += amount
         elif amount:
+            if exchange == "in_transit":
+                sent = [row for row in events
+                        if row.get("event_type") == "transfer_sent"
+                        and str(row.get("asset", "")).upper() == asset
+                        and _dt(row["event_at_utc"]) <= at]
+                if not sent:
+                    gaps.append(f"no source exchange for in-transit {asset} balance")
+                    continue
+                exchange = str(max(sent, key=lambda row: _dt(row["event_at_utc"]))
+                               .get("exchange_slug") or "").lower()
             pair = _pair_for_asset(events, exchange, asset)
             market = (exchange, pair) if pair else None
             book_row = books.get(market) if market else None
             if not market or not book_row:
                 gaps.append(f"no bid book for {asset} balance on {exchange}")
                 continue
-            snapshot, observed_at = book_row
+            observed_at = book_row["observed_at"]
             if (at - observed_at).total_seconds() < 0 or (at - observed_at).total_seconds() > MAX_EQUITY_BOOK_AGE_SECONDS:
                 gaps.append(f"stale bid book for {asset} balance on {exchange}")
                 continue
-            bids = snapshot.get("bids") or []
-            if not bids:
-                gaps.append(f"no bids for {asset} balance on {exchange}")
-                continue
+            bids = book_row["bids"]
             fee_rule = exit_fees.get(market)
             if fee_rule is None:
                 gaps.append(f"unknown exit fee for {asset} on {exchange}")
@@ -108,7 +143,7 @@ def _equity(balances: dict[tuple[str, str], Decimal],
                 sell_quantity = amount / (Decimal(1) + fee_rate)
             else:
                 sell_quantity = amount
-            filled, proceeds = _fill(bids, sell_quantity, depth_factor)
+            filled, proceeds = _fill(bids, sell_quantity, Decimal(1))
             if filled < sell_quantity:
                 gaps.append(f"insufficient bid depth for {asset} balance on {exchange}: {filled}/{sell_quantity}")
             if fee_asset in {"USDT", "USDC", "USD"}:
@@ -127,6 +162,21 @@ def _historical_exit_fee(event: dict[str, Any], fee_event: dict[str, Any] | None
     if denominator <= 0:
         return None
     return amount / denominator, fee_asset
+
+
+def _drawdown_from_points(starting: Decimal,
+                          points: list[tuple[datetime, Decimal, bool, Decimal]],
+                          baseline_complete: bool) -> Decimal | None:
+    if not baseline_complete:
+        return None
+    peak, maximum = starting, Decimal(0)
+    for _, equity, reliable, net_flows in points:
+        if not reliable:
+            continue
+        flow_adjusted = equity - net_flows
+        maximum = max(maximum, peak - flow_adjusted, Decimal(0))
+        peak = max(peak, flow_adjusted)
+    return maximum
 
 
 def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots: list[dict[str, Any]], *,
@@ -191,10 +241,25 @@ def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots
         gaps.append("starting balances include unvalued or unallocated assets")
     if not any(row.get("event_type") in {"buy", "sell"} for row in events):
         gaps.append("journal has no executions for replay")
-    points: list[tuple[datetime, Decimal]] = []
-    books: dict[tuple[str, str], tuple[dict[str, Any], datetime]] = {}
+    points: list[tuple[datetime, Decimal, bool, Decimal]] = []
+    coverage_gaps: list[dict[str, Any]] = []
+    books: dict[tuple[str, str], dict[str, Any]] = {}
+    book_states: dict[tuple[Any, ...], dict[str, Any]] = {}
     net_flows, fee_total, completed = Decimal(0), Decimal(0), 0
+
+    def capture_point(at: datetime, prior_gap_count: int) -> None:
+        equity = _equity(balances, books, exit_fees, events, at, depth_factor, gaps)
+        point_gaps = gaps[prior_gap_count:]
+        reliable = bool(run.get("baseline_complete", True)) and not point_gaps
+        points.append((at, equity, reliable, net_flows))
+        if not reliable:
+            coverage_gaps.append({
+                "at_utc": at.isoformat(),
+                "reasons": point_gaps or ["starting balances are incomplete"],
+            })
+
     for at, _, event, snapshot in ordered:
+        prior_gap_count = len(gaps)
         kind = event.get("event_type")
         exchange = str(event.get("exchange_slug") or "").lower()
         asset = str(event.get("asset") or "").upper()
@@ -237,24 +302,38 @@ def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots
             fee_event = commission_events.get(fee_key)
             if not snapshot:
                 gaps.append(f"{key}: no book snapshot for delay {delay_seconds}s")
-                points.append((at, _equity(balances, books, exit_fees, events, at, depth_factor, gaps)))
+                capture_point(at, prior_gap_count)
                 continue
             pair = str(event.get("market_pair") or "").upper()
-            levels = snapshot.get("asks" if side == "buy" else "bids", [])
             requested = Decimal(str(event.get("quantity") or 0))
-            filled, notional = _fill(levels, requested, depth_factor)
+            observed_value = snapshot.get("_replay_observed_at_utc") or snapshot.get("captured_at_utc") or event["event_at_utc"]
+            observed_at = _dt(observed_value) if observed_value else None
+            raw_bids, raw_asks = snapshot.get("bids") or [], snapshot.get("asks") or []
+            state_key = (exchange, pair, observed_at,
+                         tuple(tuple(str(value) for value in level[:2]) for level in raw_bids),
+                         tuple(tuple(str(value) for value in level[:2]) for level in raw_asks))
+            book_state = book_states.get(state_key)
+            if book_state is None:
+                book_state = {"snapshot": snapshot, "observed_at": observed_at,
+                              "bids": _scaled_levels(raw_bids, depth_factor),
+                              "asks": _scaled_levels(raw_asks, depth_factor)}
+                book_states[state_key] = book_state
+            books[(exchange, pair)] = book_state
+            levels = book_state["asks" if side == "buy" else "bids"]
+            coin_key = (exchange, asset)
+            available = balances.get(coin_key, Decimal(0)) if side == "sell" else Decimal(0)
+            execution_quantity = requested
+            if side == "sell" and requested > available:
+                gaps.append(f"{key}: sell exceeds available {asset} on {exchange}")
+                execution_quantity = available
+            filled, notional = _fill(levels, execution_quantity, Decimal(1))
             if filled <= 0:
                 gaps.append(f"{key}: insufficient book depth")
-                points.append((at, _equity(balances, books, exit_fees, events, at, depth_factor, gaps)))
+                capture_point(at, prior_gap_count)
                 continue
             if filled < requested:
                 gaps.append(f"{key}: partial execution {filled}/{requested}")
-            bids = snapshot.get("bids") or []
-            observed_value = snapshot.get("_replay_observed_at_utc") or snapshot.get("captured_at_utc") or event["event_at_utc"]
-            observed_at = _dt(observed_value) if observed_value else None
-            if bids and observed_at is not None:
-                books[(exchange, pair)] = (snapshot, observed_at)
-            else:
+            if not raw_bids or observed_at is None:
                 gaps.append(f"{key}: book snapshot has no timestamp or bids for equity valuation")
             historical_fee = Decimal(str((fee_event or {}).get("fee_amount") or 0))
             fee_asset = str((fee_event or {}).get("fee_asset") or "USDT").upper()
@@ -285,16 +364,13 @@ def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots
                 cash_key = (exchange, quote)
                 if balances.get(cash_key, Decimal(0)) < quote_cost:
                     gaps.append(f"{key}: insufficient {quote} on {exchange}")
-                    points.append((at, _equity(balances, books, exit_fees, events, at, depth_factor, gaps)))
+                    capture_point(at, prior_gap_count)
                     continue
+                _consume(book_state["asks"], filled)
                 balances[cash_key] = balances.get(cash_key, Decimal(0)) - quote_cost
                 balances[(exchange, asset)] = balances.get((exchange, asset), Decimal(0)) + net_coin
             else:
-                coin_key = (exchange, asset)
-                available = balances.get(coin_key, Decimal(0))
-                if filled > available:
-                    gaps.append(f"{key}: sell exceeds available {asset} on {exchange}")
-                    filled, notional = _fill(levels, available, depth_factor)
+                _consume(book_state["bids"], filled)
                 if fee_asset == asset:
                     fee = filled * (sell_fee_percent / 100 if sell_fee_percent is not None
                                     else historical_fee / requested if requested else 0)
@@ -314,14 +390,12 @@ def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots
         elif kind == "commission":
             # Buy and sell commissions are included with their exact execution above.
             pass
-        equity = _equity(balances, books, exit_fees, events, at, depth_factor, gaps)
-        points.append((at, equity))
+        capture_point(at, prior_gap_count)
 
-    peak, max_drawdown, final_equity = starting, Decimal(0), starting
+    max_drawdown = _drawdown_from_points(starting, points, bool(run.get("baseline_complete", True)))
+    final_equity = starting
     daily: dict[str, Decimal] = {}
-    for at, equity in points:
-        peak = max(peak, equity)
-        max_drawdown = max(max_drawdown, peak - equity)
+    for at, equity, _, _ in points:
         final_equity = equity
         daily[at.astimezone(timezone.utc).date().isoformat()] = equity
     return {
@@ -331,6 +405,12 @@ def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots
         "fees_usd": fee_total,
         "closed_positions": completed,
         "gaps": gaps,
+        "coverage_gaps": coverage_gaps,
+        "equity_points": [
+            {"at_utc": at.isoformat(), "equity_usd": equity, "reliable": reliable,
+             "net_capital_flows_usd": flows}
+            for at, equity, reliable, flows in points
+        ],
         "complete": not gaps and bool(points) and bool(run.get("baseline_complete", True)),
         "daily_equity": daily,
     }

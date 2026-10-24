@@ -849,9 +849,45 @@ class PersistenceTests(unittest.TestCase):
         result = replay_scenario(run, events, [])
 
         self.assertEqual(result["fees_usd"], Decimal("0.21"))
-        self.assertEqual(result["equity_usd"], Decimal("101.680"))
-        self.assertFalse(result["gaps"])
-        self.assertTrue(result["complete"])
+        self.assertEqual(result["equity_usd"], Decimal("90.79"))
+        self.assertTrue(any("insufficient bid depth" in gap for gap in result["gaps"]))
+        self.assertFalse(result["complete"])
+
+    def test_replay_sell_consumes_snapshot_depth_and_new_snapshot_restores_it(self) -> None:
+        from main.treider.replay import replay_scenario
+
+        run = {"starting_equity_usd": Decimal("100"), "baseline_complete": True,
+               "starting_balances": [{"exchange": "binance", "asset": "USDT", "balance": "100"}]}
+        buy_book = {"snapshot_type": "depth", "captured_at_utc": "2026-10-24T10:00:00Z",
+                    "asks": [["10", "2"]], "bids": [["9", "2"]]}
+        reused_sell_book = {"snapshot_type": "depth", "captured_at_utc": "2026-10-24T10:00:02Z",
+                            "bids": [["11", "1"]]}
+        refreshed_sell_book = {"snapshot_type": "depth", "captured_at_utc": "2026-10-24T10:00:03Z",
+                               "bids": [["12", "1"]]}
+        events = [
+            {"event_id": 1, "event_key": "10:buy", "settlement_id": 10, "event_type": "buy",
+             "event_at_utc": "2026-10-24T10:00:00Z", "exchange_slug": "binance",
+             "market_pair": "ABC/USDT", "asset": "ABC", "quantity": "2",
+             "book_snapshot": {"buy": buy_book}},
+            {"event_id": 2, "event_key": "10:sell:1", "settlement_id": 10, "event_type": "sell",
+             "event_at_utc": "2026-10-24T10:00:02Z", "exchange_slug": "binance",
+             "market_pair": "ABC/USDT", "asset": "ABC", "quantity": "1",
+             "book_snapshot": {"sell": reused_sell_book}},
+            {"event_id": 3, "event_key": "10:sell:2", "settlement_id": 10, "event_type": "sell",
+             "event_at_utc": "2026-10-24T10:00:02.500Z", "exchange_slug": "binance",
+             "market_pair": "ABC/USDT", "asset": "ABC", "quantity": "1",
+             "book_snapshot": {"sell": reused_sell_book}},
+            {"event_id": 4, "event_key": "10:sell:3", "settlement_id": 10, "event_type": "sell",
+             "event_at_utc": "2026-10-24T10:00:03Z", "exchange_slug": "binance",
+             "market_pair": "ABC/USDT", "asset": "ABC", "quantity": "1",
+             "book_snapshot": {"sell": refreshed_sell_book}},
+        ]
+
+        result = replay_scenario(run, events, [])
+
+        self.assertEqual(result["equity_usd"], Decimal("103"))
+        self.assertTrue(any("insufficient book depth" in gap for gap in result["gaps"]))
+        self.assertFalse(result["complete"])
 
     def test_replay_equity_liquidates_full_bid_depth_on_matching_exchange(self) -> None:
         from datetime import datetime, timezone
@@ -863,7 +899,8 @@ class PersistenceTests(unittest.TestCase):
         gaps: list[str] = []
         value = _equity(
             {("binance", "ABC"): Decimal("10")},
-            {("binance", "ABC/USDT"): ({"bids": [["10", "1"], ["1", "9"]]}, at)},
+            {("binance", "ABC/USDT"): {"bids": [[Decimal("10"), Decimal("1")],
+                                                    [Decimal("1"), Decimal("9")]], "observed_at": at}},
             {("binance", "ABC/USDT"): (Decimal(0), "USDT")}, events, at, Decimal(1), gaps,
         )
 
@@ -880,7 +917,7 @@ class PersistenceTests(unittest.TestCase):
         gaps: list[str] = []
         value = _equity(
             {("binance", "ABC"): Decimal("10")},
-            {("mexc", "ABC/USDT"): ({"bids": [["10", "10"]]}, at)},
+            {("mexc", "ABC/USDT"): {"bids": [[Decimal("10"), Decimal("10")]], "observed_at": at}},
             {("binance", "ABC/USDT"): (Decimal(0), "USDT")}, events, at, Decimal(1), gaps,
         )
 
@@ -898,18 +935,56 @@ class PersistenceTests(unittest.TestCase):
         stale_gaps: list[str] = []
         _equity(
             {("binance", "ABC"): Decimal("10")},
-            {("binance", "ABC/USDT"): ({"bids": [["10", "10"]]}, at - timedelta(seconds=31))},
+            {("binance", "ABC/USDT"): {"bids": [[Decimal("10"), Decimal("10")]],
+                                         "observed_at": at - timedelta(seconds=31)}},
             fees, events, at, Decimal(1), stale_gaps,
         )
         shallow_gaps: list[str] = []
         _equity(
             {("binance", "ABC"): Decimal("10")},
-            {("binance", "ABC/USDT"): ({"bids": [["10", "1"]]}, at)},
+            {("binance", "ABC/USDT"): {"bids": [[Decimal("10"), Decimal("1")]], "observed_at": at}},
             fees, events, at, Decimal(1), shallow_gaps,
         )
 
         self.assertTrue(any("stale bid book" in gap for gap in stale_gaps))
         self.assertTrue(any("insufficient bid depth" in gap for gap in shallow_gaps))
+
+    def test_replay_drawdown_ignores_incomplete_equity_points(self) -> None:
+        from datetime import datetime, timezone
+        from main.treider.replay import _drawdown_from_points
+
+        at = datetime(2026, 10, 24, 10, tzinfo=timezone.utc)
+        incomplete_dip = [
+            (at, Decimal("0"), False, Decimal("0")),
+            (at, Decimal("100"), True, Decimal("0")),
+        ]
+        trusted_drawdown = [
+            (at, Decimal("100"), True, Decimal("0")),
+            (at, Decimal("80"), True, Decimal("0")),
+            (at, Decimal("100"), True, Decimal("0")),
+        ]
+
+        self.assertEqual(_drawdown_from_points(Decimal("100"), incomplete_dip, True), Decimal("0"))
+        self.assertEqual(_drawdown_from_points(Decimal("100"), trusted_drawdown, True), Decimal("20"))
+
+    def test_replay_capital_deposit_does_not_create_strategy_pnl_or_drawdown(self) -> None:
+        from main.treider.replay import replay_scenario
+
+        run = {"starting_equity_usd": Decimal("100"), "baseline_complete": True,
+               "starting_balances": [{"exchange": "binance", "asset": "USDT", "balance": "100"}]}
+        events = [
+            {"event_id": 1, "event_key": "deposit-1", "event_type": "capital_movement",
+             "event_at_utc": "2026-10-24T10:00:00Z", "exchange_slug": "binance", "amount_usd": "100"},
+            {"event_id": 2, "event_key": "withdrawal-1", "event_type": "capital_movement",
+             "event_at_utc": "2026-10-24T10:01:00Z", "exchange_slug": "binance", "amount_usd": "-100"},
+        ]
+
+        result = replay_scenario(run, events, [])
+
+        self.assertEqual(result["pnl_usd"], Decimal("0"))
+        self.assertEqual(result["max_drawdown_usd"], Decimal("0"))
+        self.assertEqual([point["equity_usd"] - point["net_capital_flows_usd"]
+                          for point in result["equity_points"]], [Decimal("100"), Decimal("100")])
 
     def test_replay_transfer_coin_fee_moves_and_deducts_exchange_balances(self) -> None:
         from main.treider.replay import replay_scenario
@@ -941,7 +1016,10 @@ class PersistenceTests(unittest.TestCase):
 
         self.assertEqual(result["equity_usd"], Decimal("100.691"))
         self.assertEqual(result["fees_usd"], Decimal("1.209"))
-        self.assertFalse(any("insufficient" in gap for gap in result["gaps"]))
+        self.assertFalse(any("insufficient" in gap for gap in result["gaps"]), result["gaps"])
+        transit_point = next(point for point in result["equity_points"]
+                             if point["at_utc"] == "2026-10-24T10:00:01+00:00")
+        self.assertEqual(transit_point["equity_usd"], Decimal("98.0"))
 
     @patch("main.treider.trade.connect_db")
     def test_demo_balance_read_is_scoped_to_requested_exchange(self, connect: Mock) -> None:
