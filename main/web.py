@@ -6,19 +6,24 @@ import html
 import json
 import logging
 import os
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
 from config import BUY_PRICE_MUST_BE_LOWER, CALCULATOR_SPREAD_LEVELS, SCREENER_QUOTE_SYMBOLS_CSV
 from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database, read_config
+from main.treider.market_data import fetch_market_sell_execution
+from main.treider.replay import replay_scenario
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 LIFETIME_EPISODE_GAP_SECONDS = 60
+TRADER_BOOK_MAX_AGE_SECONDS = 30
 
 
 def _fmt(value: Any) -> str:
@@ -147,10 +152,18 @@ def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], lis
     try:
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
-                "SELECT balance_usd, training_mode, created_at, updated_at "
+                "SELECT balance_usd, initial_capital_usd, training_mode, created_at, updated_at "
                 "FROM trader_account WHERE account_id = 1"
             )
             account = cursor.fetchone()
+            cursor.execute(
+                "SELECT run.run_id, run.git_commit, run.config_hash, run.config, run.starting_balances, "
+                "run.starting_equity_usd, run.baseline_complete, run.status, run.started_at_utc, run.ended_at_utc "
+                "FROM trader_demo_run_state AS state JOIN trader_demo_runs AS run "
+                "ON run.run_id = state.active_run_id WHERE state.state_id = 1"
+            )
+            active_run = cursor.fetchone()
+            stats = {"active_demo_run": active_run}
             cursor.execute(
                 "SELECT COUNT(*) AS total_count, "
                 "SUM(status = 'settled') AS settled_count, "
@@ -162,7 +175,30 @@ def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], lis
                 "COALESCE(SUM(CASE WHEN status = 'settled' THEN buy_fee_usd + COALESCE(sell_fee_usd, 0) ELSE 0 END), 0) AS total_fees "
                 "FROM trader_training_settlements"
             )
-            stats = cursor.fetchone() or {}
+            stats.update(cursor.fetchone() or {})
+            cursor.execute(
+                "SELECT COALESCE(JSON_UNQUOTE(JSON_EXTRACT(route_assumptions, '$.demo_run_id')), 'legacy') AS run_id, "
+                "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(route_assumptions, '$.demo_strategy')), 'tp_sl') AS strategy, "
+                "COUNT(*) AS total_count, SUM(status = 'settled') AS settled_count, "
+                "SUM(status IN ('pending','settling','partial')) AS pending_count, SUM(status = 'open') AS open_count, "
+                "COALESCE(SUM(CASE WHEN status IN ('settled','partial','open') THEN realized_profit_usd ELSE 0 END), 0) AS realized_profit, "
+                "COALESCE(SUM(CASE WHEN status IN ('settled','partial','open') THEN buy_fee_usd + COALESCE(sell_fee_usd, 0) ELSE 0 END), 0) AS fees "
+                "FROM trader_training_settlements GROUP BY run_id, strategy"
+            )
+            stats["strategy_stats"] = cursor.fetchall()
+            cursor.execute("SELECT exchange_slug, asset, balance FROM trader_balances ORDER BY exchange_slug, asset")
+            exchange_balances = cursor.fetchall()
+            stats["exchange_balances"] = exchange_balances
+            stats["exchange_usdt"] = sum(
+                (Decimal(str(row["balance"])) for row in exchange_balances if row["asset"] == "USDT"), Decimal(0)
+            )
+            cursor.execute(
+                "SELECT COALESCE(SUM(CASE WHEN movement_type = 'deposit' THEN amount_usd ELSE 0 END), 0) AS deposits_usd, "
+                "COALESCE(-SUM(CASE WHEN movement_type = 'withdrawal' THEN amount_usd ELSE 0 END), 0) AS withdrawals_usd, "
+                "COALESCE(SUM(CASE WHEN movement_type IN ('deposit','withdrawal') THEN amount_usd ELSE 0 END), 0) AS net_capital_movements "
+                "FROM trader_capital_movements"
+            )
+            stats.update(cursor.fetchone() or {})
             cursor.execute(
                 "SELECT settlement_id, source_pair, buy_exchange, buy_market_pair, buy_price, "
                 "sell_exchange, sell_market_pair, expected_sell_price, stop_loss_price, final_sell_price, quantity, "
@@ -170,12 +206,341 @@ def _load_trader_dashboard() -> tuple[dict[str, Any] | None, dict[str, Any], lis
                 "sold_quantity, sell_proceeds_accumulated_usd, "
                 "expected_profit_usd, realized_profit_usd, status, created_at, settle_after_utc, settled_at, "
                 "planned_sell_at, actual_sell_at, "
-                "route_status, remaining_quantity, transfer_fee_amount, transfer_fee_currency, "
+                "route_status, asset_exchange, remaining_quantity, transfer_fee_amount, transfer_fee_currency, "
+                "transfer_dust_quantity, "
                 "expected_profit_before_reserve_usd, expected_profit_after_reserve_usd, price_reserve_usd "
                 "FROM trader_training_settlements ORDER BY created_at DESC, settlement_id DESC LIMIT 500"
             )
             trades = cursor.fetchall()
+            cursor.execute(
+                "SELECT buy_exchange, buy_market_pair, sell_exchange, sell_market_pair, remaining_quantity, "
+                "expected_sell_taker_fee_rate, position_status, asset_exchange, valuation_usd, "
+                "transfer_dust_quantity, "
+                "last_valuation_price "
+                "FROM trader_training_settlements WHERE (remaining_quantity > 0 "
+                "AND status IN ('pending','settling','partial','open')) OR transfer_dust_quantity > 0"
+            )
+            active_positions = cursor.fetchall()
+        valuation_positions = list(active_positions)
+        for position in active_positions:
+            dust = Decimal(str(position.get("transfer_dust_quantity") or 0))
+            if dust > 0:
+                valuation_positions.append({
+                    **position, "sell_exchange": position["buy_exchange"],
+                    "sell_market_pair": position["buy_market_pair"],
+                    "remaining_quantity": dust, "position_status": "dust",
+                    "asset_exchange": position["buy_exchange"],
+                })
+        stats.update(_value_trader_positions(valuation_positions))
+        if account:
+            balance = Decimal(str(account["balance_usd"])) + stats["exchange_usdt"]
+            equity = balance + Decimal(str(stats["position_value_usd"]))
+            initial_capital = Decimal(str(account.get("initial_capital_usd") or 0))
+            net_flows = Decimal(str(stats.get("net_capital_movements") or 0))
+            stats["equity_usd"] = equity
+            stats["equity_pnl_usd"] = equity - initial_capital - net_flows
+            stats["initial_capital_usd"] = initial_capital
+            stats["net_capital_movements"] = net_flows
+        if active_run:
+            _capture_demo_daily_report(connection, active_run, stats)
+        stats["demo_runs"] = _load_demo_runs(connection)
         return account, stats, trades
+    finally:
+        connection.close()
+
+
+def _value_trader_positions(positions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Value held coins from sell-side bid depth; stale fallbacks remain explicitly marked."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    transfer_quantity = Decimal(0)
+    unallocated_quantity = Decimal(0)
+    for position in positions:
+        quantity = Decimal(str(position.get("remaining_quantity") or 0))
+        if quantity <= 0:
+            continue
+        location = position.get("asset_exchange", position["sell_exchange"])
+        if "asset_exchange" in position and not location:
+            unallocated_quantity += quantity
+            continue
+        pair = position.get("buy_market_pair") if position.get("position_status") == "pending_transfer" else position["sell_market_pair"]
+        key = (str(location), str(pair))
+        groups.setdefault(key, []).append(position)
+        if position.get("position_status") == "pending_transfer":
+            transfer_quantity += quantity
+
+    position_value = Decimal(0)
+    transfer_value = Decimal(0)
+    complete = unallocated_quantity == 0
+    stale = False
+    unavailable = False
+    warnings: list[str] = []
+    if unallocated_quantity:
+        warnings.append("старые остатки не распределены по биржам и не оценены")
+    for (exchange, pair), group in groups.items():
+        total_quantity = sum(
+            (Decimal(str(position["remaining_quantity"])) for position in group), Decimal(0)
+        )
+        try:
+            execution = fetch_market_sell_execution(exchange, pair, total_quantity)
+            book_timestamp = getattr(execution, "book_timestamp_utc", None)
+            if isinstance(book_timestamp, datetime):
+                if book_timestamp.tzinfo is None:
+                    book_timestamp = book_timestamp.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - book_timestamp).total_seconds()
+                if age_seconds > TRADER_BOOK_MAX_AGE_SECONDS:
+                    raise RuntimeError(f"order book snapshot is {age_seconds:.1f}s old")
+            filled_ratio = min(Decimal(1), execution.filled_quantity / total_quantity)
+            average_price = execution.proceeds / execution.filled_quantity
+            net_value = Decimal(0)
+            for position in group:
+                quantity = Decimal(str(position["remaining_quantity"]))
+                net_position_value = (
+                    quantity * filled_ratio * average_price
+                    * (Decimal(1) - Decimal(str(position.get("expected_sell_taker_fee_rate") or 0)))
+                )
+                net_value += net_position_value
+                if position.get("position_status") == "pending_transfer":
+                    transfer_value += net_position_value
+            position_value += net_value
+            if execution.remaining_quantity > 0:
+                complete = False
+                warnings.append(f"неполный стакан {exchange} {pair}")
+        except Exception:
+            complete = False
+            stale = True
+            warnings.append(f"устаревшая оценка {exchange} {pair}")
+            group_cached_value = Decimal(0)
+            transfer_cached_value = Decimal(0)
+            group_has_cached_valuation = False
+            for position in group:
+                cached = position.get("valuation_usd")
+                price = position.get("last_valuation_price")
+                quantity = Decimal(str(position["remaining_quantity"]))
+                group_has_cached_valuation = group_has_cached_valuation or cached is not None or price is not None
+                gross = Decimal(str(cached)) if cached is not None else (
+                    Decimal(str(price)) * quantity if price is not None else Decimal(0)
+                )
+                net = gross * (Decimal(1) - Decimal(str(position.get("expected_sell_taker_fee_rate") or 0)))
+                group_cached_value += net
+                if position.get("position_status") == "pending_transfer":
+                    transfer_cached_value += net
+            position_value += group_cached_value
+            transfer_value += transfer_cached_value
+            unavailable = unavailable or not group_has_cached_valuation
+    return {
+        "position_value_usd": position_value,
+        "transfer_quantity": transfer_quantity,
+        "transfer_value_usd": transfer_value,
+        "unallocated_position_quantity": unallocated_quantity,
+        "valuation_complete": complete,
+        "valuation_stale": stale,
+        "valuation_unavailable": unavailable,
+        "valuation_warnings": warnings,
+    }
+
+
+def _capture_demo_daily_report(connection: Any, run: dict[str, Any], stats: dict[str, Any]) -> None:
+    if not run:
+        return
+    local_start = datetime.combine(datetime.now(KYIV_TZ).date(), datetime.min.time(), KYIV_TZ)
+    utc_start = local_start.astimezone(timezone.utc).replace(tzinfo=None)
+    utc_end = (local_start + timedelta(days=1)).astimezone(timezone.utc).replace(tzinfo=None)
+    report_day = local_start.date()
+    run_id = str(run["run_id"])
+    with connection.cursor(dictionary=True) as cursor:
+        cursor.execute(
+            "SELECT COALESCE(SUM(quote_amount), 0) AS fees_usd, "
+            "SUM(event_type = 'commission' AND quote_amount IS NULL) AS unvalued_fees "
+            "FROM trader_demo_operation_log WHERE run_id = %s AND event_type = 'commission' "
+            "AND event_at_utc >= %s AND event_at_utc < %s",
+            (run_id, utc_start, utc_end),
+        )
+        fees = cursor.fetchone() or {}
+        cursor.execute(
+            "SELECT COUNT(*) AS trade_count, SUM(settled_at >= %s AND settled_at < %s) AS closed_trade_count "
+            "FROM trader_training_settlements WHERE JSON_UNQUOTE(JSON_EXTRACT(route_assumptions, '$.demo_run_id')) = %s "
+            "AND created_at >= %s AND created_at < %s",
+            (utc_start, utc_end, run_id, utc_start, utc_end),
+        )
+        trade_counts = cursor.fetchone() or {}
+        cursor.execute(
+            "SELECT COALESCE(SUM(amount_usd), 0) AS net_flows FROM trader_capital_movements "
+            "WHERE created_at >= %s AND created_at < UTC_TIMESTAMP()",
+            (run["started_at_utc"],),
+        )
+        all_flows = cursor.fetchone() or {}
+        starting_equity = Decimal(str(run["starting_equity_usd"]))
+        equity = Decimal(str(stats.get("equity_usd") or 0))
+        pnl = equity - starting_equity - Decimal(str(all_flows.get("net_flows") or 0))
+        cursor.execute(
+            "SELECT MAX(equity_usd) AS peak FROM trader_demo_daily_reports WHERE run_id = %s",
+            (run_id,),
+        )
+        peak_row = cursor.fetchone() or {}
+        peak = max(equity, Decimal(str(peak_row["peak"]))) if peak_row.get("peak") is not None else equity
+        drawdown = max(Decimal(0), peak - equity)
+        complete = bool(run.get("baseline_complete") and stats.get("valuation_complete")
+                        and not stats.get("valuation_stale") and not int(fees.get("unvalued_fees") or 0))
+        cursor.execute(
+            "INSERT INTO trader_demo_daily_reports (run_id, report_day_kyiv, equity_usd, pnl_usd, fees_usd, "
+            "trade_count, closed_trade_count, drawdown_usd, drawdown_percent, position_value_usd, transfer_value_usd, "
+            "valuation_complete, valuation_stale) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE equity_usd = VALUES(equity_usd), pnl_usd = VALUES(pnl_usd), "
+            "fees_usd = VALUES(fees_usd), trade_count = VALUES(trade_count), closed_trade_count = VALUES(closed_trade_count), "
+            "drawdown_usd = VALUES(drawdown_usd), drawdown_percent = VALUES(drawdown_percent), "
+            "position_value_usd = VALUES(position_value_usd), transfer_value_usd = VALUES(transfer_value_usd), "
+            "valuation_complete = VALUES(valuation_complete), valuation_stale = VALUES(valuation_stale), "
+            "captured_at_utc = UTC_TIMESTAMP(6)",
+            (run_id, report_day, equity, pnl, Decimal(str(fees.get("fees_usd") or 0)),
+             int(trade_counts.get("trade_count") or 0), int(trade_counts.get("closed_trade_count") or 0),
+             drawdown, drawdown / peak * Decimal(100) if peak > 0 else Decimal(0),
+             stats.get("position_value_usd") or 0, stats.get("transfer_value_usd") or 0,
+             int(complete), int(bool(stats.get("valuation_stale")))),
+        )
+    connection.commit()
+
+
+def _load_demo_runs(connection: Any) -> list[dict[str, Any]]:
+    with connection.cursor(dictionary=True) as cursor:
+        cursor.execute(
+            "SELECT run_id, git_commit, config_hash, config, starting_balances, starting_equity_usd, "
+            "baseline_complete, status, started_at_utc, ended_at_utc FROM trader_demo_runs "
+            "ORDER BY started_at_utc DESC"
+        )
+        runs = cursor.fetchall()
+        cursor.execute(
+            "SELECT run_id, report_day_kyiv, equity_usd, pnl_usd, fees_usd, trade_count, closed_trade_count, "
+            "drawdown_usd, drawdown_percent, position_value_usd, transfer_value_usd, valuation_complete, "
+            "valuation_stale, captured_at_utc FROM trader_demo_daily_reports "
+            "ORDER BY report_day_kyiv DESC, run_id LIMIT 1000"
+        )
+        reports = cursor.fetchall()
+    reports_by_run: dict[str, list[dict[str, Any]]] = {}
+    for report in reports:
+        reports_by_run.setdefault(str(report["run_id"]), []).append(report)
+    for run in runs:
+        run["reports"] = reports_by_run.get(str(run["run_id"]), [])
+        for field in ("config", "starting_balances"):
+            if isinstance(run.get(field), str):
+                try:
+                    run[field] = json.loads(run[field])
+                except (TypeError, ValueError):
+                    run[field] = {}
+    return runs
+
+
+def _load_demo_replay(run_id: str, delay: Decimal, buy_fee: Decimal, sell_fee: Decimal,
+                      depth_reduction: Decimal) -> str:
+    connection = connect_db()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT run_id, git_commit, config, starting_balances, starting_equity_usd, baseline_complete, started_at_utc "
+                "FROM trader_demo_runs WHERE run_id = %s", (run_id,),
+            )
+            run = cursor.fetchone()
+            if not run:
+                raise ValueError("Демопрогон не найден")
+            cursor.execute(
+                "SELECT event_id, event_key, settlement_id, event_type, event_at_utc, exchange_slug, market_pair, "
+                "asset, quantity, price, quote_amount, fee_amount, fee_asset, book_snapshot "
+                "FROM trader_demo_operation_log WHERE run_id = %s ORDER BY event_at_utc, event_id", (run_id,),
+            )
+            events = cursor.fetchall()
+            cursor.execute(
+                "SELECT side, exchange_slug, market_pair, observed_at_utc, book_snapshot "
+                "FROM trader_replay_book_snapshots WHERE run_id = %s "
+                "ORDER BY observed_at_utc, snapshot_id LIMIT 100000", (run_id,),
+            )
+            snapshots = cursor.fetchall()
+            cursor.execute(
+                "SELECT movement_id, movement_type, amount_usd, created_at FROM trader_capital_movements "
+                "WHERE created_at >= %s AND movement_type IN ('deposit','withdrawal') ORDER BY created_at, movement_id",
+                (run["started_at_utc"],),
+            )
+            movements = cursor.fetchall()
+        events.extend({
+            "event_id": int(movement["movement_id"]), "event_key": f"capital:{movement['movement_id']}",
+            "event_type": "capital_movement", "event_at_utc": movement["created_at"],
+            "amount_usd": movement["amount_usd"],
+        } for movement in movements)
+        if isinstance(run.get("starting_balances"), str):
+            run["starting_balances"] = json.loads(run["starting_balances"])
+        base = replay_scenario(run, events, snapshots)
+        stressed = replay_scenario(
+            run, events, snapshots, delay_seconds=delay, buy_fee_percent=buy_fee,
+            sell_fee_percent=sell_fee, depth_reduction_percent=depth_reduction,
+        )
+        return _render_replay_page(run, base, stressed, delay, buy_fee, sell_fee, depth_reduction)
+    finally:
+        connection.close()
+
+
+def _render_replay_page(run: dict[str, Any], base: dict[str, Any], stressed: dict[str, Any],
+                        delay: Decimal, buy_fee: Decimal, sell_fee: Decimal,
+                        depth_reduction: Decimal) -> str:
+    def scenario_row(label: str, values: dict[str, Any]) -> str:
+        completeness = "полные данные" if values["complete"] else f"есть пропуски: {len(values['gaps'])}"
+        return (f"<tr><th>{html.escape(label)}</th><td>{_fmt_fixed(values['equity_usd'], 3)}</td>"
+                f"<td>{_fmt_fixed(values['pnl_usd'], 3)}</td><td>{_fmt_fixed(values['max_drawdown_usd'], 3)}</td>"
+                f"<td>{_fmt_fixed(values['fees_usd'], 3)}</td><td>{html.escape(completeness)}</td></tr>")
+    base_gaps = "".join(f"<li>{html.escape(item)}</li>" for item in base["gaps"][:30]) or "<li>Нет</li>"
+    stress_gaps = "".join(f"<li>{html.escape(item)}</li>" for item in stressed["gaps"][:30]) or "<li>Нет</li>"
+    return f"""<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Replay {html.escape(str(run['run_id']))}</title><style>body{{font:16px system-ui;background:#0b1220;color:#e5e7eb;margin:3rem}}table{{border-collapse:collapse}}td,th{{padding:12px;border:1px solid #334155}}input{{width:8rem}}</style>
+<h1>Replay демопрогона</h1><p>ID: {html.escape(str(run['run_id']))} · commit: {html.escape(str(run['git_commit']))}</p>
+<form method="get"><input type="hidden" name="run_id" value="{html.escape(str(run['run_id']), quote=True)}">
+Задержка, сек <input name="delay" type="number" min="0" step="0.1" value="{delay}">
+Комиссия buy, % <input name="buy_fee" type="number" min="0" step="0.001" value="{buy_fee}">
+Комиссия sell, % <input name="sell_fee" type="number" min="0" step="0.001" value="{sell_fee}">
+Снижение глубины, % <input name="depth" type="number" min="0" max="99.999" step="0.1" value="{depth_reduction}">
+<button>Пересчитать</button></form>
+<p>При нулевой задержке используются снимки операции. При задержке берётся первый записанный снимок не раньше времени исполнения; будущие снимки не используются для входа без заданной задержки.</p>
+<table><thead><tr><th>Сценарий</th><th>Equity</th><th>PnL</th><th>Макс. просадка</th><th>Комиссии</th><th>Полнота</th></tr></thead><tbody>
+{scenario_row('Базовый', base)}{scenario_row('Ухудшенный', stressed)}</tbody></table>
+<h2>Пропуски базового сценария</h2><ul>{base_gaps}</ul>
+<h2>Пропуски/неполные исполнения ухудшенного сценария</h2><ul>{stress_gaps}</ul>
+<p>Неполные данные стартового портфеля: {'да' if not run.get('baseline_complete') else 'нет'}</p><a href="/trader">Назад к трейдеру</a></html>"""
+
+
+def _record_capital_movement(movement_type: str, amount: Decimal, exchange: str = "binance") -> None:
+    if (movement_type not in {"deposit", "withdrawal"} or not amount.is_finite()
+            or amount <= 0 or amount > Decimal("9999999999.99999999")
+            or amount.as_tuple().exponent < -8):
+        raise ValueError("Укажите положительную сумму пополнения или снятия")
+    connection = connect_db()
+    try:
+        connection.start_transaction()
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT balance_usd, training_mode FROM trader_account WHERE account_id = 1 FOR UPDATE"
+            )
+            account = cursor.fetchone()
+            if account is None or not account["training_mode"]:
+                raise ValueError("Изменение капитала доступно только для тренировочного счёта")
+            exchange = exchange.strip().lower()
+            if exchange not in {"binance", "bybit", "okx", "mexc"}:
+                raise ValueError("Неизвестная биржа демосчёта")
+            signed_amount = amount if movement_type == "deposit" else -amount
+            cursor.execute(
+                "INSERT INTO trader_balances (exchange_slug, asset, balance) VALUES (%s, 'USDT', %s) "
+                "ON DUPLICATE KEY UPDATE balance = balance + VALUES(balance)",
+                (exchange, signed_amount),
+            )
+            if movement_type == "withdrawal" and cursor.rowcount == 0:
+                raise ValueError("Снятие превышает доступный баланс USDT")
+            cursor.execute("SELECT balance FROM trader_balances WHERE exchange_slug = %s AND asset = 'USDT' FOR UPDATE", (exchange,))
+            current = Decimal(str(cursor.fetchone()["balance"]))
+            if current < 0:
+                raise ValueError("Снятие превышает доступный баланс USDT")
+            cursor.execute(
+                "INSERT INTO trader_capital_movements (movement_type, amount_usd, exchange_slug) VALUES (%s, %s, %s)",
+                (movement_type, signed_amount, exchange),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -224,7 +589,9 @@ def _render_trader_page(
             f'<td class="{profit_class}">{_fmt_fixed(profit, 3)} USD'
             f'{"<small>накопленная, позиция открыта</small>" if realized and not settled else ""}'
             f'{"<small>ожидаемая до резерва; после резерва " + _fmt_fixed(trade["expected_profit_after_reserve_usd"], 3) + " USDT</small>" if not realized else ""}</td>'
-            f"<td>{route_label}<small>Перевод: {_fmt(trade['transfer_fee_amount'])} {html.escape(str(trade['transfer_fee_currency']))}</small></td>"
+            f"<td>{route_label}<small>Перевод: {_fmt(trade['transfer_fee_amount'])} {html.escape(str(trade['transfer_fee_currency']))}</small>"
+            f"{'<small>Пыль на buy: ' + _fmt_fixed(trade.get('transfer_dust_quantity') or 0, 8) + ' монет</small>' if Decimal(str(trade.get('transfer_dust_quantity') or 0)) > 0 else ''}"
+            f"{'<small>Биржа старого остатка не распределена</small>' if remaining_quantity > 0 and not trade.get('asset_exchange') else ''}</td>"
             f"<td>{_fmt_fixed(remaining_quantity, 8)}</td>"
             f"<td><span class=\"status status-{html.escape(str(trade['status']))}\">"
             f"{status_labels.get(trade['status'], html.escape(str(trade['status'])))}</span></td>"
@@ -237,7 +604,83 @@ def _render_trader_page(
     if not trade_rows:
         trade_rows.append('<tr><td colspan="13">Трейдер ещё не входил в сделки.</td></tr>')
 
-    balance = _fmt_fixed(account["balance_usd"], 3) if account else "—"
+    balance = _fmt_fixed(stats.get("exchange_usdt", account["balance_usd"] if account else None), 3)
+    equity = _fmt_fixed(stats.get("equity_usd"), 3)
+    equity_pnl = Decimal(str(stats.get("equity_pnl_usd") or 0))
+    equity_pnl_class = "positive" if equity_pnl >= 0 else "negative"
+    strategy_cards = "".join(
+        '<div class="card"><span>Прогон ' + html.escape(str(item.get("run_id", "legacy"))[:8]) + ' · стратегия: '
+        + html.escape(str(item["strategy"])) + '</span>'
+        + '<strong>' + _fmt(item.get("settled_count") or 0) + ' закрыто / ' + _fmt(item.get("pending_count") or 0)
+        + ' в работе</strong><small>Открыто: ' + _fmt(item.get("open_count") or 0)
+        + ' · реализованный PnL: ' + _fmt_fixed(item.get("realized_profit") or 0, 3)
+        + ' USDT · комиссии: ' + _fmt_fixed(item.get("fees") or 0, 3) + ' USDT</small></div>'
+        for item in stats.get("strategy_stats", [])
+    ) or '<div class="card"><span>Стратегии</span><strong>Пока нет сделок</strong></div>'
+    active_run = stats.get("active_demo_run") or {}
+    replay_link = (
+        '<a href="/trader/replay?run_id=' + quote(str(active_run.get("run_id")), safe="") + '">Replay</a>'
+        if active_run.get("run_id") else ""
+    )
+    active_config = active_run.get("config") or {}
+    active_balances = active_run.get("starting_balances") or []
+    if isinstance(active_config, str):
+        try:
+            active_config = json.loads(active_config)
+        except (TypeError, ValueError):
+            active_config = {}
+    if isinstance(active_balances, str):
+        try:
+            active_balances = json.loads(active_balances)
+        except (TypeError, ValueError):
+            active_balances = []
+    run_details = (
+        '<div class="card"><span>Активный демопрогон</span><strong>'
+        + html.escape(str(active_run.get("run_id") or "—")) + '</strong><small>Commit: '
+        + html.escape(str(active_run.get("git_commit") or "—")) + '</small><small>Стартовые остатки: '
+        + html.escape(json.dumps(active_balances, ensure_ascii=False, separators=(",", ":")))
+        + '</small><small>Конфигурация: '
+        + html.escape(json.dumps(active_config, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        + '</small></div>'
+        if active_run else '<div class="card"><span>Активный демопрогон</span><strong>Не создан</strong></div>'
+    )
+    daily_report_rows = []
+    for run in stats.get("demo_runs", []):
+        for report in run.get("reports", []):
+            day = report.get("report_day_kyiv")
+            daily_report_rows.append(
+                '<tr><td>' + html.escape(str(day)) + '</td><td>' + html.escape(str(run["run_id"]))
+                + '<small>Commit ' + html.escape(str(run.get("git_commit") or "—")) + '</small></td>'
+                + '<td>' + _fmt_fixed(report.get("equity_usd"), 3) + '</td><td>' + _fmt_fixed(report.get("pnl_usd"), 3)
+                + '</td><td>' + _fmt_fixed(report.get("fees_usd"), 3) + '</td><td>' + _fmt(report.get("trade_count"))
+                + ' / ' + _fmt(report.get("closed_trade_count")) + '</td><td>' + _fmt_fixed(report.get("drawdown_usd"), 3)
+                + ' (' + _fmt_fixed(report.get("drawdown_percent"), 2) + '%)</td><td>'
+                + _fmt_fixed(report.get("position_value_usd"), 3) + ' / '
+                + _fmt_fixed(report.get("transfer_value_usd"), 3) + '</td><td>'
+                + ('полная' if report.get("valuation_complete") else 'неполная')
+                + (' · устарела' if report.get("valuation_stale") else '') + '</td></tr>'
+            )
+    if not daily_report_rows:
+        daily_report_rows.append('<tr><td colspan="9">Дневных снимков пока нет.</td></tr>')
+    valuation_status = (
+        "старые остатки не распределены и не оценены"
+        if stats.get("unallocated_position_quantity") else
+        "стакан устарел/недоступен; часть монет не оценена"
+        if stats.get("valuation_stale") and stats.get("valuation_unavailable") else
+        "устаревшая оценка; используется последнее сохранённое значение"
+        if stats.get("valuation_stale") else
+        "неполная оценка: глубины bids не хватило для всего остатка"
+        if not stats.get("valuation_complete") else "оценка по свежей глубине bids"
+    )
+    capital_form = (
+        '<form method="post" action="/trader/capital" class="capital-form">'
+        '<label>Движение капитала <select name="movement_type"><option value="deposit">Пополнение</option>'
+        '<option value="withdrawal">Снятие</option></select></label>'
+        '<label>Биржа <select name="exchange">' + ''.join(f'<option value="{slug}">{slug}</option>' for slug in ("binance", "bybit", "okx", "mexc")) + '</select></label>'
+        '<label>Сумма USDT <input name="amount" type="number" min="0.00000001" step="0.00000001" required></label>'
+        '<button type="submit">Записать</button></form>'
+        if account and account.get("training_mode") else ""
+    )
     mode = "Тренировка" if account and account["training_mode"] else "Рабочий режим"
     last_update = _fmt_time(account["updated_at"]) if account else "Счёт ещё не создан"
     return f"""<!doctype html>
@@ -251,6 +694,7 @@ nav a {{ padding:8px 12px; border:1px solid #334155; border-radius:8px; color:#7
 .muted, small {{ color:#9ca3af; }} small {{ display:block; margin-top:4px; }}
 .cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:24px; }}
 .card {{ padding:16px; border:1px solid #26334a; border-radius:10px; background:#111b2e; }} .card span {{ display:block; color:#9ca3af; font-size:.85rem; }} .card strong {{ display:block; margin-top:8px; font-size:1.3rem; }}
+.capital-form {{ display:flex; flex-wrap:wrap; align-items:end; gap:10px; margin:0 0 24px; padding:14px; border:1px solid #26334a; border-radius:10px; background:#111b2e; }} .capital-form label {{ display:grid; gap:5px; color:#9ca3af; font-size:.85rem; }} .capital-form input, .capital-form select, .capital-form button {{ padding:8px; border:1px solid #475569; border-radius:6px; background:#0b1220; color:#e5e7eb; }} .capital-form button {{ cursor:pointer; }}
 .table-wrap {{ overflow-x:auto; border:1px solid #26334a; border-radius:10px; }} table {{ width:100%; min-width:1200px; border-collapse:collapse; background:#111b2e; }}
 th,td {{ padding:11px 13px; text-align:left; border-bottom:1px solid #26334a; white-space:nowrap; }} th {{ color:#9fb4d0; font-size:.8rem; text-transform:uppercase; }}
 .positive {{ color:#67e8a5; font-weight:700; }} .negative {{ color:#f87171; font-weight:700; }} .status {{ color:#fbbf24; }} .status-settled {{ color:#67e8a5; }}
@@ -260,18 +704,20 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 .trade-row {{ cursor:help; }} .trade-row:focus {{ outline:2px solid #38bdf8; outline-offset:-2px; }}
 </style></head><body>
 <header><h1>Трейдер</h1><div class="muted">Состояние счёта и сделки · страница обновляется каждые 30 секунд · баланс на {last_update}</div>
-<nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a class="active" href="/trader">Трейдер</a></nav></header>
+<nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a class="active" href="/trader">Трейдер</a><a href="/trader/export/demo-operations.csv">Экспорт демоопераций CSV</a>{replay_link}</nav></header>
 <main><section class="cards">
-<div class="card"><span>Баланс</span><strong>{balance} USD</strong></div>
+<div class="card"><span>Доступный USDT на биржах</span><strong>{balance} USD</strong><small>Старый общий остаток: {_fmt_fixed(account['balance_usd'], 3) if account else '—'} USDT (не распределён)</small></div>
+<div class="card"><span>Демобалансы по биржам и активам</span><strong>{html.escape('; '.join(f"{row['exchange_slug']} {row['asset']}: {_fmt_fixed(row['balance'], 8)}" for row in stats.get('exchange_balances', [])) or 'пока пусто')}</strong><small>Старый общий остаток не распределён и не доступен для новых входов.</small></div>
+<div class="card"><span>Общий Equity</span><strong>{equity} USD</strong><small>USDT + чистая оценка монет · {html.escape(valuation_status)}</small></div>
+<div class="card"><span>Общий PnL с начала</span><strong class="{equity_pnl_class}">{_fmt_fixed(equity_pnl, 3)} USD</strong><small>Старт {_fmt_fixed(stats.get('initial_capital_usd'), 3)} · пополнения {_fmt_fixed(stats.get('deposits_usd') or 0, 3)} · снятия {_fmt_fixed(stats.get('withdrawals_usd') or 0, 3)}</small></div>
+<div class="card"><span>Чистая стоимость монет</span><strong>{_fmt_fixed(stats.get('position_value_usd') or 0, 3)} USD</strong></div>
+<div class="card"><span>В переводе · включено в Equity</span><strong>{_fmt_fixed(stats.get('transfer_quantity') or 0, 8)} монет</strong><small>Оценка {_fmt_fixed(stats.get('transfer_value_usd') or 0, 3)} USD</small></div>
 <div class="card"><span>Режим</span><strong>{mode}</strong></div>
-<div class="card"><span>Завершено сделок</span><strong>{_fmt(stats.get('settled_count') or 0)}</strong></div>
-<div class="card"><span>В ожидании</span><strong>{_fmt(stats.get('pending_count') or 0)}</strong></div>
 <div class="card"><span>Подтверждённые маршруты</span><strong>{_fmt(stats.get('confirmed_routes') or 0)}</strong></div>
 <div class="card"><span>Предполагаемые маршруты</span><strong>{_fmt(stats.get('assumed_routes') or 0)}</strong></div>
-<div class="card"><span>Остались открыты</span><strong>{_fmt(stats.get('open_count') or 0)}</strong></div>
-<div class="card"><span>Реализованный результат</span><strong class="{'positive' if Decimal(str(stats.get('net_profit') or 0)) >= 0 else 'negative'}">{_fmt_fixed(stats.get('net_profit') or 0, 3)} USD</strong></div>
-<div class="card"><span>Уплаченные комиссии</span><strong>{_fmt_fixed(stats.get('total_fees') or 0, 3)} USD</strong></div>
-</section><h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
+</section><h2>Демопрогон</h2><section class="cards">{run_details}</section><h2>Статистика по стратегиям и прогонам</h2><section class="cards">{strategy_cards}</section>
+<h2>Дневной отчёт · Europe/Kyiv</h2><div class="table-wrap"><table><thead><tr><th>День</th><th>Прогон / commit</th><th>Equity</th><th>PnL</th><th>Комиссии</th><th>Сделок / закрыто</th><th>Просадка</th><th>В позициях / переводе</th><th>Оценка</th></tr></thead><tbody>{''.join(daily_report_rows)}</tbody></table></div>
+{capital_form}<h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
 <th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
 </tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div>
 <div id="trade-detail-modal" role="tooltip" aria-hidden="true"><strong data-detail="pair"></strong>
@@ -999,9 +1445,124 @@ document.addEventListener('keydown', event => {{ if (event.key === 'Escape' && !
 </html>"""
 
 
+DEMO_LOG_EXPORT_COLUMNS = (
+    "event_id", "event_key", "run_id", "settlement_id", "signal_id", "event_type", "event_at_utc",
+    "exchange_slug", "market_pair", "asset", "quantity", "price", "quote_amount",
+    "fee_amount", "fee_asset", "balance_before", "balance_after", "book_snapshot",
+    "application_realized_profit_usd", "application_buy_debit_usd",
+    "application_sell_proceeds_accumulated_usd", "application_sell_fees_accumulated_usd",
+    "application_remaining_quantity", "application_status",
+)
+
+
+def _demo_operation_csv(rows: list[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=DEMO_LOG_EXPORT_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        values = {column: row.get(column) for column in DEMO_LOG_EXPORT_COLUMNS}
+        snapshot = values.get("book_snapshot")
+        if isinstance(snapshot, (dict, list)):
+            values["book_snapshot"] = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        for column in ("event_key", "run_id", "event_type", "exchange_slug", "market_pair", "asset", "fee_asset"):
+            value = values.get(column)
+            if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+                values[column] = "'" + value
+        writer.writerow(values)
+    return output.getvalue().encode("utf-8-sig")
+
+
+def _load_demo_operation_csv() -> bytes:
+    connection = connect_db()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT log.event_id, log.event_key, log.run_id, log.settlement_id, log.signal_id, log.event_type, log.event_at_utc, "
+                "log.exchange_slug, log.market_pair, log.asset, log.quantity, log.price, log.quote_amount, log.fee_amount, log.fee_asset, "
+                "log.balance_before, log.balance_after, log.book_snapshot, "
+                "settlement.realized_profit_usd AS application_realized_profit_usd, "
+                "settlement.buy_debit_usd AS application_buy_debit_usd, "
+                "settlement.sell_proceeds_accumulated_usd AS application_sell_proceeds_accumulated_usd, "
+                "settlement.sell_fees_accumulated_usd AS application_sell_fees_accumulated_usd, "
+                "settlement.remaining_quantity AS application_remaining_quantity, "
+                "settlement.status AS application_status "
+                "FROM trader_demo_operation_log AS log LEFT JOIN trader_training_settlements AS settlement "
+                "ON settlement.settlement_id = log.settlement_id ORDER BY log.event_id"
+            )
+            rows = cursor.fetchall()
+        return _demo_operation_csv(rows)
+    finally:
+        connection.close()
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        if urlparse(self.path).path != "/trader/capital":
+            self.send_error(404)
+            return
+        origin = urlparse(self.headers.get("Origin", "")).netloc
+        host = self.headers.get("Host", "")
+        if not origin or origin.lower() != host.lower():
+            self.send_error(403, "Запрос должен быть отправлен со страницы трейдера")
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length <= 0 or content_length > 2048:
+                raise ValueError("Некорректный размер запроса")
+            form = parse_qs(self.rfile.read(content_length).decode("utf-8"), strict_parsing=True)
+            movement_type = form.get("movement_type", [""])[0]
+            amount = Decimal(form.get("amount", [""])[0])
+            exchange = form.get("exchange", ["binance"])[0]
+            _record_capital_movement(movement_type, amount, exchange)
+            self.send_response(303)
+            self.send_header("Location", "/trader")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        except (ValueError, KeyError, ArithmeticError) as error:
+            self.send_error(400, str(error))
+        except Exception:
+            logger.exception("Не удалось записать движение капитала трейдера")
+            self.send_error(500, "Не удалось обновить тренировочный счёт")
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/trader/replay":
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                run_id = query.get("run_id", [""])[0]
+                if not run_id or len(run_id) > 36:
+                    raise ValueError("Укажите ID демопрогона")
+                delay = Decimal(query.get("delay", ["2"])[0])
+                buy_fee = Decimal(query.get("buy_fee", ["0.1"])[0])
+                sell_fee = Decimal(query.get("sell_fee", ["0.1"])[0])
+                depth = Decimal(query.get("depth", ["25"])[0])
+                body = _load_demo_replay(run_id, delay, buy_fee, sell_fee, depth).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (ValueError, ArithmeticError) as error:
+                self.send_error(400, str(error))
+            except Exception:
+                logger.exception("Не удалось выполнить replay демопрогона")
+                self.send_error(500, "Не удалось выполнить replay демопрогона")
+            return
+        if path == "/trader/export/demo-operations.csv":
+            try:
+                body = _load_demo_operation_csv()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="demo-operations.csv"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                logger.exception("Не удалось экспортировать журнал демоопераций")
+                self.send_error(500, "Не удалось получить журнал демоопераций из БД")
+            return
         if path == "/trader":
             try:
                 account, stats, trades = _load_trader_dashboard()

@@ -6,7 +6,7 @@ import logging
 import time
 
 from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database
-from main.treider.account import initialize_trader_account
+from main.treider.account import active_demo_run_id, initialize_trader_account
 from main.treider.config import (
     ACTIVE_OPPORTUNITY_FALLBACK_SECONDS,
     SIGNAL_MAX_ATTEMPTS,
@@ -21,7 +21,7 @@ from main.treider.queue import (
     mark_rejected,
     mark_retry,
 )
-from main.treider.trade import process_due_training_trade
+from main.treider.trade import process_due_training_trade, set_demo_run_id
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ def _initialize() -> None:
     try:
         initialize_database(connection)
         balance, training_mode = initialize_trader_account(connection)
+        set_demo_run_id(active_demo_run_id(connection))
         logger.info(
             "Счёт трейдера готов: режим=%s, баланс=$%s",
             "тренировка" if training_mode else "обычный",

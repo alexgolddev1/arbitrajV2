@@ -138,6 +138,13 @@ def _network_record(
         "withdraw_fee": fee,
         "min_deposit": min_deposit,
         "min_withdraw": min_withdraw,
+        "withdraw_step": (
+            (raw or {}).get("withdrawIntegerMultiple") if exchange in {"binance", "mexc"} else None
+        ),
+        "withdraw_precision": (
+            (raw or {}).get("minAccuracy") if exchange == "bybit" else
+            (raw or {}).get("wdTickSz") if exchange == "okx" else None
+        ),
         "contract_address": contract_address,
         "raw": raw or {},
         "checked_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -420,6 +427,8 @@ def build_transfer_routes(
             "identity_verified": identity_verified,
             "withdraw_fee": (source_record or {}).get("withdraw_fee"),
             "withdraw_fee_currency": currency.strip().upper(),
+            "min_withdraw": (source_record or {}).get("min_withdraw"),
+            "withdraw_step": (source_record or {}).get("withdraw_step"),
             "fee_required": (source_record or {}).get("withdraw_fee") is not None,
             "estimated_seconds": time_emulator.get_emulated_duration(profile),
             "time_model": "seeded_random" if time_emulator.random_mode else "fixed",
@@ -467,6 +476,8 @@ def build_transfer_routes(
                     else TRANSFER_FEE_CURRENCY or currency.strip().upper()
                 ),
                 "fee_required": actual_fee is not None or configured_fee is not None,
+                "min_withdraw": (source_record or {}).get("min_withdraw"),
+                "withdraw_step": (source_record or {}).get("withdraw_step"),
                 "estimated_seconds": time_emulator.get_emulated_duration(requested_profile),
                 "time_model": "seeded_random" if time_emulator.random_mode else "fixed",
                 "random_seed": time_emulator.seed,

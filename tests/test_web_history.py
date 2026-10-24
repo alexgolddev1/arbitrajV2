@@ -1,13 +1,177 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
 
-from main.web import _aggregate_lifetime_groups, _count_trader_positions, _render_history, _render_page
+from main.web import (
+    _aggregate_lifetime_groups, _count_trader_positions, _record_capital_movement,
+    _demo_operation_csv, _render_history, _render_page, _render_replay_page,
+    _render_trader_page, _value_trader_positions,
+)
 
 
 class TraderHistoryTests(unittest.TestCase):
+    def test_replay_page_compares_scenarios_and_displays_data_gaps(self) -> None:
+        page = _render_replay_page(
+            {"run_id": "run-1", "git_commit": "abc"},
+            {"equity_usd": Decimal("101"), "pnl_usd": Decimal("1"),
+             "max_drawdown_usd": Decimal("2"), "fees_usd": Decimal("0.1"),
+             "complete": True, "gaps": []},
+            {"equity_usd": Decimal("98"), "pnl_usd": Decimal("-2"),
+             "max_drawdown_usd": Decimal("4"), "fees_usd": Decimal("0.3"),
+             "complete": False, "gaps": ["нет более позднего снимка"]},
+            Decimal("2"), Decimal("0.1"), Decimal("0.2"), Decimal("25"),
+        )
+
+        self.assertIn("Ухудшенный", page)
+        self.assertIn("Equity", page)
+        self.assertIn("Макс. просадка", page)
+        self.assertIn("нет более позднего снимка", page)
+        self.assertIn("без заданной задержки", page)
+
+    def test_demo_operation_export_includes_ids_snapshot_and_no_unlisted_secrets(self) -> None:
+        exported = _demo_operation_csv([{
+            "event_id": 8, "event_key": "8:buy", "run_id": "run-id", "settlement_id": 8,
+            "signal_id": 9, "event_type": "buy", "event_at_utc": "2026-10-24 12:00:00",
+            "exchange_slug": "binance", "asset": "ABC", "quantity": Decimal("2"),
+            "book_snapshot": {"snapshot_type": "best_quote", "asks": [["10", "2"]]},
+            "api_key": "must-not-export",
+        }]).decode("utf-8-sig")
+
+        self.assertIn("event_id,event_key,run_id,settlement_id,signal_id,event_type,event_at_utc", exported)
+        self.assertIn("application_realized_profit_usd", exported)
+        self.assertIn('"snapshot_type":"best_quote"', exported)
+        self.assertNotIn("must-not-export", exported)
+
+    @patch("main.web.fetch_market_sell_execution")
+    def test_equity_values_positions_once_and_lists_transfer_subset(self, sell: MagicMock) -> None:
+        sell.return_value = MagicMock(
+            proceeds=Decimal("45"), filled_quantity=Decimal("5"),
+            remaining_quantity=Decimal(0),
+        )
+        result = _value_trader_positions([
+            {
+                "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT",
+                "remaining_quantity": Decimal("2"), "expected_sell_taker_fee_rate": Decimal("0.01"),
+                "position_status": "pending_transfer",
+            },
+            {
+                "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT",
+                "remaining_quantity": Decimal("3"), "expected_sell_taker_fee_rate": Decimal("0.01"),
+                "position_status": "partial",
+            },
+        ])
+
+        self.assertEqual(result["position_value_usd"], Decimal("44.55"))
+        self.assertEqual(result["transfer_quantity"], Decimal("2"))
+        self.assertEqual(result["transfer_value_usd"], Decimal("17.82"))
+        self.assertTrue(result["valuation_complete"])
+        sell.assert_called_once_with("mexc", "ABC/USDT", Decimal("5"))
+
+    @patch("main.web.fetch_market_sell_execution")
+    def test_incomplete_and_failed_depth_are_marked(self, sell: MagicMock) -> None:
+        position = {
+            "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT",
+            "remaining_quantity": Decimal("2"), "expected_sell_taker_fee_rate": Decimal("0.01"),
+            "position_status": "open", "valuation_usd": Decimal("20"),
+        }
+        sell.return_value = MagicMock(
+            proceeds=Decimal("9"), filled_quantity=Decimal("1"), remaining_quantity=Decimal("1"),
+        )
+        partial = _value_trader_positions([position])
+        self.assertEqual(partial["position_value_usd"], Decimal("8.91"))
+        self.assertFalse(partial["valuation_complete"])
+        self.assertFalse(partial["valuation_stale"])
+
+        sell.side_effect = RuntimeError("book unavailable")
+        stale = _value_trader_positions([position])
+        self.assertEqual(stale["position_value_usd"], Decimal("19.80"))
+        self.assertTrue(stale["valuation_stale"])
+
+        sell.side_effect = None
+        sell.return_value.book_timestamp_utc = datetime.now(timezone.utc) - timedelta(seconds=45)
+        old_book = _value_trader_positions([position])
+        self.assertEqual(old_book["position_value_usd"], Decimal("19.80"))
+        self.assertTrue(old_book["valuation_stale"])
+
+    def test_legacy_position_without_exchange_is_not_assigned_or_valued(self) -> None:
+        position = {
+            "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT",
+            "asset_exchange": None, "remaining_quantity": Decimal("2"),
+        }
+        with patch("main.web.fetch_market_sell_execution") as sell:
+            result = _value_trader_positions([position])
+        sell.assert_not_called()
+        self.assertFalse(result["valuation_complete"])
+        self.assertEqual(result["unallocated_position_quantity"], Decimal("2"))
+
+    def test_trader_page_shows_equity_pnl_and_capital_flow_controls(self) -> None:
+        page = _render_trader_page(
+            {
+                "balance_usd": Decimal("80"), "training_mode": True,
+                "updated_at": datetime(2026, 10, 20),
+            },
+            {
+                "equity_usd": Decimal("100"), "equity_pnl_usd": Decimal("-5"),
+                "initial_capital_usd": Decimal("100"), "net_capital_movements": Decimal("5"),
+                "position_value_usd": Decimal("20"), "transfer_quantity": Decimal("1"),
+                "transfer_value_usd": Decimal("10"), "valuation_complete": True,
+                "valuation_stale": False,
+                "strategy_stats": [
+                    {"strategy": "tp_sl", "settled_count": 1, "pending_count": 0, "open_count": 0,
+                     "realized_profit": Decimal("2"), "fees": Decimal("0.1")},
+                    {"strategy": "immediate_after_transfer", "settled_count": 2, "pending_count": 1,
+                     "open_count": 0, "realized_profit": Decimal("3"), "fees": Decimal("0.2")},
+                ],
+                "active_demo_run": {
+                    "run_id": "run-123", "git_commit": "abc123", "config": {"strategy": "tp_sl"},
+                    "starting_balances": [{"exchange": "binance", "asset": "USDT", "balance": "100"}],
+                },
+                "demo_runs": [{
+                    "run_id": "run-123", "git_commit": "abc123", "reports": [{
+                        "report_day_kyiv": "2026-10-24", "equity_usd": Decimal("102"),
+                        "pnl_usd": Decimal("2"), "fees_usd": Decimal("0.1"), "trade_count": 3,
+                        "closed_trade_count": 1, "drawdown_usd": Decimal("1"),
+                        "drawdown_percent": Decimal("0.98"), "position_value_usd": Decimal("20"),
+                        "transfer_value_usd": Decimal("5"), "valuation_complete": False,
+                        "valuation_stale": True,
+                    }],
+                }],
+            },
+            [],
+        )
+
+        self.assertIn("Общий Equity", page)
+        self.assertIn("-5.000 USD", page)
+        self.assertIn("В переводе · включено в Equity", page)
+        self.assertIn('action="/trader/capital"', page)
+        self.assertIn("Статистика по стратегиям", page)
+        self.assertIn("immediate_after_transfer", page)
+        self.assertIn("Дневной отчёт · Europe/Kyiv", page)
+        self.assertIn("2026-10-24", page)
+        self.assertIn("abc123", page)
+        self.assertIn("устарела", page)
+
+    @patch("main.web.connect_db")
+    def test_withdrawal_records_negative_flow_and_updates_only_demo_balance(self, connect: MagicMock) -> None:
+        cursor = MagicMock()
+        cursor.fetchone.return_value = {"balance_usd": Decimal("20"), "training_mode": 1}
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect.return_value = connection
+
+        cursor.fetchone.side_effect = [
+            {"balance_usd": Decimal("20"), "training_mode": 1},
+            {"balance": Decimal("15")},
+        ]
+        _record_capital_movement("withdrawal", Decimal("5"), "binance")
+
+        self.assertIn("trader_balances", cursor.execute.call_args_list[1].args[0])
+        self.assertEqual(cursor.execute.call_args_list[-1].args[1], ("withdrawal", Decimal("-5"), "binance"))
+        connection.commit.assert_called_once()
+
     def test_history_lifetime_rows_include_live_quote_button_and_modal(self) -> None:
         now = datetime(2026, 10, 18, 12, 0, 0)
         page = _render_history(

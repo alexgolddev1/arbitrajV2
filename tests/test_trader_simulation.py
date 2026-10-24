@@ -5,7 +5,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
-from main.treider import exchange_networks, fees, market_data, tran_emulation
+from main.treider import exchange_networks, fees, market_data, market_rules, tran_emulation
 
 
 class FeeTests(unittest.TestCase):
@@ -141,6 +141,44 @@ class WebSocketQuoteFilterTests(unittest.TestCase):
 
 
 class MarketAndRouteTests(unittest.TestCase):
+    @patch("main.treider.trade.fetch_spot_market_rules")
+    @patch("main.treider.trade.fetch_spot_order_book")
+    @patch("main.treider.trade.TRADE_SIZE_CANDIDATES_USDT", (Decimal("100"), Decimal("25")))
+    @patch("main.treider.trade.MIN_NET_PROFIT_USDT", Decimal("0"))
+    def test_larger_size_rejected_on_sell_depth_while_smaller_size_is_selected(
+        self, fetch_book: Mock, fetch_rules: Mock,
+    ) -> None:
+        from main.treider import trade
+
+        buy = market_data.SpotBookTicker("binance", "ABC/USDT", Decimal("9.9"), Decimal("100"), Decimal("10"), Decimal("100"))
+        sell = market_data.SpotBookTicker("mexc", "ABC/USDT", Decimal("10"), Decimal("100"), Decimal("10.1"), Decimal("100"))
+        timestamp = market_data.datetime.now(market_data.timezone.utc)
+        fetch_book.side_effect = [
+            market_data.SpotOrderBook("binance", "ABC/USDT", [["9.9", "100"]], [["10", "100"]], timestamp),
+            market_data.SpotOrderBook("mexc", "ABC/USDT", [["10", "5"]], [["10.1", "100"]], timestamp),
+        ]
+        fetch_rules.return_value = market_rules.SpotMarketRules(
+            Decimal("0.01"), Decimal("0.01"), Decimal("1"), "test",
+        )
+        rates = fees.TradeFeeRates("binance", "ABCUSDT", Decimal(0), Decimal(0), "test", buy_taker_rate=Decimal(0))
+        sell_rates = fees.TradeFeeRates("mexc", "ABCUSDT", Decimal(0), Decimal(0), "test", sell_taker_rate=Decimal(0))
+        cursor = Mock()
+        cursor.fetchall.return_value = []
+
+        estimate, stop_price, _, _, error = trade._select_trade_estimate(
+            cursor, buy, sell, rates, sell_rates, Decimal("100"),
+            {"withdraw_fee": "0", "withdraw_fee_currency": "ABC", "withdraw_step": "0.01", "min_withdraw": "0.01"},
+            Decimal("11"),
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(estimate.buy_cost_usd, Decimal("25.00"))
+        self.assertEqual(estimate.quantity_after_fees, Decimal("2.50"))
+        self.assertEqual(estimate.expected_profit_after_reserve_usd, Decimal("0.000"))
+        self.assertLess(stop_price, Decimal("11"))
+        self.assertEqual(fetch_book.call_count, 2)
+        self.assertEqual(fetch_rules.call_count, 2)
+
     @patch("main.treider.market_data._get_json")
     def test_mexc_spot_book_keeps_last_price_separate_from_best_bid(self, get_json: Mock) -> None:
         get_json.return_value = {
@@ -164,12 +202,36 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(full.proceeds, Decimal("63"))
         self.assertEqual(full.average_price, Decimal("63") / Decimal("7"))
         self.assertEqual(full.levels_used, 3)
+        self.assertEqual(full.book_snapshot["bids"], [["10", "2"], ["9", "3"], ["8", "4"]])
+        self.assertNotIn("headers", full.book_snapshot)
         partial = market_data.simulate_market_sell(
             "mexc", "ABC/USDT", Decimal("7"), [["10", "2"], ["9", "3"]]
         )
         self.assertEqual(partial.filled_quantity, Decimal("5"))
         self.assertEqual(partial.remaining_quantity, Decimal("2"))
         self.assertEqual(partial.proceeds, Decimal("47"))
+
+    @patch("main.treider.market_data._get_json")
+    def test_fetched_sell_keeps_only_used_public_bid_snapshot(self, get_json: Mock) -> None:
+        get_json.return_value = {"bids": [["10", "2"], ["9", "3"]], "apiKey": "private"}
+        result = market_data.fetch_market_sell_execution("binance", "ABC/USDT", Decimal("3"))
+
+        self.assertEqual(result.book_snapshot["bids"], [["10", "2"], ["9", "3"]])
+        self.assertIn("captured_at_utc", result.book_snapshot)
+        self.assertNotIn("apiKey", result.book_snapshot)
+
+    def test_demo_event_insert_uses_stable_key_and_explicit_snapshot_only(self) -> None:
+        from main.treider import trade
+
+        cursor = Mock()
+        snapshot = {"snapshot_type": "bids", "bids": [["9", "2"]]}
+        trade._log_demo_event(cursor, 4, 12, "4:sell:2", "sell", "mexc", "ABC/USDT", "ABC",
+                              Decimal("2"), Decimal("9"), Decimal("18"), book_snapshot=snapshot)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("ON DUPLICATE KEY UPDATE event_key", sql)
+        self.assertEqual(params[0], "4:sell:2")
+        self.assertEqual(params[2:6], (4, 12, "sell", "mexc"))
+        self.assertEqual(params[-1], '{"snapshot_type":"bids","bids":[["9","2"]]}')
 
     def test_take_profit_limit_ignores_bids_below_limit(self) -> None:
         result = market_data.simulate_market_sell(
@@ -189,6 +251,19 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(trade._exit_trigger(Decimal("101"), Decimal("101"), Decimal("99.5")), "take_profit")
         self.assertEqual(trade._exit_trigger(Decimal("99.5"), Decimal("101"), Decimal("99.5")), "stop_loss")
         self.assertIsNone(trade._exit_trigger(Decimal("100"), Decimal("101"), Decimal("99.5")))
+
+    def test_immediate_strategy_ignores_tp_sl_while_legacy_strategy_keeps_them(self) -> None:
+        from main.treider import trade
+
+        self.assertEqual(
+            trade._strategy_trigger("immediate_after_transfer", Decimal("90"), Decimal("110"), Decimal("95")),
+            "immediate_after_transfer",
+        )
+        self.assertIsNone(trade._strategy_trigger("tp_sl", Decimal("100"), Decimal("110"), Decimal("95")))
+        self.assertEqual(
+            trade._strategy_trigger("tp_sl", Decimal("90"), Decimal("110"), Decimal("95")),
+            "stop_loss",
+        )
 
     def test_network_check_logs_exchange_networks_and_transfer_flags(self) -> None:
         from main.treider.network_check import _log_exchange_networks
@@ -370,21 +445,68 @@ class MarketAndRouteTests(unittest.TestCase):
 
 
 class TradeCalculationTests(unittest.TestCase):
-    def test_cheap_coin_buy_quantity_is_rounded_down_to_whole_units(self) -> None:
-        from main.treider.trade import _round_buy_quantity
+    def test_market_filters_parse_documented_quantity_fields(self) -> None:
+        binance = market_rules.parse_market_rules("binance", {"symbols": [{
+            "symbol": "ABCUSDT", "filters": [
+                {"filterType": "MARKET_LOT_SIZE", "minQty": "0.1", "stepSize": "0.01"},
+                {"filterType": "MIN_NOTIONAL", "minNotional": "5", "applyToMarket": True},
+            ],
+        }]}, "ABC/USDT", market_order=True)
+        bybit = market_rules.parse_market_rules("bybit", {"retCode": 0, "result": {"list": [{
+            "symbol": "ABCUSDT", "lotSizeFilter": {
+                "basePrecision": "0.001", "minOrderAmt": "5",
+            },
+        }]}}, "ABC/USDT", market_order=True)
+        okx = market_rules.parse_market_rules("okx", {"code": "0", "data": [{
+            "instId": "ABC-USDT", "lotSz": "0.01", "minSz": "0.1",
+        }]}, "ABC/USDT", market_order=True)
+        mexc = market_rules.parse_market_rules("mexc", {"symbols": [{
+            "symbol": "ABCUSDT", "baseSizePrecision": "0.001", "quoteAmountPrecisionMarket": "5",
+        }]}, "ABC/USDT", market_order=True)
 
+        self.assertEqual(binance.quantity_step, Decimal("0.01"))
+        self.assertEqual(binance.min_quantity, Decimal("0.1"))
+        self.assertEqual(binance.min_notional, Decimal("5"))
+        self.assertEqual(bybit.quantity_step, Decimal("0.001"))
+        self.assertEqual(bybit.min_notional, Decimal("5"))
+        self.assertEqual(okx.min_quantity, Decimal("0.1"))
+        self.assertEqual(mexc.quantity_step, Decimal("0.001"))
+
+    def test_unknown_withdraw_increment_is_rejected(self) -> None:
+        with self.assertRaises(market_rules.UnknownMarketRules):
+            market_rules.withdraw_step({"exchange": "mexc", "withdraw_precision": None})
+
+    def test_arbitrary_quantity_step_rounds_down_without_price_heuristics(self) -> None:
         self.assertEqual(
-            _round_buy_quantity(Decimal("146052.777631725000146053"), Decimal("0.000684")),
-            Decimal("146052"),
+            market_rules.floor_to_step(Decimal("1.239"), Decimal("0.05")), Decimal("1.20")
         )
 
-    def test_expensive_coin_buy_keeps_eight_fractional_places(self) -> None:
-        from main.treider.trade import _round_buy_quantity
+    @patch("main.treider.trade.fetch_market_sell_execution")
+    @patch("main.treider.trade.PRICE_MOVE_RESERVE_PERCENT", Decimal("0"))
+    @patch("main.treider.trade.MIN_NET_PROFIT_USDT", Decimal("0"))
+    def test_withdraw_rounding_preserves_dust_and_reprices_expected_profit(self, sell_execution: Mock) -> None:
+        from main.treider import trade
 
-        self.assertEqual(
-            _round_buy_quantity(Decimal("0.123456789123"), Decimal("65000")),
-            Decimal("0.12345678"),
+        buy = market_data.SpotBookTicker("binance", "ABC/USDT", Decimal("9"), Decimal("100"), Decimal("10"), Decimal("100"))
+        sell = market_data.SpotBookTicker("mexc", "ABC/USDT", Decimal("11"), Decimal("100"), Decimal("12"), Decimal("100"))
+        rates = fees.TradeFeeRates("binance", "ABCUSDT", Decimal(0), Decimal("0.01"), "now", buy_taker_rate=Decimal("0.01"))
+        sell_rates = fees.TradeFeeRates("mexc", "ABCUSDT", Decimal(0), Decimal("0.01"), "now", sell_taker_rate=Decimal("0.01"))
+        sell_execution.return_value = SimpleNamespace(
+            proceeds=Decimal("9.6") * Decimal("11"), average_price=Decimal("11"), remaining_quantity=Decimal(0),
         )
+        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "base"}), \
+                patch.object(trade, "fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
+                    Decimal("0.01"), Decimal("0.01"), Decimal("1"), "test"
+                )):
+            estimate = trade._estimate_trade(
+                buy, sell, rates, sell_rates, Decimal("100"),
+                {"withdraw_fee": "0", "withdraw_fee_currency": "ABC", "withdraw_step": "0.4", "min_withdraw": "1"},
+            )
+
+        self.assertEqual(estimate.quantity_after_fees, Decimal("9.6"))
+        self.assertEqual(estimate.transfer_dust_quantity, Decimal("0.3"))
+        self.assertEqual(estimate.expected_sell_proceeds_usd, Decimal("105.6"))
+        sell_execution.assert_called_once_with("mexc", "ABC/USDT", Decimal("9.6"))
 
     @patch("main.treider.trade.fetch_market_sell_execution")
     @patch("main.treider.trade.PRICE_MOVE_RESERVE_PERCENT", Decimal("1"))
@@ -399,10 +521,13 @@ class TradeCalculationTests(unittest.TestCase):
         def simulate(_exchange: str, _pair: str, qty: Decimal) -> SimpleNamespace:
             return SimpleNamespace(proceeds=qty * Decimal("11"), average_price=Decimal("11"), remaining_quantity=Decimal(0))
         sell_execution.side_effect = simulate
-        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "quote"}):
+        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "quote"}), \
+                patch.object(trade, "fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
+                    Decimal("0.01"), Decimal("0.01"), Decimal("1"), "test"
+                )):
             result = trade._estimate_trade(
                 buy, sell, buy_rates, sell_rates, Decimal("100"),
-                {"withdraw_fee": "0.5", "withdraw_fee_currency": "USDT"},
+                {"withdraw_fee": "0.5", "withdraw_fee_currency": "USDT", "withdraw_step": "0.01", "min_withdraw": "0.01"},
             )
         self.assertLessEqual(result.buy_cost_usd + result.buy_fee_usd + result.transfer_fee_usd, Decimal("100"))
         self.assertEqual(result.transfer_fee_usd, Decimal("0.5"))
@@ -425,10 +550,13 @@ class TradeCalculationTests(unittest.TestCase):
         sell_execution.return_value = SimpleNamespace(
             proceeds=Decimal("100"), average_price=Decimal("10"), remaining_quantity=Decimal(0),
         )
-        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "base"}):
+        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "base"}), \
+                patch.object(trade, "fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
+                    Decimal("0.01"), Decimal("0.01"), Decimal("1"), "test"
+                )):
             result = trade._estimate_trade(
                 buy, sell, buy_rates, sell_rates, Decimal("100"),
-                {"withdraw_fee": "0.02", "withdraw_fee_currency": "ABC"},
+                {"withdraw_fee": "0.02", "withdraw_fee_currency": "ABC", "withdraw_step": "0.01", "min_withdraw": "0.01"},
             )
         self.assertEqual(result.quantity, Decimal("10"))
         self.assertEqual(result.buy_fee_base_quantity, Decimal("0.10"))
@@ -483,7 +611,7 @@ class TradeCalculationTests(unittest.TestCase):
             proceeds=Decimal("20"), filled_quantity=Decimal("2"), remaining_quantity=Decimal("1"),
             average_price=Decimal("10"), best_bid=Decimal("10"), levels_used=1,
         )
-        spot_book.return_value = SimpleNamespace(bid=Decimal("10"))
+        spot_book.return_value = SimpleNamespace(bid=Decimal("9"))
         fee_rates.return_value = fees.TradeFeeRates(
             "mexc", "ABCUSDT", Decimal(0), Decimal("0.001"), "now",
             sell_taker_rate=Decimal("0.001"),
@@ -499,9 +627,53 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertEqual(len(updates), 1)
         values = updates[0].args[1]
         self.assertEqual(values[0], "partial")
+        self.assertEqual(values[1], "stop_loss")
         self.assertEqual(values[7], Decimal("-10.020"))
         self.assertEqual(values[9], Decimal("69.98000000"))
         self.assertEqual(values[14], Decimal("1"))
+        sell_execution.assert_called_once_with("mexc", "ABC/USDT", Decimal("3"))
+
+
+class SettlementClaimTests(unittest.TestCase):
+    @patch("main.treider.trade.connect_db")
+    def test_open_timeout_position_is_claimed_once_when_due(self, connect: Mock) -> None:
+        from main.treider import trade
+
+        cursor = Mock()
+        cursor.fetchone.return_value = {
+            "settlement_id": 23, "status": "open", "remaining_quantity": Decimal("2.5"),
+        }
+        cursor.rowcount = 1
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect.return_value = connection
+
+        claimed = trade._claim_due_trade()
+
+        self.assertEqual(claimed["settlement_id"], 23)
+        self.assertEqual(claimed["remaining_quantity"], Decimal("2.5"))
+        select_sql = cursor.execute.call_args_list[0].args[0]
+        self.assertIn("status IN ('pending','partial','open')", select_sql)
+        self.assertIn("FOR UPDATE SKIP LOCKED", select_sql)
+        claim_sql, claim_params = cursor.execute.call_args_list[1].args
+        self.assertIn("WHERE settlement_id = %s AND status = %s", claim_sql)
+        self.assertEqual(claim_params[1:], (23, "open"))
+        connection.commit.assert_called_once()
+
+    @patch("main.treider.trade.connect_db")
+    def test_timeout_retry_does_not_reset_position_or_cost_accounting(self, connect: Mock) -> None:
+        from main.treider import trade
+
+        connection = MagicMock()
+        connect.return_value = connection
+        trade._retry_settlement(23, "timeout", "lease")
+
+        sql, params = connection.cursor.return_value.__enter__.return_value.execute.call_args.args
+        self.assertIn("'open'", sql)
+        self.assertNotIn("remaining_quantity", sql)
+        self.assertNotIn("buy_debit_usd", sql)
+        self.assertIn("settle_after_utc = UTC_TIMESTAMP() + INTERVAL %s SECOND", sql)
+        self.assertEqual(params[-2:], (23, "lease"))
 
 
 class RetryTests(unittest.TestCase):
@@ -536,13 +708,115 @@ class RetryTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    @patch("main.treider.account._git_commit", return_value="a" * 40)
+    @patch("main.treider.account._demo_config_snapshot", return_value={"strategy": "tp_sl"})
+    def test_demo_run_restart_reuses_same_commit_and_configuration(
+        self, _config: Mock, _commit: Mock,
+    ) -> None:
+        from main.treider.account import _ensure_demo_run
+
+        cursor = Mock()
+        cursor.fetchone.return_value = {
+            "run_id": "existing-run", "config_hash": __import__("hashlib").sha256(b'{"strategy":"tp_sl"}').hexdigest(),
+            "git_commit": "a" * 40,
+        }
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        self.assertEqual(_ensure_demo_run(connection), "existing-run")
+        self.assertEqual(cursor.execute.call_count, 1)
+
+    @patch("main.treider.account._git_commit", return_value="b" * 40)
+    @patch("main.treider.account._demo_config_snapshot", return_value={"strategy": "immediate_after_transfer"})
+    def test_changed_demo_configuration_creates_a_new_run_without_resetting_balances(
+        self, _config: Mock, _commit: Mock,
+    ) -> None:
+        from main.treider.account import _ensure_demo_run
+
+        cursor = Mock()
+        cursor.fetchone.side_effect = [
+            {"run_id": "old-run", "config_hash": "old-hash", "git_commit": "a" * 40},
+            {"balance_usd": Decimal("7")}, {"active_count": 0},
+        ]
+        cursor.fetchall.side_effect = [[], [], [
+            {"exchange_slug": "binance", "asset": "USDT", "balance": Decimal("73")},
+        ]]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        new_run = _ensure_demo_run(connection)
+
+        self.assertNotEqual(new_run, "old-run")
+        statements = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertTrue(any("status = 'superseded'" in statement for statement in statements))
+        self.assertTrue(any("INSERT INTO trader_demo_run_state" in statement for statement in statements))
+        inserted_run = next(call for call in cursor.execute.call_args_list if "INSERT INTO trader_demo_runs (run_id" in call.args[0] and "INSERT IGNORE" not in call.args[0])
+        self.assertIn('"balance":"73"', inserted_run.args[1][4])
+
+    def test_replay_latency_never_selects_a_snapshot_before_execution_time(self) -> None:
+        from main.treider.replay import select_snapshot
+
+        event = {
+            "event_at_utc": "2026-10-24T10:00:00+00:00", "exchange_slug": "binance",
+            "market_pair": "ABC/USDT", "book_snapshot": {"buy": {"snapshot_type": "depth", "asks": [["10", "2"]]}},
+        }
+        snapshots = [
+            {"exchange_slug": "binance", "market_pair": "ABC/USDT", "observed_at_utc": "2026-10-24T10:00:04+00:00",
+             "book_snapshot": {"snapshot_type": "depth", "asks": [["9", "2"]]}},
+            {"exchange_slug": "binance", "market_pair": "ABC/USDT", "observed_at_utc": "2026-10-24T10:00:06+00:00",
+             "book_snapshot": {"snapshot_type": "depth", "asks": [["11", "2"]]}},
+        ]
+
+        selected = select_snapshot(event, snapshots, "buy", Decimal("5"))
+
+        self.assertEqual(selected["asks"][0][0], "11")
+        self.assertEqual(select_snapshot(event, snapshots, "buy", Decimal(0))["asks"][0][0], "10")
+
+    def test_replay_reports_missing_delayed_books_and_degraded_depth(self) -> None:
+        from main.treider.replay import replay_scenario
+
+        run = {"starting_equity_usd": Decimal("100"), "baseline_complete": True}
+        events = [{
+            "event_id": 1, "event_key": "1:buy", "settlement_id": 1, "event_type": "buy",
+            "event_at_utc": "2026-10-24T10:00:00+00:00", "exchange_slug": "binance",
+            "market_pair": "ABC/USDT", "asset": "ABC", "quantity": Decimal("2"),
+            "quote_amount": Decimal("20"), "book_snapshot": {
+                "buy": {"snapshot_type": "depth", "asks": [["10", "2"]], "bids": [["9", "2"]]},
+            },
+        }]
+
+        missing = replay_scenario(run, events, [], delay_seconds=Decimal("2"))
+        reduced = replay_scenario(run, events, [], depth_reduction_percent=Decimal("50"))
+
+        self.assertFalse(missing["complete"])
+        self.assertTrue(any("нет снимка" in gap for gap in missing["gaps"]))
+        self.assertFalse(reduced["complete"])
+        self.assertTrue(any("частичное исполнение" in gap for gap in reduced["gaps"]))
+
+    @patch("main.treider.trade.connect_db")
+    def test_demo_balance_read_is_scoped_to_requested_exchange(self, connect: Mock) -> None:
+        from main.treider.trade import _read_balance
+
+        cursor = Mock()
+        cursor.fetchone.return_value = {"balance": Decimal("42.5")}
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect.return_value = connection
+
+        self.assertEqual(_read_balance("ByBit"), Decimal("42.5"))
+        self.assertIn("trader_balances", cursor.execute.call_args.args[0])
+        self.assertEqual(cursor.execute.call_args.args[1], ("bybit",))
+
     @patch("main.treider.account.TRAINING_MODE", True)
     @patch("main.treider.account.INITIAL_BALANCE_USD", Decimal("100"))
-    def test_restart_does_not_reset_existing_demo_balance(self) -> None:
+    @patch("main.treider.account._ensure_demo_run", return_value="run")
+    def test_restart_does_not_reset_existing_demo_balance(self, _ensure_run: Mock) -> None:
         from main.treider.account import initialize_trader_account
 
         cursor = Mock()
-        cursor.fetchone.return_value = {"balance_usd": Decimal("73.25"), "training_mode": 1}
+        cursor.fetchone.return_value = {
+            "balance_usd": Decimal("73.25"), "training_mode": 1, "initial_capital_funded": 1,
+        }
         connection = MagicMock()
         connection.cursor.return_value.__enter__.return_value = cursor
         balance, training = initialize_trader_account(connection)
@@ -551,6 +825,34 @@ class PersistenceTests(unittest.TestCase):
         self.assertNotIn("balance_usd =", insert_sql)
         self.assertEqual(balance, Decimal("73.25"))
         self.assertTrue(training)
+
+    @patch("main.treider.account.TRAINING_MODE", True)
+    @patch("main.treider.account.INITIAL_BALANCE_USD", Decimal("100"))
+    @patch("main.treider.account.INITIAL_EXCHANGE_SLUG", "bybit")
+    @patch("main.treider.account._ensure_demo_run", return_value="run")
+    def test_first_initial_funding_is_exchange_scoped_and_marked_once(self, _ensure_run: Mock) -> None:
+        from main.treider.account import initialize_trader_account
+
+        cursor = Mock()
+        cursor.fetchone.return_value = {
+            "balance_usd": Decimal("0"), "training_mode": 1, "initial_capital_funded": 0,
+        }
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        initialize_trader_account(connection)
+
+        funding_call = next(
+            call for call in cursor.execute.call_args_list
+            if "INSERT INTO trader_balances" in call.args[0]
+        )
+        self.assertEqual(funding_call.args[1], ("bybit", Decimal("100")))
+        funded_call = next(
+            call for call in cursor.execute.call_args_list
+            if "initial_capital_funded = 1" in call.args[0]
+        )
+        self.assertEqual(funded_call.args[1], ("bybit",))
+        connection.commit.assert_called_once()
 
 
 class QueueFencingTests(unittest.TestCase):

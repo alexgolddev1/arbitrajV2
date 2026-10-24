@@ -40,6 +40,19 @@ if _training_mode not in {"0", "1"}:
     raise ValueError("TRADER_TRAINING_MODE должен быть равен 1 (тренировка) или 0")
 TRAINING_MODE = _training_mode == "1"
 
+DEMO_STRATEGY = os.getenv("TRADER_DEMO_STRATEGY", "tp_sl").strip().lower()
+if DEMO_STRATEGY not in {"tp_sl", "immediate_after_transfer"}:
+    raise ValueError("TRADER_DEMO_STRATEGY должен быть tp_sl или immediate_after_transfer")
+
+try:
+    TRADE_SIZE_CANDIDATES_USDT = tuple(
+        sorted({Decimal(item.strip()) for item in os.getenv("TRADER_TRADE_SIZE_CANDIDATES_USDT", "10,25,50,100").split(",")})
+    )
+except InvalidOperation as error:
+    raise ValueError("TRADER_TRADE_SIZE_CANDIDATES_USDT должен содержать суммы через запятую") from error
+if not TRADE_SIZE_CANDIDATES_USDT or any(not item.is_finite() or item <= 0 for item in TRADE_SIZE_CANDIDATES_USDT):
+    raise ValueError("TRADER_TRADE_SIZE_CANDIDATES_USDT должен содержать только положительные суммы")
+
 # Баланс, которым инициализируется счёт трейдера только при первой установке.
 try:
     INITIAL_BALANCE_USD = Decimal(os.getenv("TRADER_INITIAL_BALANCE_USD", "100"))
@@ -48,10 +61,10 @@ except InvalidOperation as error:
 if not INITIAL_BALANCE_USD.is_finite() or INITIAL_BALANCE_USD < 0:
     raise ValueError("TRADER_INITIAL_BALANCE_USD должен быть конечным неотрицательным числом")
 
-# Для дешёвых активов покупаем целое число монет; для дорогих оставляем до 8 знаков.
-# Цена пары котируется в USDT, поэтому порог применяется к цене одной монеты в USDT.
-INTEGER_QUANTITY_PRICE_THRESHOLD_USD = Decimal("1")
-FRACTIONAL_QUANTITY_DECIMAL_PLACES = 8
+SUPPORTED_EXCHANGES = ("binance", "bybit", "okx", "mexc")
+INITIAL_EXCHANGE_SLUG = os.getenv("TRADER_INITIAL_EXCHANGE", "binance").strip().lower()
+if INITIAL_EXCHANGE_SLUG not in SUPPORTED_EXCHANGES:
+    raise ValueError(f"TRADER_INITIAL_EXCHANGE должен быть одним из {', '.join(SUPPORTED_EXCHANGES)}")
 
 
 def _decimal_setting(name: str, default: str) -> Decimal:

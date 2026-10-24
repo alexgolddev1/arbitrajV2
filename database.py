@@ -159,6 +159,11 @@ def initialize_database(connection: MySQLConnection) -> None:
                     f"ALTER TABLE opportunity_lifetimes MODIFY COLUMN `{column}` {definition}"
                 )
         trader_migrations = {
+            "trader_account": {
+                "initial_capital_usd": "DECIMAL(18, 8) NULL",
+                "initial_capital_funded": "TINYINT(1) NOT NULL DEFAULT 1",
+                "initial_exchange_slug": "VARCHAR(32) NULL",
+            },
             "trader_signals": {
                 "decision": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
                 "attempt_count": "INT UNSIGNED NOT NULL DEFAULT 0",
@@ -173,6 +178,7 @@ def initialize_database(connection: MySQLConnection) -> None:
                 "sell_fee_source": "VARCHAR(16) NOT NULL DEFAULT 'legacy'",
                 "buy_fee_currency": "VARCHAR(24) NOT NULL DEFAULT 'USDT'",
                 "buy_fee_base_quantity": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
+                "transfer_dust_quantity": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
                 "transfer_fee_amount": "DECIMAL(38, 18) NOT NULL DEFAULT 0",
                 "transfer_fee_currency": "VARCHAR(24) NOT NULL DEFAULT 'USDT'",
                 "transfer_fee_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
@@ -188,7 +194,8 @@ def initialize_database(connection: MySQLConnection) -> None:
                 "sell_fees_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "buy_debit_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "purchase_model": "VARCHAR(64) NOT NULL DEFAULT 'legacy'",
-                "position_status": "ENUM('legacy','pending_transfer','ready_to_sell','partial','closed','open') NOT NULL DEFAULT 'legacy'",
+                "position_status": "ENUM('legacy','pending_transfer','ready_to_sell','partial','stop_loss','closed','open') NOT NULL DEFAULT 'legacy'",
+                "asset_exchange": "VARCHAR(32) NULL", "transfer_completed_at": "DATETIME NULL",
                 "planned_sell_at": "DATETIME NULL", "actual_sell_at": "DATETIME NULL",
                 "retry_started_at": "DATETIME NULL", "last_valuation_price": "DECIMAL(38, 18) NULL",
                 "valuation_usd": "DECIMAL(38, 12) NULL", "valued_at": "DATETIME NULL",
@@ -200,12 +207,32 @@ def initialize_database(connection: MySQLConnection) -> None:
                 cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE %s", (column_name,))
                 if cursor.fetchone() is None:
                     cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+        cursor.execute("SHOW COLUMNS FROM trader_capital_movements LIKE 'exchange_slug'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "ALTER TABLE trader_capital_movements ADD COLUMN exchange_slug VARCHAR(32) NULL AFTER movement_type"
+            )
+        cursor.execute("SHOW COLUMNS FROM trader_capital_movements LIKE 'movement_type'")
+        movement_type_column = cursor.fetchone()
+        if movement_type_column is not None and "allocation" not in str(movement_type_column[1]).lower():
+            cursor.execute(
+                "ALTER TABLE trader_capital_movements MODIFY COLUMN movement_type "
+                "ENUM('deposit','withdrawal','allocation') NOT NULL"
+            )
         cursor.execute("SHOW COLUMNS FROM trader_training_settlements LIKE 'status'")
         status_column = cursor.fetchone()
         if status_column is not None and "partial" not in str(status_column[1]).lower():
             cursor.execute(
                 "ALTER TABLE trader_training_settlements MODIFY COLUMN status "
                 "ENUM('pending','settling','settled','partial','open','expired') NOT NULL DEFAULT 'pending'"
+            )
+        cursor.execute("SHOW COLUMNS FROM trader_training_settlements LIKE 'position_status'")
+        position_status_column = cursor.fetchone()
+        if position_status_column is not None and "stop_loss" not in str(position_status_column[1]).lower():
+            cursor.execute(
+                "ALTER TABLE trader_training_settlements MODIFY COLUMN position_status "
+                "ENUM('legacy','pending_transfer','ready_to_sell','partial','stop_loss','closed','open') "
+                "NOT NULL DEFAULT 'legacy'"
             )
         cursor.execute("SHOW COLUMNS FROM calculator_market_pairs LIKE 'market_id'")
         market_id_column = cursor.fetchone()

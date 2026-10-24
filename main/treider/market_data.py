@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -25,6 +26,7 @@ class SpotBookTicker:
     ask: Decimal
     ask_size: Decimal
     last_price: Decimal | None = None
+    book_timestamp_utc: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,24 @@ class SpotMarketSell:
     levels_used: int
     filled_quantity: Decimal
     remaining_quantity: Decimal
+    book_timestamp_utc: datetime | None = None
+    book_snapshot: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class SpotOrderBook:
+    exchange: str
+    market_pair: str
+    bids: list[list[Any]]
+    asks: list[list[Any]]
+    book_timestamp_utc: datetime
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "snapshot_type": "depth", "captured_at_utc": self.book_timestamp_utc.isoformat(),
+            "bids": [[str(level[0]), str(level[1])] for level in self.bids if len(level) >= 2],
+            "asks": [[str(level[0]), str(level[1])] for level in self.asks if len(level) >= 2],
+        }
 
 
 def _pair_parts(market_pair: str) -> tuple[str, str]:
@@ -121,7 +141,41 @@ def fetch_spot_book(exchange: str, market_pair: str) -> SpotBookTicker:
         last_price = _decimal(last_price_value, "last_price") if last_price_value else None
     except ValueError:
         last_price = None
-    return SpotBookTicker(exchange_slug, market_pair, bid, bid_size, ask, ask_size, last_price)
+    return SpotBookTicker(exchange_slug, market_pair, bid, bid_size, ask, ask_size, last_price, datetime.now(timezone.utc))
+
+
+def fetch_spot_order_book(exchange: str, market_pair: str) -> SpotOrderBook:
+    """Fetch one sanitized depth snapshot for sizing and execution estimates."""
+    exchange_slug = exchange.strip().lower()
+    base, quote = _pair_parts(market_pair)
+    symbol = f"{base}{quote}"
+    timestamp_value: Any = None
+    if exchange_slug == "binance":
+        payload = _get_json("https://data-api.binance.vision/api/v3/depth", {"symbol": symbol, "limit": "1000"})
+        bids, asks = payload.get("bids", []), payload.get("asks", [])
+    elif exchange_slug == "bybit":
+        payload = _get_json("https://api.bybit.com/v5/market/orderbook", {"category": "spot", "symbol": symbol, "limit": "1000"})
+        if str(payload.get("retCode")) != "0":
+            raise RuntimeError(f"Bybit вернул ошибку {payload.get('retCode')}: {payload.get('retMsg')}")
+        result = payload.get("result", {})
+        bids, asks, timestamp_value = result.get("b", []), result.get("a", []), result.get("ts")
+    elif exchange_slug == "okx":
+        payload = _get_json("https://www.okx.com/api/v5/market/books", {"instId": f"{base}-{quote}", "sz": "400"})
+        if str(payload.get("code")) != "0":
+            raise RuntimeError(f"OKX вернул ошибку {payload.get('code')}: {payload.get('msg')}")
+        rows = payload.get("data", [])
+        row = rows[0] if rows else {}
+        bids, asks, timestamp_value = row.get("bids", []), row.get("asks", []), row.get("ts")
+    elif exchange_slug == "mexc":
+        payload = _get_json("https://api.mexc.com/api/v3/depth", {"symbol": symbol, "limit": "1000"})
+        bids, asks = payload.get("bids", []), payload.get("asks", [])
+        timestamp_value = payload.get("timestamp") or payload.get("ts")
+    else:
+        raise ValueError(f"Биржа {exchange!r} не поддерживается для получения стакана")
+    timestamp = _parse_book_timestamp(timestamp_value) or datetime.now(timezone.utc)
+    if not bids or not asks:
+        raise InsufficientLiquidity(f"Пустая глубина стакана {exchange_slug} {market_pair}")
+    return SpotOrderBook(exchange_slug, market_pair, bids, asks, timestamp)
 
 
 def fetch_market_sell_execution(
@@ -135,6 +189,7 @@ def fetch_market_sell_execution(
     if not quantity.is_finite() or quantity <= 0:
         raise ValueError(f"Объём рыночной продажи должен быть положительным: {quantity}")
 
+    book_timestamp_value: Any = None
     if exchange_slug == "binance":
         payload = _get_json(
             "https://data-api.binance.vision/api/v3/depth",
@@ -148,7 +203,9 @@ def fetch_market_sell_execution(
         )
         if str(payload.get("retCode")) != "0":
             raise RuntimeError(f"Bybit вернул ошибку {payload.get('retCode')}: {payload.get('retMsg')}")
-        bids = payload.get("result", {}).get("b", [])
+        result = payload.get("result", {})
+        bids = result.get("b", [])
+        book_timestamp_value = result.get("ts")
     elif exchange_slug == "okx":
         payload = _get_json(
             "https://www.okx.com/api/v5/market/books",
@@ -158,18 +215,40 @@ def fetch_market_sell_execution(
             raise RuntimeError(f"OKX вернул ошибку {payload.get('code')}: {payload.get('msg')}")
         items = payload.get("data", [])
         bids = items[0].get("bids", []) if items else []
+        book_timestamp_value = items[0].get("ts") if items else None
     elif exchange_slug == "mexc":
         payload = _get_json(
             "https://api.mexc.com/api/v3/depth",
             {"symbol": symbol, "limit": "1000"},
         )
         bids = payload.get("bids", [])
+        book_timestamp_value = payload.get("timestamp") or payload.get("ts")
     else:
         raise ValueError(f"Биржа {exchange!r} не поддерживается для рыночной продажи")
 
-    return simulate_market_sell(
+    book_timestamp = _parse_book_timestamp(book_timestamp_value) or datetime.now(timezone.utc)
+    execution = simulate_market_sell(
         exchange_slug, market_pair, quantity, bids, minimum_price=minimum_price
     )
+    return replace(
+        execution, book_timestamp_utc=book_timestamp,
+        book_snapshot={"snapshot_type": "bids", "captured_at_utc": book_timestamp.isoformat(),
+                       "bids": [[str(level[0]), str(level[1])] for level in bids if len(level) >= 2]},
+    )
+
+
+def _parse_book_timestamp(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        timestamp = Decimal(str(value))
+        if not timestamp.is_finite() or timestamp <= 0:
+            return None
+        if timestamp > Decimal("100000000000"):
+            timestamp /= Decimal(1000)
+        return datetime.fromtimestamp(float(timestamp), timezone.utc)
+    except (InvalidOperation, OverflowError, OSError, TypeError, ValueError):
+        return None
 
 
 def fetch_limit_sell_execution(
@@ -215,7 +294,9 @@ def simulate_market_sell(
     return SpotMarketSell(
         exchange, market_pair, quantity, proceeds,
         proceeds / filled_quantity, best_bid, levels_used,
-        filled_quantity, remaining,
+        filled_quantity, remaining, None,
+        {"snapshot_type": "bids", "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+         "bids": [[str(level[0]), str(level[1])] for level in bids if len(level) >= 2]},
     )
 
 
