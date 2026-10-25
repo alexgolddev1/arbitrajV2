@@ -745,7 +745,7 @@ def _render_trader_page(
             f'data-average="{_fmt_fixed(average_execution_price, 8)}" '
             f'data-sold="{_fmt_fixed(sold_quantity, 8)}" '
             f'data-remaining="{_fmt_fixed(remaining_quantity, 8)}">'
-            f"<td>{html.escape(str(trade['source_pair']))}</td>"
+            f"<td>{_history_live_button(trade)}{html.escape(str(trade['source_pair']))}</td>"
             f"<td>{_market_cell(trade['buy_exchange'], trade['buy_market_pair'], trade['buy_price'])}</td>"
             f"<td>{_market_cell(trade['sell_exchange'], trade['sell_market_pair'], sale_price)}</td>"
             f"<td>TP {_fmt(trade['expected_sell_price'])}<small>SL {_fmt(trade['stop_loss_price'])}</small></td>"
@@ -772,6 +772,10 @@ def _render_trader_page(
         trade_rows.append('<tr><td colspan="13">Трейдер ещё не входил в сделки.</td></tr>')
 
     balance = _fmt_fixed(stats.get("exchange_usdt", account["balance_usd"] if account else None), 3)
+    exchange_usdt_balances = [
+        row for row in stats.get("exchange_balances", [])
+        if str(row.get("asset", "")).upper() == "USDT"
+    ]
     equity = _fmt_fixed(stats.get("equity_usd"), 3)
     equity_pnl = Decimal(str(stats.get("equity_pnl_usd") or 0))
     equity_pnl_class = "positive" if equity_pnl >= 0 else "negative"
@@ -803,12 +807,7 @@ def _render_trader_page(
             active_balances = []
     run_details = (
         '<div class="card"><span>Активный демопрогон</span><strong>'
-        + html.escape(str(active_run.get("run_id") or "—")) + '</strong><small>Commit: '
-        + html.escape(str(active_run.get("git_commit") or "—")) + '</small><small>Стартовые остатки: '
-        + html.escape(json.dumps(active_balances, ensure_ascii=False, separators=(",", ":")))
-        + '</small><small>Конфигурация: '
-        + html.escape(json.dumps(active_config, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-        + '</small></div>'
+        + html.escape(str(active_run.get("run_id") or "—")) + '</strong>/div>'
         if active_run else '<div class="card"><span>Активный демопрогон</span><strong>Не создан</strong></div>'
     )
     daily_report_rows = []
@@ -871,13 +870,20 @@ th,td {{ padding:11px 13px; text-align:left; border-bottom:1px solid #26334a; wh
 a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ color:#7dd3fc; text-decoration:underline; }}
 #trade-detail-modal {{ display:none; position:fixed; z-index:1000; max-width:320px; padding:14px 16px; border:1px solid #475569; border-radius:10px; background:#0f172a; box-shadow:0 12px 32px #0009; pointer-events:none; line-height:1.5; }}
 #trade-detail-modal.visible {{ display:block; }} #trade-detail-modal strong {{ display:block; margin-bottom:7px; color:#7dd3fc; }}
+ .live-pair-button {{ margin-right:8px; width:28px; height:30px; padding:0; border:1px solid #334155; border-radius:6px; background:#0b1220; color:#9fb4d0; font-size:1.25rem; cursor:pointer; }}
+.live-pair-button:hover {{ border-color:#38bdf8; color:#7dd3fc; }}
+.live-modal {{ position:fixed; inset:0; z-index:2000; display:grid; place-items:center; padding:16px; background:#020617cc; }} .live-modal[hidden] {{ display:none; }}
+.live-dialog {{ width:min(760px,100%); padding:20px; border:1px solid #334155; border-radius:14px; background:#111b2e; }}
+.live-head {{ display:flex; justify-content:space-between; align-items:center; }} .live-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }}
+.live-card {{ padding:14px; border:1px solid #26334a; border-radius:10px; background:#0b1220; }} .live-card p {{ color:#9fb4d0; }}
+.live-status {{ color:#fbbf24; }} .live-status.connected {{ color:#67e8a5; }} .live-status.error {{ color:#f87171; }}
 .trade-row {{ cursor:help; }} .trade-row:focus {{ outline:2px solid #38bdf8; outline-offset:-2px; }}
 </style></head><body>
 <header><h1>Трейдер</h1><div class="muted">Состояние счёта и сделки · страница обновляется каждые 30 секунд · баланс на {last_update}</div>
 <nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a class="active" href="/trader">Трейдер</a><a href="/trader/export/demo-operations.csv">Экспорт демоопераций CSV</a>{replay_link}</nav></header>
 <main><section class="cards">
-<div class="card"><span>Доступный USDT на биржах</span><strong>{balance} USD</strong><small>Старый общий остаток: {_fmt_fixed(account['balance_usd'], 3) if account else '—'} USDT (не распределён)</small></div>
-<div class="card"><span>Демобалансы по биржам и активам</span><strong>{html.escape('; '.join(f"{row['exchange_slug']} {row['asset']}: {_fmt_fixed(row['balance'], 8)}" for row in stats.get('exchange_balances', [])) or 'пока пусто')}</strong><small>Старый общий остаток не распределён и не доступен для новых входов.</small></div>
+<div class="card"><span>Доступный USDT на биржах</span><strong>{balance} USD</strong></div>
+<div class="card"><span>Демобалансы USDT по биржам</span><strong>{html.escape('; '.join(f"{row['exchange_slug']}: {_fmt_fixed(row['balance'], 8)} USDT" for row in exchange_usdt_balances) or 'пока пусто')}</strong></div>
 <div class="card"><span>Общий Equity</span><strong>{equity} USD</strong><small>USDT + чистая оценка монет · {html.escape(valuation_status)}</small></div>
 <div class="card"><span>Общий PnL с начала</span><strong class="{equity_pnl_class}">{_fmt_fixed(equity_pnl, 3)} USD</strong><small>Старт {_fmt_fixed(stats.get('initial_capital_usd'), 3)} · пополнения {_fmt_fixed(stats.get('deposits_usd') or 0, 3)} · снятия {_fmt_fixed(stats.get('withdrawals_usd') or 0, 3)}</small></div>
 <div class="card"><span>Чистая стоимость монет</span><strong>{_fmt_fixed(stats.get('position_value_usd') or 0, 3)} USD</strong></div>
@@ -893,7 +899,11 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 <div id="trade-detail-modal" role="tooltip" aria-hidden="true"><strong data-detail="pair"></strong>
 <div>Средняя цена исполнения: <span data-detail="average"></span></div>
 <div>Продано монет: <span data-detail="sold"></span></div>
-<div>Остаток монет: <span data-detail="remaining"></span></div></div></main>
+<div>Остаток монет: <span data-detail="remaining"></span></div></div><div id="trader-live-modal" class="live-modal" hidden><section class="live-dialog" role="dialog" aria-modal="true">
+  <div class="live-head"><h2 id="trader-live-title"></h2><button id="trader-live-close" type="button" aria-label="Закрыть">×</button></div>
+  <div class="live-grid"><article class="live-card"><h3 id="trader-live-buy-title"></h3><p>Bid: <strong id="trader-live-buy-bid">—</strong></p><p>Ask: <strong id="trader-live-buy-ask">—</strong></p><div id="trader-live-buy-status" class="live-status">Подключение…</div></article>
+  <article class="live-card"><h3 id="trader-live-sell-title"></h3><p>Bid: <strong id="trader-live-sell-bid">—</strong></p><p>Ask: <strong id="trader-live-sell-ask">—</strong></p><div id="trader-live-sell-status" class="live-status">Подключение…</div></article></div><h3 id="trader-live-spread">Спред: ожидаем котировки</h3>
+</section></div></main>
 <script>
 const tradeDetail = document.getElementById('trade-detail-modal');
 function positionTradeDetail(event) {{
@@ -927,6 +937,27 @@ document.querySelectorAll('.trade-row').forEach(row => {{
   }});
   row.addEventListener('blur', hideTradeDetail);
 }});
+const traderLiveModal = document.getElementById('trader-live-modal');
+let traderLiveSockets = [], traderLiveTimers = [], traderLiveQuotes = {{}};
+function traderLiveStatus(side, text, state) {{ const n = document.getElementById('trader-live-' + side + '-status'); n.textContent = text; n.className = 'live-status' + (state ? ' ' + state : ''); }}
+function traderStopLive() {{ traderLiveTimers.forEach(clearInterval); traderLiveTimers = []; traderLiveSockets.forEach(s => {{ try {{ s.close(); }} catch (_) {{}} }}); traderLiveSockets = []; traderLiveQuotes = {{}}; }}
+function traderReceive(side, bid, ask) {{ bid = Number(bid); ask = Number(ask); if (!(bid > 0) || !(ask > 0)) return; traderLiveQuotes[side] = {{bid, ask}}; document.getElementById('trader-live-' + side + '-bid').textContent = bid; document.getElementById('trader-live-' + side + '-ask').textContent = ask; traderLiveStatus(side, 'Обновлено ' + new Date().toLocaleTimeString(), 'connected'); if (traderLiveQuotes.buy && traderLiveQuotes.sell) {{ const a = traderLiveQuotes.buy.ask, b = traderLiveQuotes.sell.bid, spread = (b-a)/a*100; document.getElementById('trader-live-spread').textContent = 'Спред по ask покупки и bid продажи: ' + (spread >= 0 ? '+' : '') + spread.toFixed(8) + '%'; }} }}
+function traderParseMexc(buffer) {{ const bytes = new Uint8Array(buffer), state = {{i: 0}}, values = {{}}; function read() {{ let v=0, shift=0, b; do {{ b=bytes[state.i++]; v+=(b&127)*2**shift; shift+=7; }} while ((b&128) && state.i<bytes.length && shift<56); return v; }} function fields(data, save) {{ let i=0; while(i<data.length) {{ const tagState={{i}}, tag=readAt(data,tagState); i=tagState.i; const f=Math.floor(tag/8), w=tag%8; if(w===2) {{ const lenState={{i}},len=readAt(data,lenState); i=lenState.i; const part=data.subarray(i,i+len); i+=len; if(save) values[f]=new TextDecoder().decode(part); else if(f>=1&&f<=4) values[f]=new TextDecoder().decode(part); }} else if(w===0) {{ const st={{i}}; readAt(data,st); i=st.i; }} else if(w===1) i+=8; else if(w===5) i+=4; else throw Error('Неверный protobuf MEXC'); }} }} function readAt(data,st) {{ let v=0,sh=0,b; do {{ b=data[st.i++]; v+=(b&127)*2**sh; sh+=7; }} while((b&128)&&st.i<data.length&&sh<56); return v; }}
+  // Вложенное поле 315 содержит bid/ask; outer protobuf также содержит бинарные служебные поля.
+  let i=0; while(i<bytes.length) {{ const tag=readAt(bytes,{{i}}); const st={{i: 0}}; st.i=i; const actual=readAt(bytes,st); i=st.i; const f=Math.floor(actual/8),w=actual%8; if(w===2) {{ const st2={{i}}; const len=readAt(bytes,st2); i=st2.i; const part=bytes.subarray(i,i+len); i+=len; if(f===315) fields(part,false); }} else if(w===0) {{ const st3={{i}}; readAt(bytes,st3); i=st3.i; }} else if(w===1) i+=8; else if(w===5) i+=4; else throw Error('Неверный protobuf MEXC'); }} return values; }}
+function traderConnectLive(side, exchange, pair) {{ const p=String(pair).toUpperCase().split(/[\/_-]/); if(p.length!==2) {{ traderLiveStatus(side,'Некорректная пара','error'); return; }} const symbol=p.join(''), slug=String(exchange).toLowerCase(); let url,sub;
+  if(slug==='binance') url='wss://stream.binance.com:9443/ws/'+symbol.toLowerCase()+'@bookTicker';
+  else if(slug==='bybit') {{ url='wss://stream.bybit.com/v5/public/spot'; sub=s=>s.send(JSON.stringify({{op:'subscribe',args:['tickers.'+symbol]}})); }}
+  else if(slug==='okx') {{ url='wss://ws.okx.com:8443/ws/v5/public'; sub=s=>s.send(JSON.stringify({{op:'subscribe',args:[{{channel:'tickers',instId:p[0]+'-'+p[1]}}]}})); }}
+  else if(slug==='mexc') {{ url='wss://wbs-api.mexc.com/ws'; sub=s=>{{s.binaryType='arraybuffer';s.send(JSON.stringify({{method:'SUBSCRIPTION',params:['spot@public.aggre.bookTicker.v3.api.pb@100ms@'+symbol]}}));traderLiveTimers.push(setInterval(()=>{{if(s.readyState===WebSocket.OPEN)s.send(JSON.stringify({{method:'PING'}}));}},20000));}}; }}
+  else {{ traderLiveStatus(side,'Биржа не поддерживается: '+exchange,'error'); return; }}
+  traderLiveStatus(side,'Подключение…'); const s=new WebSocket(url); traderLiveSockets.push(s); s.onopen=()=>{{if(traderLiveModal.hidden){{s.close();return;}}if(sub)sub(s);if(slug==='bybit'||slug==='okx')traderLiveTimers.push(setInterval(()=>{{if(s.readyState===WebSocket.OPEN)s.send(slug==='bybit'?JSON.stringify({{op:'ping'}}):'ping');}},20000));}};
+  s.onmessage=e=>{{try{{if(slug==='binance'){{const d=JSON.parse(e.data);traderReceive(side,d.b,d.a);}}else if(slug==='bybit'){{const d=JSON.parse(e.data);if(d.data)traderReceive(side,d.data.bid1Price,d.data.ask1Price);}}else if(slug==='okx'){{const d=JSON.parse(e.data);if(d.data&&d.data.length)traderReceive(side,d.data[0].bidPx,d.data[0].askPx);}}else if(slug==='mexc'&&e.data instanceof ArrayBuffer){{const d=traderParseMexc(e.data);traderReceive(side,d[1],d[3]);}}}}catch(err){{traderLiveStatus(side,'Ошибка данных: '+err.message,'error');}}}}; s.onerror=()=>traderLiveStatus(side,'Ошибка подключения','error'); }}
+document.addEventListener('click',e=>{{const b=e.target.closest('.live-pair-button');if(b){{traderStopLive();const d=b.dataset;traderLiveModal.hidden=false;document.getElementById('trader-live-title').textContent=d.pair+' · WebSocket';document.getElementById('trader-live-buy-title').textContent=d.buyExchange+' · '+d.buyPair;document.getElementById('trader-live-sell-title').textContent=d.sellExchange+' · '+d.sellPair;['buy','sell'].forEach(x=>{{document.getElementById('trader-live-'+x+'-bid').textContent='—';document.getElementById('trader-live-'+x+'-ask').textContent='—';traderLiveStatus(x,'Подключение…');}});document.getElementById('trader-live-spread').textContent='Спред: ожидаем котировки';traderConnectLive('buy',d.buyExchange,d.buyPair);traderConnectLive('sell',d.sellExchange,d.sellPair);}}if(e.target===traderLiveModal)traderCloseLive();}});
+function traderCloseLive(){{traderLiveModal.hidden=true;traderStopLive();}}
+document.getElementById('trader-live-close').addEventListener('click',traderCloseLive);
+document.addEventListener('keydown',e=>{{if(e.key==='Escape'&&!traderLiveModal.hidden)traderCloseLive();}});
+
 </script></body></html>"""
 
 

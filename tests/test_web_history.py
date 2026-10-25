@@ -29,6 +29,38 @@ class TraderHistoryTests(unittest.TestCase):
 
         self.assertTrue(result[7]["route_unavailable"])
 
+    def test_trader_deals_include_live_quote_button_and_modal(self) -> None:
+        trade = {
+            "status": "pending", "source_pair": "POLYX/USDT",
+            "buy_exchange": "binance", "buy_market_pair": "POLYX/USDT",
+            "sell_exchange": "mexc", "sell_market_pair": "POLYX/USDT",
+            "buy_price": Decimal("0.035"), "expected_sell_price": Decimal("0.0356"),
+            "final_sell_price": None, "expected_profit_usd": Decimal("1"),
+            "expected_profit_after_reserve_usd": Decimal("0.5"),
+            "realized_profit_usd": None, "quantity": Decimal("100"),
+            "sold_quantity": Decimal("0"), "remaining_quantity": Decimal("100"),
+            "sell_proceeds_accumulated_usd": Decimal("0"), "stop_loss_price": Decimal("0.034"),
+            "buy_cost_usd": Decimal("3.5"), "realized_sell_proceeds_usd": None,
+            "buy_fee_usd": Decimal("0.01"), "sell_fee_usd": None,
+            "route_status": "unconfirmed", "transfer_fee_amount": Decimal("5"),
+            "transfer_fee_currency": "POLYX", "transfer_dust_quantity": Decimal("0"),
+            "asset_exchange": "binance", "created_at": datetime(2026, 10, 25),
+            "planned_sell_at": None, "actual_sell_at": None, "settled_at": None,
+            "settle_after_utc": None,
+        }
+
+        page = _render_trader_page(
+            {"balance_usd": Decimal("100"), "training_mode": True, "updated_at": datetime(2026, 10, 25)},
+            {}, [trade],
+        )
+
+        self.assertIn('class="live-pair-button"', page)
+        self.assertIn('data-pair="POLYX/USDT"', page)
+        self.assertIn('data-buy-exchange="binance"', page)
+        self.assertIn('data-sell-exchange="mexc"', page)
+        self.assertIn('id="trader-live-modal"', page)
+        self.assertIn("traderConnectLive('buy'", page)
+
     @patch("main.web.read_config", return_value={"interval_minutes": 1})
     @patch("main.web.connect_db")
     def test_opportunity_route_status_query_uses_non_reserved_alias(self, connect_db, _read_config) -> None:
@@ -192,6 +224,10 @@ class TraderHistoryTests(unittest.TestCase):
                 "position_value_usd": Decimal("20"), "transfer_quantity": Decimal("1"),
                 "transfer_value_usd": Decimal("10"), "valuation_complete": True,
                 "valuation_stale": False,
+                "exchange_balances": [
+                    {"exchange_slug": "binance", "asset": "USDT", "balance": Decimal("100.008")},
+                    {"exchange_slug": "binance", "asset": "POLYX", "balance": Decimal("2")},
+                ],
                 "strategy_stats": [
                     {"strategy": "tp_sl", "settled_count": 1, "pending_count": 0, "open_count": 0,
                      "realized_profit": Decimal("2"), "fees": Decimal("0.1")},
@@ -225,6 +261,8 @@ class TraderHistoryTests(unittest.TestCase):
         self.assertIn("Дневной отчёт · Europe/Kyiv", page)
         self.assertIn("2026-10-24", page)
         self.assertIn("abc123", page)
+        self.assertIn("binance: 100.00800000 USDT", page)
+        self.assertNotIn("binance POLYX", page)
         self.assertIn("устарела", page)
 
     @patch("main.web.connect_db")
