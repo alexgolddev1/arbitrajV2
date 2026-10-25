@@ -131,4 +131,4 @@ DEFAULT_INTERVAL_MINUTES = int(DEFAULT_CONFIG["interval_minutes"])
 
 # Оставлять рынки с включёнными границами объёма за 24 часа в USD.
 MIN_VOLUME_USD = Decimal("300000")
-MAX_VOLUME_USD = Decimal("500000")
+MAX_VOLUME_USD = Decimal("1000000")

@@ -48,6 +48,9 @@ NETWORK_ALIASES = {
     "BSC": ("BSC", "BEP20", "BEP-20", "BNB SMART", "BNB SMART CHAIN", "BNB SMART CHAIN BEP20", "BNB SMART CHAIN BEP 20", "BNB CHAIN", "BEP20BSC"),
     "SOLANA": ("SOLANA", "SOL", "SPL", "SOL NETWORK"),
     "POLYGON": ("POLYGON", "POLYGON POS", "POLYGON MAINNET", "MATIC", "POL"),
+    # Binance may label the Polymesh network by its native token ticker,
+    # while MEXC uses the chain name (or the ticker as the network name).
+    "POLYMESH": ("POLYMESH", "POLYX"),
     "TON": ("TON", "TONCOIN", "THE OPEN NETWORK", "TON NETWORK"),
     "ETHEREUM": ("ETHEREUM", "ERC20", "ERC-20", "ETH", "ETHEREUM MAINNET"),
     "ARBITRUM": ("ARBITRUM", "ARBITRUM ONE", "ARBITRUMONE", "ARB", "ARBITRUM-ONE", "ARBITRUM ONE (ARB)"),

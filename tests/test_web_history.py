@@ -9,13 +9,55 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from main.web import (
-    _aggregate_lifetime_groups, _count_trader_positions, _record_capital_movement,
+    _aggregate_lifetime_groups, _count_trader_positions, _load_logged_failures, _load_opportunities, _record_capital_movement,
     _demo_operation_csv, _render_history, _render_page, _render_replay_page,
     _render_trader_page, _value_trader_positions, _drawdown_metrics,
 )
 
 
 class TraderHistoryTests(unittest.TestCase):
+    def test_history_keeps_old_logged_failure_even_after_later_success(self) -> None:
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            {"lifetime_id": 7, "decision": "processed", "error_message": None,
+             "created_at": datetime.now(timezone.utc).replace(tzinfo=None)},
+            {"lifetime_id": 7, "decision": "rejected", "error_message": "нет доступного маршрута",
+             "created_at": datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)},
+        ]
+
+        result = _load_logged_failures(cursor, [7], historical=True)
+
+        self.assertTrue(result[7]["route_unavailable"])
+
+    @patch("main.web.read_config", return_value={"interval_minutes": 1})
+    @patch("main.web.connect_db")
+    def test_opportunity_route_status_query_uses_non_reserved_alias(self, connect_db, _read_config) -> None:
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connection.cursor.return_value.__exit__.return_value = False
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        cursor.fetchall.side_effect = [
+            [{
+                "lifetime_id": 7, "source_market_id": 1, "source_pair": "ABC/USDT",
+                "base_symbol": "ABC", "source_quote": "USDT", "price_difference_percent": Decimal("2"),
+                "exchange_name": "binance", "venue_pair": "ABC/USDT", "price": Decimal("1"),
+                "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT", "sell_price": Decimal("1.02"),
+                "last_updated": now, "started_at": now,
+            }],
+            [{
+                "lifetime_id": 7, "decision": "rejected", "error_message": "нет доступного маршрута",
+                "created_at": now,
+            }],
+        ]
+        connect_db.return_value = connection
+
+        rows, interval = _load_opportunities()
+
+        self.assertEqual(interval, 1)
+        self.assertTrue(rows[0]["route_unavailable"])
+        self.assertTrue(any("FROM trader_signals AS sig" in call.args[0] for call in cursor.execute.call_args_list))
+
     def test_drawdown_reports_current_and_historical_maximum_separately(self) -> None:
         current, maximum, percent, peak = _drawdown_metrics(
             Decimal("100"),
@@ -225,6 +267,10 @@ class TraderHistoryTests(unittest.TestCase):
                 "ended_at": now,
                 "duration_seconds": 30,
                 "is_active": False,
+                "route_unavailable": True,
+                "route_status_label": "В журнале: нет маршрута",
+                "balance_unavailable": True,
+                "balance_status_label": "В журнале: недостаточный баланс",
             }],
         )
 
@@ -233,6 +279,8 @@ class TraderHistoryTests(unittest.TestCase):
         self.assertIn('data-sell-exchange="mexc"', page)
         self.assertIn('id="history-live-modal"', page)
         self.assertIn("historyConnectLive('buy'", page)
+        self.assertIn('status-icon route no', page)
+        self.assertIn('status-icon balance no', page)
 
     def test_screener_rows_include_pair_specific_live_quote_controls(self) -> None:
         now = datetime(2026, 10, 18, 12, 0, 0)
@@ -261,6 +309,27 @@ class TraderHistoryTests(unittest.TestCase):
         self.assertIn('data-sell-pair="ABC/USDT"', page)
         self.assertIn("wss://stream.binance.com:9443/ws/", page)
         self.assertIn("wss://wbs-api.mexc.com/ws", page)
+
+    def test_screener_shows_route_and_exchange_balance_status_icons(self) -> None:
+        now = datetime(2026, 10, 18, 12, 0, 0)
+        page = _render_page(
+            [{
+                "source_market_id": 18, "source_pair": "ABC/USDT", "base_symbol": "ABC",
+                "source_quote": "USDT", "price_difference_percent": Decimal("1.2"),
+                "exchange_name": "binance", "venue_pair": "ABC/USDT", "price": Decimal("10"),
+                "sell_exchange": "mexc", "sell_market_pair": "ABC/USDT", "sell_price": Decimal("10.12"),
+                "last_updated": now, "started_at": now,
+                "route_unavailable": True, "route_status_label": "В журнале: нет маршрута",
+                "balance_unavailable": True, "balance_status_label": "В журнале: недостаточный баланс",
+            }],
+            1,
+        )
+
+        self.assertIn('status-icon route no', page)
+        self.assertIn('status-icon balance no', page)
+        self.assertNotIn('status-icon balance yes', page)
+        self.assertIn('aria-label="В журнале: нет маршрута"', page)
+        self.assertIn('aria-label="В журнале: недостаточный баланс"', page)
 
     def test_period_counters_include_only_created_trader_positions(self) -> None:
         now = datetime(2026, 10, 18, 12, 0, 0)

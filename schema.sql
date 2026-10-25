@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS trader_demo_operation_log (
     settlement_id BIGINT UNSIGNED NOT NULL,
     signal_id BIGINT UNSIGNED NOT NULL,
     event_type VARCHAR(32) NOT NULL,
-    event_at_utc DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+    event_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     exchange_slug VARCHAR(64) NOT NULL,
     market_pair VARCHAR(128) NULL,
     asset VARCHAR(24) NULL,
@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS trader_demo_runs (
     starting_equity_usd DECIMAL(38, 12) NOT NULL,
     baseline_complete TINYINT(1) NOT NULL DEFAULT 1,
     status VARCHAR(16) NOT NULL DEFAULT 'active',
-    started_at_utc DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+    started_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     ended_at_utc DATETIME(6) NULL,
     INDEX idx_trader_demo_runs_started (started_at_utc)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS trader_demo_runs (
 CREATE TABLE IF NOT EXISTS trader_demo_run_state (
     state_id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
     active_run_id CHAR(36) NULL,
-    updated_at_utc DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6) ON UPDATE UTC_TIMESTAMP(6),
+    updated_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
     CONSTRAINT fk_trader_demo_run_state_active
         FOREIGN KEY (active_run_id) REFERENCES trader_demo_runs (run_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS trader_replay_book_snapshots (
     side VARCHAR(8) NOT NULL,
     exchange_slug VARCHAR(64) NOT NULL,
     market_pair VARCHAR(128) NOT NULL,
-    observed_at_utc DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+    observed_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     book_snapshot JSON NOT NULL,
     INDEX idx_trader_replay_book (run_id, exchange_slug, market_pair, observed_at_utc),
     INDEX idx_trader_replay_signal (run_id, signal_id),
@@ -220,7 +220,7 @@ CREATE TABLE IF NOT EXISTS trader_demo_daily_reports (
     transfer_value_usd DECIMAL(38, 12) NULL,
     valuation_complete TINYINT(1) NOT NULL DEFAULT 0,
     valuation_stale TINYINT(1) NOT NULL DEFAULT 0,
-    captured_at_utc DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+    captured_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (run_id, report_day_kyiv),
     CONSTRAINT fk_trader_demo_daily_run
         FOREIGN KEY (run_id) REFERENCES trader_demo_runs (run_id)
@@ -230,7 +230,7 @@ CREATE TABLE IF NOT EXISTS trader_demo_daily_reports (
 CREATE TABLE IF NOT EXISTS trader_demo_equity_snapshots (
     snapshot_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
     run_id CHAR(36) NOT NULL,
-    captured_at_utc DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+    captured_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     equity_usd DECIMAL(38, 12) NULL,
     valuation_complete TINYINT(1) NOT NULL DEFAULT 0,
     valuation_stale TINYINT(1) NOT NULL DEFAULT 0,

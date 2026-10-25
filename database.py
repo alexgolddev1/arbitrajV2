@@ -94,6 +94,7 @@ def connect_db() -> MySQLConnection:
         "user": DB_USER,
         "password": DB_PASSWORD,
         "connection_timeout": DB_CONNECT_TIMEOUT_SECONDS,
+        "time_zone": "+00:00",
     }
     for attempt in range(1, DB_CONNECT_RETRIES + 1):
         try:

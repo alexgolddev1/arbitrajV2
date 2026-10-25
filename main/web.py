@@ -15,7 +15,13 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
-from config import BUY_PRICE_MUST_BE_LOWER, CALCULATOR_SPREAD_LEVELS, SCREENER_QUOTE_SYMBOLS_CSV
+from config import (
+    BUY_PRICE_MUST_BE_LOWER,
+    CALCULATOR_SPREAD_LEVELS,
+    MAX_VOLUME_USD,
+    MIN_VOLUME_USD,
+    SCREENER_QUOTE_SYMBOLS_CSV,
+)
 from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database, read_config
 from main.treider.market_data import fetch_market_sell_execution
 from main.treider.replay import replay_scenario
@@ -93,10 +99,91 @@ def _market_link(exchange: Any, market_pair: Any, label: Any) -> str:
     return f'<a class="market-link" href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">{text}</a>'
 
 
+def _status_icon(kind: str, title: str) -> str:
+    symbol = "＄" if kind == "balance" else (
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 2h10l4 20H3L7 2Z" fill="currentColor"/><path d="M12 4v4m0 3v4m0 3v2" stroke="#0b1220" stroke-width="1.5" stroke-linecap="round"/></svg>'
+    )
+    label = html.escape(title, quote=True)
+    return f'<span class="status-icon {kind} no" role="img" aria-label="{label}" title="{label}">{symbol}</span>'
+
+
+def _exchange_status_icons(row: dict[str, Any], side: str) -> str:
+    if side != "buy":
+        return ""
+    icons = []
+    if row.get("route_unavailable"):
+        icons.append(_status_icon("route", str(row.get("route_status_label") or "В журнале трейдера: нет доступного маршрута вывода")))
+    if row.get("balance_unavailable"):
+        icons.append(_status_icon("balance", str(row.get("balance_status_label") or "В журнале трейдера: недостаточно USDT на бирже покупки")))
+    if not icons:
+        return ""
+    return f'<span class="exchange-status-icons">{"".join(icons)}</span>'
+
+
 def _elapsed_seconds_since(value: datetime) -> int:
     """Посчитать длительность по UTC, независимо от часового пояса процесса."""
     utc_value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
     return max(0, int((datetime.now(timezone.utc) - utc_value).total_seconds()))
+
+
+def _load_logged_failures(
+    cursor: Any, lifetime_ids: list[int], *, historical: bool = False,
+) -> dict[int, dict[str, str | bool]]:
+    if not lifetime_ids:
+        return {}
+    placeholders = ",".join(["%s"] * len(lifetime_ids))
+    cursor.execute(
+        "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(sig.payload, '$.lifetime_id')) AS UNSIGNED) AS lifetime_id, "
+        "sig.decision, sig.error_message, sig.created_at "
+        "FROM trader_signals AS sig "
+        f"WHERE CAST(JSON_UNQUOTE(JSON_EXTRACT(sig.payload, '$.lifetime_id')) AS UNSIGNED) IN ({placeholders}) "
+        "ORDER BY sig.signal_id DESC",
+        tuple(lifetime_ids),
+    )
+    route_unavailable_reason = "\u043d\u0435\u0442 \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e\u0433\u043e \u043c\u0430\u0440\u0448\u0440\u0443\u0442\u0430"
+    latest_failures: dict[int, dict[str, str | bool]] = {}
+    for signal in cursor.fetchall():
+        lifetime_id = int(signal["lifetime_id"])
+        reason = str(signal.get("error_message") or "").casefold()
+        route_failed = signal.get("decision") == "rejected" and reason == route_unavailable_reason
+        insufficient = signal.get("decision") == "rejected" and (
+            "\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0439 \u0431\u0430\u043b\u0430\u043d\u0441" in reason
+            or "\u043d\u0435\u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u044b\u0439 \u0431\u0430\u043b\u0430\u043d\u0441" in reason
+        )
+        if historical:
+            failure = latest_failures.setdefault(lifetime_id, {})
+            if route_failed and "route_unavailable" not in failure:
+                failure.update({
+                    "route_unavailable": True,
+                    "route_status_label": "В журнале трейдера: нет доступного маршрута вывода",
+                })
+            if insufficient and "balance_unavailable" not in failure:
+                failure.update({
+                    "balance_unavailable": True,
+                    "balance_status_label": f"В журнале трейдера: {signal.get('error_message')}",
+                })
+            continue
+        if lifetime_id in latest_failures:
+            continue
+        checked_at = signal.get("created_at")
+        checked_utc = (
+            checked_at.replace(tzinfo=timezone.utc)
+            if checked_at is not None and checked_at.tzinfo is None
+            else checked_at.astimezone(timezone.utc) if checked_at is not None else None
+        )
+        if checked_utc is not None and datetime.now(timezone.utc) - checked_utc > timedelta(minutes=10):
+            latest_failures[lifetime_id] = {}
+        elif route_failed:
+            latest_failures[lifetime_id] = {
+                "route_unavailable": True,
+                "route_status_label": "В журнале трейдера: нет доступного маршрута вывода",
+            }
+        else:
+            latest_failures[lifetime_id] = ({
+                "balance_unavailable": True,
+                "balance_status_label": f"В журнале трейдера: {signal.get('error_message')}",
+            } if insufficient else {})
+    return latest_failures
 
 
 def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
@@ -113,7 +200,7 @@ def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
                 "life.buy_price AS price, "
                 "life.sell_exchange, life.sell_market_pair, life.sell_price, "
                 "life.last_confirmed_at AS last_updated, "
-                "life.started_at "
+                "life.started_at, life.lifetime_id "
                 "FROM opportunity_lifetimes AS life "
                 "JOIN market_pairs AS source ON source.market_id = life.source_market_id "
                 "WHERE life.is_active = 1 AND life.threshold_percent = %s "
@@ -123,6 +210,10 @@ def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
                 (CALCULATOR_SPREAD_LEVELS[0], SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
             )
             rows = cursor.fetchall()
+            lifetime_ids = [row["lifetime_id"] for row in rows if row.get("lifetime_id") is not None]
+            latest_failures = _load_logged_failures(cursor, lifetime_ids)
+        for row in rows:
+            row.update(latest_failures.get(int(row["lifetime_id"]), {}))
         return rows, int(config["interval_minutes"])
     finally:
         connection.close()
@@ -975,7 +1066,12 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
                 "ORDER BY started_at DESC, lifetime_id DESC LIMIT 500",
                 (int(is_active), SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
             )
-            return cursor.fetchall()
+            rows = cursor.fetchall()
+            lifetime_ids = [row["lifetime_id"] for row in rows if row.get("lifetime_id") is not None]
+            latest_failures = _load_logged_failures(cursor, lifetime_ids, historical=not is_active)
+            for row in rows:
+                row.update(latest_failures.get(int(row["lifetime_id"]), {}))
+            return rows
     finally:
         connection.close()
 
@@ -1045,7 +1141,7 @@ def _render_history(
             "<tr>"
             f"<td>{_history_live_button(row)} {html.escape(str(row['source_pair']))}</td>"
             f"<td>{threshold}</td><td class=spread>{spread}</td>"
-            f"<td>{_market_cell(row['buy_exchange'], row['buy_market_pair'], row['buy_price'])}</td>"
+            f"<td><div class=\"exchange-cell\">{_market_cell(row['buy_exchange'], row['buy_market_pair'], row['buy_price'])}{_exchange_status_icons(row, 'buy')}</div></td>"
             f"<td>{_market_cell(row['sell_exchange'], row['sell_market_pair'], row['sell_price'])}</td>"
             f"<td>{started}</td><td>{state}</td><td>{duration}</td>"
             f"<td>{total_duration}</td></tr>"
@@ -1069,6 +1165,10 @@ def _render_history(
   table {{ width: 100%; border-collapse: collapse; min-width: 760px; background: #111b2e; }}
   th, td {{ padding: 11px 14px; text-align: left; border-bottom: 1px solid #26334a; white-space: nowrap; }}
   th {{ color: #9fb4d0; font-size: .82rem; text-transform: uppercase; }} .spread {{ color: #67e8a5; font-weight: 700; }}
+  .exchange-cell {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
+  .exchange-status-icons {{ display: inline-flex; align-items: center; gap: 5px; }}
+  .status-icon {{ display: inline-grid; place-items: center; width: 21px; height: 21px; border: 1px solid currentColor; border-radius: 50%; color: #f87171; font-size: 13px; font-weight: 800; line-height: 1; cursor: help; }}
+  .status-icon.route {{ border-radius: 5px; }} .status-icon.route svg {{ width: 14px; height: 14px; }}
   a.market-link {{ color: inherit; text-decoration: none; }} a.market-link:hover {{ color: #7dd3fc; text-decoration: underline; }}
   .live-pair-button {{ margin-right: 8px; width: 28px; height: 30px; padding: 0; border: 1px solid #334155; border-radius: 6px; background: #0b1220; color: #9fb4d0; font-size: 1.25rem; cursor: pointer; }}
   .live-pair-button:hover {{ border-color: #38bdf8; color: #7dd3fc; }}
@@ -1175,10 +1275,10 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
             f'data-sell-pair="{html.escape(sell_pair, quote=True)}">⋮</button></td>'
             f"<td>{html.escape(str(source_pair))}<small>ID {html.escape(str(row['source_market_id']))}</small></td>"
             f"<td class=spread>+{_fmt(row['price_difference_percent'])}%</td>"
-            f"<td>{_market_link(row['exchange_name'], row['venue_pair'], row['exchange_name'])}</td>"
+            f"<td><div class=\"exchange-cell\">{_market_link(row['exchange_name'], row['venue_pair'], row['exchange_name'])}{_exchange_status_icons(row, 'buy')}</div></td>"
             f"<td>{_market_link(row['exchange_name'], row['venue_pair'], row['venue_pair'] or '—')}</td>"
             f"<td class=price>{_fmt(row['price'])}</td>"
-            f"<td>{_market_link(row['sell_exchange'], row['sell_market_pair'], row['sell_exchange'])}</td>"
+            f"<td><div class=\"exchange-cell\">{_market_link(row['sell_exchange'], row['sell_market_pair'], row['sell_exchange'])}{_exchange_status_icons(row, 'sell')}</div></td>"
             f"<td>{_market_link(row['sell_exchange'], row['sell_market_pair'], row['sell_market_pair'] or '—')}</td>"
             f"<td class=price>{_fmt(row['sell_price'])}</td>"
             f'<td><span class="{freshness_class}">{freshness}</span>'
@@ -1242,6 +1342,12 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
     .spread, .price {{ font-variant-numeric: tabular-nums; }}
     .spread {{ color: #67e8a5; font-weight: 700; }}
     .price {{ font-weight: 600; }}
+    .exchange-cell {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
+    .exchange-status-icons {{ display: inline-flex; align-items: center; gap: 5px; }}
+    .status-icon {{ display: inline-grid; place-items: center; width: 21px; height: 21px; border: 1px solid currentColor; border-radius: 50%; font-size: 13px; font-weight: 800; line-height: 1; cursor: help; }}
+    .status-icon.yes {{ color: #67e8a5; }} .status-icon.no {{ color: #f87171; }} .status-icon.unknown {{ color: #fbbf24; }}
+    .status-icon.route {{ border-radius: 5px; font-size: 11px; }}
+    .status-icon.route svg {{ width: 14px; height: 14px; }}
     .fresh {{ color: #67e8a5; }} .stale {{ color: #fbbf24; }}
     a {{ color: #7dd3fc; }}
     .empty {{ padding: 28px; border: 1px solid #26334a; border-radius: 10px; background: #111b2e; }}
@@ -1275,7 +1381,7 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
   <nav><a class="active" href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/trader">Трейдер</a></nav>
   <header><h1>Арбитражный скринер</h1>
   <div id="worker-status" class="worker-status"><strong>Проверяю обновление…</strong><small></small></div>
-  <div class="muted">Длительность активных возможностей обновляется каждую секунду · данные пересчитываются по расписанию</div></header>
+  <div class="muted">Объём торгов за 24 ч: {_fmt(MIN_VOLUME_USD)}–{_fmt(MAX_VOLUME_USD)} USD · длительность активных возможностей обновляется каждую секунду · данные пересчитываются по расписанию</div></header>
   <main><div class="summary">Позиций: {distinct_positions} · Биржевых строк: {len(rows)} · Страница обновлена: {refreshed_at}</div>
   {body}</main>
 <div id="live-modal" class="live-modal" hidden>
@@ -1582,7 +1688,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         origin = urlparse(self.headers.get("Origin", "")).netloc
         host = self.headers.get("Host", "")
         if not origin or origin.lower() != host.lower():
-            self.send_error(403, "Запрос должен быть отправлен со страницы трейдера")
+            self.send_error(403)
             return
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
@@ -1598,10 +1704,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
         except (ValueError, KeyError, ArithmeticError) as error:
-            self.send_error(400, str(error))
+            self.send_error(400)
         except Exception:
             logger.exception("Не удалось записать движение капитала трейдера")
-            self.send_error(500, "Не удалось обновить тренировочный счёт")
+            self.send_error(500)
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -1623,10 +1729,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             except (ValueError, ArithmeticError) as error:
-                self.send_error(400, str(error))
+                self.send_error(400)
             except Exception:
                 logger.exception("Не удалось выполнить replay демопрогона")
-                self.send_error(500, "Не удалось выполнить replay демопрогона")
+                self.send_error(500)
             return
         if path == "/trader/export/demo-operations.csv":
             try:
@@ -1640,7 +1746,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except Exception:
                 logger.exception("Не удалось экспортировать журнал демоопераций")
-                self.send_error(500, "Не удалось получить журнал демоопераций из БД")
+                self.send_error(500)
             return
         if path == "/trader":
             try:
@@ -1654,7 +1760,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except Exception:
                 logger.exception("Не удалось загрузить страницу трейдера")
-                self.send_error(500, "Не удалось получить данные трейдера из БД")
+                self.send_error(500)
             return
         if path in ("/api/history-lifetimes", "/api/active-situations"):
             try:
@@ -1669,7 +1775,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except Exception:
                 logger.exception("Не удалось обновить завершённые возможности")
-                self.send_error(500, "Не удалось обновить историю")
+                self.send_error(500)
             return
         if path in ("/history", "/situations"):
             try:
@@ -1687,7 +1793,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except Exception:
                 logger.exception("Не удалось загрузить историю возможностей")
-                self.send_error(500, "Не удалось получить историю из БД")
+                self.send_error(500)
             return
         if path == "/api/status":
             try:
@@ -1700,7 +1806,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             except Exception:
                 logger.exception("Не удалось получить состояние worker")
-                self.send_error(500, "Не удалось получить состояние процесса")
+                self.send_error(500)
             return
         if path == "/healthz":
             self.send_response(200)
@@ -1721,7 +1827,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except Exception:
             logger.exception("Не удалось загрузить данные для веб-страницы")
-            self.send_error(500, "Не удалось получить данные из БД")
+            self.send_error(500)
 
     def log_message(self, format_string: str, *args: Any) -> None:
         logger.info("%s - %s", self.address_string(), format_string % args)

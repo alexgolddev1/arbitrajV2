@@ -317,6 +317,30 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(routes[0]["network_profile"], "POLYGON")
         self.assertEqual(routes[0]["route_status"], "unconfirmed")
 
+    @patch.object(exchange_networks, "ALLOW_UNCONFIRMED_ROUTE_DEMO", True)
+    @patch.object(exchange_networks, "ALLOW_DISABLED_ROUTE_DEMO", False)
+    def test_polyx_and_polymesh_network_names_match(self) -> None:
+        networks = {
+            "binance": [{
+                "network_code": "POLYX", "network_name": "POLYX",
+                "withdraw_enabled": True, "deposit_enabled": True,
+            }],
+            "mexc": [{
+                "network_code": "POLYMESH", "network_name": "POLYX",
+                "withdraw_enabled": True, "deposit_enabled": True,
+            }],
+        }
+
+        self.assertEqual(exchange_networks._network_profile(networks["binance"][0]), "POLYMESH")
+        self.assertEqual(exchange_networks._network_profile(networks["mexc"][0]), "POLYMESH")
+        routes = exchange_networks.build_transfer_routes(
+            "POLYX", "binance", "mexc", {"networks": networks},
+        )
+
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0]["network_profile"], "POLYMESH")
+        self.assertEqual(routes[0]["route_status"], "unconfirmed")
+
     def test_compound_ethereum_labels_match_but_mixed_chain_labels_do_not(self) -> None:
         self.assertEqual(
             exchange_networks._network_profile({"network_code": "MEME-ERC20", "network_name": "Ethereum (ERC20)"}),
@@ -461,7 +485,8 @@ class TradeCalculationTests(unittest.TestCase):
             "instId": "ABC-USDT", "lotSz": "0.01", "minSz": "0.1",
         }]}, "ABC/USDT", market_order=True)
         mexc = market_rules.parse_market_rules("mexc", {"symbols": [{
-            "symbol": "ABCUSDT", "baseSizePrecision": "0.001", "quoteAmountPrecisionMarket": "5",
+            "symbol": "ABCUSDT", "baseAssetPrecision": 3,
+            "baseSizePrecision": "0.001", "quoteAmountPrecisionMarket": "5",
         }]}, "ABC/USDT", market_order=True)
 
         self.assertEqual(binance.quantity_step, Decimal("0.01"))
@@ -471,6 +496,29 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertEqual(bybit.min_notional, Decimal("5"))
         self.assertEqual(okx.min_quantity, Decimal("0.1"))
         self.assertEqual(mexc.quantity_step, Decimal("0.001"))
+        self.assertEqual(mexc.min_quantity, Decimal("0.001"))
+
+    def test_mexc_zero_minimum_quantity_uses_documented_base_decimal_precision_for_step(self) -> None:
+        mexc = market_rules.parse_market_rules("mexc", {"symbols": [{
+            "symbol": "GNSUSDT",
+            "status": "1",
+            "baseAssetPrecision": 2,
+            "baseSizePrecision": "0",
+            "quoteAmountPrecisionMarket": "1",
+            "filters": [{"filterType": "PERCENT_PRICE_BY_SIDE"}],
+        }]}, "GNS/USDT", market_order=True)
+
+        self.assertEqual(mexc.quantity_step, Decimal("0.01"))
+        self.assertEqual(mexc.min_quantity, Decimal("0"))
+        self.assertEqual(mexc.min_notional, Decimal("1"))
+
+    def test_mexc_missing_step_and_base_precision_remains_unknown(self) -> None:
+        with self.assertRaises(market_rules.UnknownMarketRules):
+            market_rules.parse_market_rules("mexc", {"symbols": [{
+                "symbol": "ABCUSDT",
+                "baseSizePrecision": "0",
+                "quoteAmountPrecisionMarket": "1",
+            }]}, "ABC/USDT", market_order=True)
 
     def test_unknown_withdraw_increment_is_rejected(self) -> None:
         with self.assertRaises(market_rules.UnknownMarketRules):
