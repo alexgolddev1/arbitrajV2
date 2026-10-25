@@ -101,6 +101,9 @@ TRANSFER_FEE_AMOUNT = (
 TRANSFER_FEE_CURRENCY = os.getenv("TRADER_TRANSFER_FEE_CURRENCY", "").strip().upper()
 MIN_NET_PROFIT_USDT = _decimal_setting("TRADER_MIN_NET_PROFIT_USDT", "0")
 PRICE_MOVE_RESERVE_PERCENT = _decimal_setting("TRADER_PRICE_MOVE_RESERVE_PERCENT", "0")
+# Do not use a route's historical result as evidence until it has enough closed trades.
+QUALITY_MIN_ROUTE_TRADES = max(1, int(os.getenv("TRADER_QUALITY_MIN_ROUTE_TRADES", "5")))
+QUALITY_MAX_BOOK_AGE_SECONDS = max(1.0, float(os.getenv("TRADER_QUALITY_MAX_BOOK_AGE_SECONDS", "30")))
 # Стоп-лосс в процентах от цены покупки; изменяйте значение здесь.
 STOP_LOSS_PERCENT = Decimal("0.5")
 # Cap one realized loss at 25% of the last four winning trades combined.

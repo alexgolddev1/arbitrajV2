@@ -141,10 +141,10 @@ class WebSocketQuoteFilterTests(unittest.TestCase):
 
 
 class MarketAndRouteTests(unittest.TestCase):
-    @patch("main.treider.trade.fetch_spot_market_rules")
-    @patch("main.treider.trade.fetch_spot_order_book")
-    @patch("main.treider.trade.TRADE_SIZE_CANDIDATES_USDT", (Decimal("100"), Decimal("25")))
-    @patch("main.treider.trade.MIN_NET_PROFIT_USDT", Decimal("0"))
+    @patch("main.treider.trade_checks.fetch_spot_market_rules")
+    @patch("main.treider.trade_checks.fetch_spot_order_book")
+    @patch("main.treider.trade_checks.TRADE_SIZE_CANDIDATES_USDT", (Decimal("100"), Decimal("25")))
+    @patch("main.treider.trade_checks.MIN_NET_PROFIT_USDT", Decimal("0"))
     def test_larger_size_rejected_on_sell_depth_while_smaller_size_is_selected(
         self, fetch_book: Mock, fetch_rules: Mock,
     ) -> None:
@@ -529,9 +529,9 @@ class TradeCalculationTests(unittest.TestCase):
             market_rules.floor_to_step(Decimal("1.239"), Decimal("0.05")), Decimal("1.20")
         )
 
-    @patch("main.treider.trade.fetch_market_sell_execution")
-    @patch("main.treider.trade.PRICE_MOVE_RESERVE_PERCENT", Decimal("0"))
-    @patch("main.treider.trade.MIN_NET_PROFIT_USDT", Decimal("0"))
+    @patch("main.treider.trade_checks.fetch_market_sell_execution")
+    @patch("main.treider.trade_checks.PRICE_MOVE_RESERVE_PERCENT", Decimal("0"))
+    @patch("main.treider.trade_checks.MIN_NET_PROFIT_USDT", Decimal("0"))
     def test_withdraw_rounding_preserves_dust_and_reprices_expected_profit(self, sell_execution: Mock) -> None:
         from main.treider import trade
 
@@ -542,8 +542,8 @@ class TradeCalculationTests(unittest.TestCase):
         sell_execution.return_value = SimpleNamespace(
             proceeds=Decimal("9.6") * Decimal("11"), average_price=Decimal("11"), remaining_quantity=Decimal(0),
         )
-        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "base"}), \
-                patch.object(trade, "fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
+        with patch.dict("main.treider.trade_checks.BUY_FEE_CURRENCY", {"binance": "base"}), \
+                patch("main.treider.trade_checks.fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
                     Decimal("0.01"), Decimal("0.01"), Decimal("1"), "test"
                 )):
             estimate = trade._estimate_trade(
@@ -556,9 +556,9 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertEqual(estimate.expected_sell_proceeds_usd, Decimal("105.6"))
         sell_execution.assert_called_once_with("mexc", "ABC/USDT", Decimal("9.6"))
 
-    @patch("main.treider.trade.fetch_market_sell_execution")
-    @patch("main.treider.trade.PRICE_MOVE_RESERVE_PERCENT", Decimal("1"))
-    @patch("main.treider.trade.MIN_NET_PROFIT_USDT", Decimal("0"))
+    @patch("main.treider.trade_checks.fetch_market_sell_execution")
+    @patch("main.treider.trade_checks.PRICE_MOVE_RESERVE_PERCENT", Decimal("1"))
+    @patch("main.treider.trade_checks.MIN_NET_PROFIT_USDT", Decimal("0"))
     def test_buy_fee_and_transfer_fee_reduce_sellable_quantity_and_profit(self, sell_execution: Mock) -> None:
         from main.treider import trade
 
@@ -569,8 +569,8 @@ class TradeCalculationTests(unittest.TestCase):
         def simulate(_exchange: str, _pair: str, qty: Decimal) -> SimpleNamespace:
             return SimpleNamespace(proceeds=qty * Decimal("11"), average_price=Decimal("11"), remaining_quantity=Decimal(0))
         sell_execution.side_effect = simulate
-        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "quote"}), \
-                patch.object(trade, "fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
+        with patch.dict("main.treider.trade_checks.BUY_FEE_CURRENCY", {"binance": "quote"}), \
+                patch("main.treider.trade_checks.fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
                     Decimal("0.01"), Decimal("0.01"), Decimal("1"), "test"
                 )):
             result = trade._estimate_trade(
@@ -583,9 +583,9 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertLess(result.expected_profit_before_reserve_usd, result.expected_sell_proceeds_usd)
         sell_execution.assert_called_once()
 
-    @patch("main.treider.trade.fetch_market_sell_execution")
-    @patch("main.treider.trade.PRICE_MOVE_RESERVE_PERCENT", Decimal("0"))
-    @patch("main.treider.trade.MIN_NET_PROFIT_USDT", Decimal("0"))
+    @patch("main.treider.trade_checks.fetch_market_sell_execution")
+    @patch("main.treider.trade_checks.PRICE_MOVE_RESERVE_PERCENT", Decimal("0"))
+    @patch("main.treider.trade_checks.MIN_NET_PROFIT_USDT", Decimal("0"))
     def test_base_currency_buy_and_transfer_fees_reduce_sell_quantity(
         self, sell_execution: Mock,
     ) -> None:
@@ -598,8 +598,8 @@ class TradeCalculationTests(unittest.TestCase):
         sell_execution.return_value = SimpleNamespace(
             proceeds=Decimal("100"), average_price=Decimal("10"), remaining_quantity=Decimal(0),
         )
-        with patch.dict(trade.BUY_FEE_CURRENCY, {"binance": "base"}), \
-                patch.object(trade, "fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
+        with patch.dict("main.treider.trade_checks.BUY_FEE_CURRENCY", {"binance": "base"}), \
+                patch("main.treider.trade_checks.fetch_spot_market_rules", return_value=market_rules.SpotMarketRules(
                     Decimal("0.01"), Decimal("0.01"), Decimal("1"), "test"
                 )):
             result = trade._estimate_trade(
@@ -611,7 +611,42 @@ class TradeCalculationTests(unittest.TestCase):
         self.assertEqual(result.quantity_after_fees, Decimal("9.88"))
         sell_execution.assert_called_once_with("mexc", "ABC/USDT", Decimal("9.88"))
 
-    @patch("main.treider.trade.connect_db")
+    @patch("main.treider.trade_checks.connect_db")
+    def test_active_position_blocks_second_entry_for_same_asset_and_buy_exchange(
+        self, connect: Mock,
+    ) -> None:
+        from main.treider import trade
+
+        cursor = Mock()
+        cursor.fetchone.side_effect = [
+            {"balance_usd": Decimal("100")},
+            None,
+        ]
+        cursor.fetchall.return_value = [{"source_pair": "WIN/USDT"}]
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connect.return_value = connection
+
+        result, reason = trade._prepare_training_trade(
+            {"source_pair": "WIN/USDT"}, 18,
+            SimpleNamespace(exchange="binance"), SimpleNamespace(exchange="mexc"),
+            Mock(), Mock(), 300,
+        )
+
+        self.assertIsNone(result)
+        self.assertIn("WIN", reason)
+        self.assertIn("binance", reason)
+        self.assertTrue(any(
+            "status IN ('pending', 'settling', 'partial', 'open')" in call.args[0]
+            and "LOWER(buy_exchange)" in call.args[0]
+            for call in cursor.execute.call_args_list
+        ))
+        self.assertFalse(any(
+            "INSERT INTO trader_training_settlements" in call.args[0]
+            for call in cursor.execute.call_args_list
+        ))
+
+    @patch("main.treider.trade_checks.connect_db")
     def test_duplicate_signal_with_existing_settlement_does_not_insert_again(self, connect: Mock) -> None:
         from main.treider import trade
 
