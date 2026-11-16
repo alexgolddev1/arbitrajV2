@@ -200,6 +200,7 @@ class OpportunityConfirmer:
         self._cycle_sources_with_two_quotes: set[int] = set()
         self._cycle_quote_updates: dict[str, int] = {}
         self._cycle_max_spread: Decimal | None = None
+        self._missing_transfer_profiles: set[tuple[int, str]] = set()
 
     def reset_cycle_stats(self) -> None:
         self._cycle_confirmed_sources.clear()
@@ -424,7 +425,18 @@ class OpportunityConfirmer:
                         network = TRANSFER_NETWORK_MAP.get(
                             buy[0].source_base_symbol, "UNKNOWN"
                         )
-                        transfer_seconds = self.transfer_emulator.get_emulated_duration(network)
+                        try:
+                            transfer_seconds = self.transfer_emulator.get_emulated_duration(network)
+                        except ValueError as error:
+                            profile_key = (source_id, network)
+                            if profile_key not in self._missing_transfer_profiles:
+                                logger.warning(
+                                    "Кандидат %s пропущен: %s; котировки продолжают обновляться",
+                                    buy[0].source_pair, error,
+                                )
+                                self._missing_transfer_profiles.add(profile_key)
+                            continue
+                        self._missing_transfer_profiles.discard((source_id, network))
                         pending = PendingEpisode(
                             started_at=now,
                             started_monotonic=time.monotonic(),

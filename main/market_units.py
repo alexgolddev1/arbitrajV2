@@ -91,6 +91,9 @@ def suggest_market_unit_scale(source_symbol: str, market_symbol: str) -> Decimal
     """Suggest a likely lot factor for the confirmation form; never applies it."""
     source = source_symbol.strip().upper()
     market = market_symbol.strip().upper()
+    if source and market and source != market and source.endswith(market):
+        inverse = suggest_market_unit_scale(market, source)
+        return Decimal(1) / inverse if inverse else None
     if not source or not market.endswith(source) or market == source:
         return None
     prefix = market[:-len(source)]

@@ -154,6 +154,20 @@ class MarketUnitTests(unittest.TestCase):
         self.assertIn("Подтвердить / сохранить", page)
         self.assertIn("Требует проверки", page)
 
+    def test_inverse_lot_suggestion_and_price_preview(self) -> None:
+        self.assertEqual(suggest_market_unit_scale("1000SATS", "SATS"), Decimal("0.001"))
+        page = _render_market_units_page([{
+            "exchange": "mexc", "exchange_name": "MEXC", "source_slug": "sats-ordinals",
+            "source_symbol": "1000SATS", "market_symbol": "SATS", "market_pair": "SATS/USDT",
+            "units_per_market_unit": "0.001", "suggestion": "0.001", "approved": False,
+            "market_price": Decimal("0.0000001"), "market_quote": "USDT",
+            "price_updated_at": "2026-11-16 12:00:00",
+        }])
+        self.assertIn("1 SATS = 0.001 1000SATS", page)
+        self.assertIn("0.0000001 USDT за 1 SATS", page)
+        self.assertIn("0.0001 USDT за 1 1000SATS", page)
+        self.assertIn("2026-11-16 12:00:00", page)
+
 
 if __name__ == "__main__":
     unittest.main()

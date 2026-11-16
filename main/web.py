@@ -253,7 +253,8 @@ def _load_market_unit_candidates() -> list[dict[str, Any]]:
             cursor.execute(
                 "SELECT venue.source_market_id, source.base_currency_slug AS source_slug, "
                 "source.base_symbol AS source_symbol, source.quote_symbol, "
-                "venue.exchange_slug, venue.exchange_name, venue.market_pair, venue.base_symbol "
+                "venue.exchange_slug, venue.exchange_name, venue.market_pair, venue.base_symbol, "
+                "venue.price AS market_price, venue.quote_symbol AS market_quote, venue.last_updated AS price_updated_at "
                 "FROM calculator_market_pairs AS venue "
                 "JOIN market_pairs AS source ON source.market_id = venue.source_market_id "
                 "WHERE LOWER(venue.category) = 'spot' AND venue.price IS NOT NULL AND venue.price > 0 "
@@ -288,8 +289,12 @@ def _load_market_unit_candidates() -> list[dict[str, Any]]:
                 "source_symbol": source_symbol,
                 "market_symbol": market_symbol,
                 "market_pair": str(row.get("market_pair") or ""),
+                "market_price": row.get("market_price"),
+                "market_quote": row.get("market_quote"),
+                "price_updated_at": row.get("price_updated_at"),
+                "suggestion": str(suggestion) if suggestion else None,
                 "units_per_market_unit": (
-                    approved["units_per_market_unit"] if approved else str(suggestion or "")
+                    approved["units_per_market_unit"] if approved else str(suggestion or "1")
                 ),
                 "approved": approved is not None,
                 "source_market_ids": set(),
@@ -348,6 +353,23 @@ def _render_market_units_page(candidates: list[dict[str, Any]], status: str = ""
     for item in candidates:
         state = "Подтверждено" if item["approved"] else "Требует проверки"
         ratio = html.escape(str(item["units_per_market_unit"]))
+        source = html.escape(item["source_symbol"])
+        market = html.escape(item["market_symbol"])
+        proposal = item.get("suggestion")
+        proposal_text = (
+            f"По названию: {html.escape(str(proposal))}" if proposal else
+            "Предположение: 1 (возможное другое имя; проверьте актив)"
+        )
+        example = f"1 {market} = {ratio} {source}"
+        price_text = "Нет цены"
+        normalized_text = "Нет оценки"
+        if item.get("market_price") is not None:
+            price = Decimal(str(item["market_price"]))
+            quote = html.escape(str(item.get("market_quote") or item["market_pair"].rsplit("/", 1)[-1]))
+            price_text = f"{format(price, 'f')} {quote} за 1 {market}"
+            scale = Decimal(str(item["units_per_market_unit"]))
+            if scale > 0:
+                normalized_text = f"{format(price / scale, 'f')} {quote} за 1 {source}"
         hidden = "".join(
             f'<input type="hidden" name="{key}" value="{html.escape(str(item[value]), quote=True)}">'
             for key, value in (("exchange", "exchange"), ("source_slug", "source_slug"),
@@ -364,9 +386,11 @@ def _render_market_units_page(candidates: list[dict[str, Any]], status: str = ""
             f"<td>{html.escape(item['exchange_name'])}<small>{html.escape(item['exchange'])}</small></td>"
             f"<td>{html.escape(item['source_symbol'])}<small>{html.escape(item['source_slug'] or 'без slug')}</small></td>"
             f"<td>{html.escape(item['market_pair'])}</td><td>{html.escape(item['market_symbol'])}</td>"
+            f"<td>{price_text}<small>{html.escape(str(item.get('price_updated_at') or 'Время неизвестно'))}</small></td>"
+            f"<td>{proposal_text}<small>{example}</small><small>Цена после пересчёта: {normalized_text}</small></td>"
             f"<td>{html.escape(state)}</td><td><form method=\"post\" class=\"inline-form\">"
             '<input type="hidden" name="action" value="save">' + hidden +
-            f'<label>Монет источника на 1 лот <input name="units_per_market_unit" value="{ratio}" required inputmode="decimal"></label>'
+            f'<label>Сколько {source} в 1 {market}<input name="units_per_market_unit" value="{ratio}" required inputmode="decimal"></label>'
             '<button type="submit">Подтвердить / сохранить</button></form>' + remove_form + "</td></tr>"
         )
     message = "Коэффициент сохранён и пересчёт обновлён." if status == "saved" else "Подтверждение удалено." if status == "removed" else ""
@@ -374,8 +398,8 @@ def _render_market_units_page(candidates: list[dict[str, Any]], status: str = ""
 <title>Единицы рынков</title><style>
 body{{margin:0;background:#0b1220;color:#e5e7eb;font:15px system-ui,sans-serif}}header,main{{padding:22px 4vw}}nav{{display:flex;gap:10px;flex-wrap:wrap}}nav a,button{{padding:8px 12px;border:1px solid #334155;border-radius:8px;background:#111b2e;color:#7dd3fc;text-decoration:none;cursor:pointer}}.note{{color:#9ca3af;max-width:1000px;line-height:1.5}}.ok{{color:#67e8a5}}.table-wrap{{overflow:auto;border:1px solid #26334a;border-radius:10px}}table{{width:100%;border-collapse:collapse;min-width:950px;background:#111b2e}}th,td{{padding:12px;text-align:left;border-bottom:1px solid #26334a;vertical-align:top}}th{{color:#9fb4d0}}small{{display:block;color:#9ca3af;margin-top:4px}}input{{display:block;width:170px;margin:5px 0;padding:8px;border:1px solid #475569;border-radius:6px;background:#0b1220;color:#e5e7eb}}.inline-form{{display:flex;align-items:end;gap:8px;flex-wrap:wrap}}.inline-form label{{color:#cbd5e1}}.empty{{padding:20px;color:#9ca3af}}
 </style></head><body><header><nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/trader">Трейдер</a><a href="/market-units">Единицы рынков</a></nav><h1>Подтверждение единиц рынка</h1>
-<p class="note">Биржа может показывать цену за лот из нескольких монет, например 1MBABYDOGE. Предложенное число — только подсказка. Проверьте его и подтвердите вручную. Неизвестные соответствия исключаются из сравнения; сохранённые правила применяются к спреду и WebSocket. Демотрейдер пока не открывает сделки для рынков с такими лотами.</p>
-<p class="ok">{html.escape(message)}</p></header><main><div class="table-wrap"><table><thead><tr><th>Биржа</th><th>Валюта скринера</th><th>Рынок биржи</th><th>Тикер рынка</th><th>Состояние</th><th>Коэффициент / действие</th></tr></thead><tbody>{''.join(rows) if rows else '<tr><td colspan="6" class="empty">Несовпадений базовой валюты не найдено.</td></tr>'}</tbody></table></div></main></body></html>"""
+<p class="note">Биржа может показывать цену за лот из нескольких монет, например 1MBABYDOGE. Коэффициент означает количество единиц валюты скринера в одной единице рынка биржи. Например, для скринера 1000SATS и рынка SATS: 1 SATS = 0.001 1000SATS. Цена пересчитывается делением на коэффициент. Для другого имени без числового префикса предлагается 1 — это предположение, а не проверенное соответствие. Цены взяты из сохранённого снимка, это не котировки в реальном времени. Предложенное число — только подсказка. Проверьте его и подтвердите вручную. Неизвестные соответствия исключаются из сравнения; сохранённые правила применяются к спреду и WebSocket. Демотрейдер пока не открывает сделки для рынков с такими лотами.</p>
+<p class="ok">{html.escape(message)}</p></header><main><div class="table-wrap"><table><thead><tr><th>Биржа</th><th>Валюта скринера</th><th>Рынок биржи</th><th>Тикер рынка</th><th>Цена рынка / время снимка</th><th>Предложение программы / пересчёт</th><th>Состояние</th><th>Коэффициент / действие</th></tr></thead><tbody>{''.join(rows) if rows else '<tr><td colspan="8" class="empty">Несовпадений базовой валюты не найдено.</td></tr>'}</tbody></table></div></main></body></html>"""
 
 
 def _load_worker_status() -> dict[str, str]:
