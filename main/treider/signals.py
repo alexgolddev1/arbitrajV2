@@ -15,6 +15,7 @@ class TradeSide(TypedDict):
     price: str
     available_base_quantity: str
     available_quote_amount: str
+    units_per_market_unit: str
 
 
 class OpportunitySignal(TypedDict):
@@ -38,6 +39,7 @@ def _side(
     market_pair: str,
     price: Decimal,
     available_base_quantity: Decimal,
+    units_per_market_unit: Decimal,
 ) -> TradeSide:
     return {
         "exchange": exchange,
@@ -45,6 +47,7 @@ def _side(
         "price": str(price),
         "available_base_quantity": str(available_base_quantity),
         "available_quote_amount": str(price * available_base_quantity),
+        "units_per_market_unit": str(units_per_market_unit),
     }
 
 
@@ -68,6 +71,8 @@ def build_opportunity_signal(
     estimated_transfer_seconds: float,
     started_at_utc: str,
     lifetime_seconds: float,
+    buy_unit_count: Decimal = Decimal(1),
+    sell_unit_count: Decimal = Decimal(1),
 ) -> tuple[str, OpportunitySignal]:
     """Return an idempotency key and the complete JSON-ready opportunity."""
     payload: OpportunitySignal = {
@@ -78,8 +83,8 @@ def build_opportunity_signal(
         "threshold_percent": str(threshold_percent),
         "spread_percent": str(spread_percent),
         "max_spread_percent": str(max_spread_percent),
-        "buy": _side(buy_exchange, buy_market_pair, buy_price, buy_size),
-        "sell": _side(sell_exchange, sell_market_pair, sell_price, sell_size),
+        "buy": _side(buy_exchange, buy_market_pair, buy_price, buy_size, buy_unit_count),
+        "sell": _side(sell_exchange, sell_market_pair, sell_price, sell_size, sell_unit_count),
         "network": network,
         "estimated_transfer_seconds": estimated_transfer_seconds,
         "opportunity_started_at_utc": started_at_utc,
@@ -118,4 +123,13 @@ def validate_opportunity_signal(payload: dict[str, Any]) -> OpportunitySignal:
             raise ValueError(
                 f"котируемая валюта пары {side_name} не совпадает с {payload['source_pair']}"
             )
+    for side_name in ("buy", "sell"):
+        side = payload[side_name]
+        try:
+            units = Decimal(str(side.get("units_per_market_unit", "1")))
+        except Exception as error:
+            raise ValueError(f"Некорректный коэффициент единиц в {side_name}") from error
+        if not units.is_finite() or units <= 0:
+            raise ValueError(f"Некорректный коэффициент единиц в {side_name}")
+        side.setdefault("units_per_market_unit", str(units))
     return payload  # type: ignore[return-value]

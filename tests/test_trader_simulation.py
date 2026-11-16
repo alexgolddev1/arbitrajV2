@@ -701,6 +701,7 @@ class TradeCalculationTests(unittest.TestCase):
                 "remaining_quantity": Decimal("3"), "sold_quantity": Decimal("0"),
                 "sell_proceeds_accumulated_usd": Decimal("0"),
                 "sell_fees_accumulated_usd": Decimal("0"), "buy_debit_usd": Decimal("30"),
+                "return_transfer_fees_accumulated_usd": Decimal("0.75"),
                 "settlement_attempts": 1, "planned_sell_at": None,
             },
             {"elapsed_seconds": 10},
@@ -733,7 +734,7 @@ class TradeCalculationTests(unittest.TestCase):
         values = updates[0].args[1]
         self.assertEqual(values[0], "partial")
         self.assertEqual(values[1], "stop_loss")
-        self.assertEqual(values[7], Decimal("-0.020"))
+        self.assertEqual(values[7], Decimal("-0.770"))
         self.assertEqual(values[9], Decimal("69.98000000"))
         self.assertEqual(values[16], Decimal("1"))
         sell_execution.assert_called_once_with("mexc", "ABC/USDT", Decimal("3"))

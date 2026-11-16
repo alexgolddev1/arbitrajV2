@@ -31,6 +31,7 @@ from main.treider.market_data import (
     simulate_market_sell,
 )
 from main.treider.config import TRANSFER_FEE_AMOUNT
+from main.treider.return_transfer import record_pending_return_transfer
 from main.treider.market_rules import fetch_spot_market_rules, floor_to_step
 from main.treider.trade_checks import (
     TradeEstimate, _base_currency, _estimate_trade, _prepare_training_trade,
@@ -389,7 +390,7 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             cursor.execute(
                 "SELECT status, claim_token, position_status, remaining_quantity, sold_quantity, "
                 "sell_proceeds_accumulated_usd, sell_fees_accumulated_usd, buy_debit_usd, bought_quantity, "
-                "cost_basis_sold_usd, cost_basis_remaining_usd, "
+                "cost_basis_sold_usd, cost_basis_remaining_usd, return_transfer_fees_accumulated_usd, "
                 "settlement_attempts, planned_sell_at, asset_exchange FROM trader_training_settlements "
                 "WHERE settlement_id = %s FOR UPDATE",
                 (trade_id,),
@@ -425,7 +426,11 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             )
             remaining_cost -= cost_sold
             accumulated_cost_sold = Decimal(str(state.get("cost_basis_sold_usd") or 0)) + cost_sold
-            realized_profit = accumulated_proceeds - accumulated_sell_fees - accumulated_cost_sold
+            return_transfer_fees = Decimal(str(state.get("return_transfer_fees_accumulated_usd") or 0))
+            realized_profit = (
+                accumulated_proceeds - accumulated_sell_fees - accumulated_cost_sold
+                - return_transfer_fees
+            )
             balance_after = (balance_before + proceeds - sell_fee).quantize(Decimal("0.00000001"))
             if per_exchange:
                 asset = _base_currency(trade["source_pair"])
@@ -445,10 +450,18 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
             sold_total = Decimal(str(state.get("sold_quantity") or 0)) + filled
             sale_key = format(sold_total, "f")
             snapshot = getattr(execution, "book_snapshot", None)
-            _log_demo_event(cursor, trade_id, int(trade["signal_id"]), f"{trade_id}:sell:{sale_key}", "sell", location, trade["sell_market_pair"], _base_currency(trade["source_pair"]), filled, execution.average_price, proceeds, book_snapshot=snapshot, run_id=event_run_id)
+            sale_event_key = f"{trade_id}:sell:{sale_key}"
+            _log_demo_event(cursor, trade_id, int(trade["signal_id"]), sale_event_key, "sell", location, trade["sell_market_pair"], _base_currency(trade["source_pair"]), filled, execution.average_price, proceeds, book_snapshot=snapshot, run_id=event_run_id)
             _log_demo_event(cursor, trade_id, int(trade["signal_id"]), f"{trade_id}:commission:sell:{sale_key}", "commission", location, trade["sell_market_pair"], "USDT", fee_amount=sell_fee, fee_asset="USDT", quote_amount=sell_fee, book_snapshot=snapshot, run_id=event_run_id)
             _log_demo_event(cursor, trade_id, int(trade["signal_id"]), f"{trade_id}:balance:sell:coin:{sale_key}", "balance_change", location, asset=_base_currency(trade["source_pair"]), quantity=-filled, run_id=event_run_id)
             _log_demo_event(cursor, trade_id, int(trade["signal_id"]), f"{trade_id}:balance:sell:usdt:{sale_key}", "balance_change", location, asset="USDT", quantity=proceeds - sell_fee, balance_before=balance_before, balance_after=balance_after, run_id=event_run_id)
+            if per_exchange and location != buy_exchange:
+                record_pending_return_transfer(
+                    cursor, settlement_id=trade_id, signal_id=int(trade["signal_id"]),
+                    run_id=str(event_run_id or DEMO_RUN_ID), sale_event_key=sale_event_key,
+                    source_exchange=location, destination_exchange=buy_exchange,
+                    amount_usdt=proceeds - sell_fee,
+                )
             exceeded_wait = False
             if remaining > 0:
                 cursor.execute(
@@ -557,6 +570,25 @@ def process_trade(
         f"покупка={buy_book.exchange} ask={buy_book.ask}, "
         f"продажа={sell_book.exchange} bid={sell_book.bid}"
     )
+    try:
+        buy_unit_count = Decimal(str(signal.get("buy", {}).get("units_per_market_unit", "1")))
+        sell_unit_count = Decimal(str(signal.get("sell", {}).get("units_per_market_unit", "1")))
+    except Exception:
+        logger.warning("Торговая симуляция отклонена: неверный коэффициент единиц рынка; %s", context)
+        return "rejected", "неверный коэффициент единиц рынка"
+    source_base = _base_currency(signal["source_pair"])
+    buy_base = _base_currency(str(signal.get("buy", {}).get("market_pair", "")))
+    sell_base = _base_currency(str(signal.get("sell", {}).get("market_pair", "")))
+    if (
+        buy_unit_count != 1 or sell_unit_count != 1
+        or buy_base != source_base or sell_base != source_base
+    ):
+        reason = (
+            "тикер или размер лота биржи отличается от валюты скринера; деморасчёт пока не переводит "
+            "шаги количества, комиссии и минимум вывода между единицами рынка"
+        )
+        logger.info("Торговая симуляция отклонена до покупки: %s; %s", reason, context)
+        return "rejected", reason
     if buy_fees is None or sell_fees is None:
         logger.warning("Торговый расчёт пропущен: не получена комиссия одной или обеих бирж; %s", context)
         return "rejected", "не получены торговые комиссии"

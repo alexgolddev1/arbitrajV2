@@ -7,6 +7,8 @@ from decimal import Decimal
 from typing import Any
 
 from config import CALCULATOR_SPREAD_LEVELS
+from main.treider.config import TRAINING_MODE
+from main.treider.return_transfer import check_return_route, validate_return_route
 from main.treider.fees import get_trade_fee_rates
 from main.treider.market_data import fetch_current_spread
 from main.treider.network_check import check_transfer_network
@@ -55,6 +57,28 @@ def process_opportunity(payload: dict[str, Any], signal_id: int) -> tuple[str, s
         return "rejected", "нет доступного маршрута"
     if transfer.get("withdraw_fee") is None:
         return "rejected", "недостаточно данных: неизвестна комиссия перевода"
+
+    if TRAINING_MODE and buy["exchange"].strip().lower() != sell["exchange"].strip().lower():
+        try:
+            raw_return_route = check_return_route(sell["exchange"], buy["exchange"])
+        except Exception as error:
+            logger.exception("Не удалось проверить обратный демомаршрут USDT; %s", context)
+            raise TemporaryProcessingError(f"временная ошибка проверки обратной сети USDT: {error}") from error
+        if not raw_return_route.get("available") and raw_return_route.get("errors"):
+            raise TemporaryProcessingError(
+                f"не удалось проверить обратную сеть USDT; ошибки API: {raw_return_route['errors']}"
+            )
+        return_route, return_error = validate_return_route(raw_return_route)
+        if return_error:
+            logger.warning("Обратный демомаршрут USDT не прошёл проверку: %s; %s", return_error, context)
+            return "rejected", return_error
+        transfer["return_transfer"] = return_route
+        logger.info(
+            "Обратный демомаршрут USDT: %s → %s, сеть=%s, комиссия=%s USDT, минимум=%s USDT, задержка=%.1f сек.; %s",
+            return_route["source_exchange"], return_route["destination_exchange"],
+            return_route.get("network") or "?", return_route["withdraw_fee"],
+            return_route["min_withdraw"], float(return_route["estimated_seconds"]), context,
+        )
 
     logger.info(
         "Маршрут перевода найден: %s → %s, сеть=%s, оценка=%.1f сек., "

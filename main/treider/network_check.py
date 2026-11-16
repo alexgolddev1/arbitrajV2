@@ -64,11 +64,14 @@ def _fetch_routes(currency: str, source: str, destination: str) -> dict[str, Any
     return result
 
 
-def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
+def check_transfer_network_for_currency(
+    currency: str, source_exchange: str, destination_exchange: str,
+    *, require_withdrawal_limits: bool = False,
+) -> dict[str, Any]:
     """Return an explicitly selected route, preferring verified routes over assumptions."""
-    currency = _currency_from_pair(signal["source_pair"])
-    source = str(signal["buy"]["exchange"]).strip().lower()
-    destination = str(signal["sell"]["exchange"]).strip().lower()
+    currency = str(currency).strip().upper()
+    source = str(source_exchange).strip().lower()
+    destination = str(destination_exchange).strip().lower()
     result = _fetch_routes(currency, source, destination)
     routes = result.get("routes") or []
     if not routes:
@@ -82,9 +85,17 @@ def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
         }
 
     requested_profile = TRANSFER_NETWORK_MAP.get(currency) or TRANSFER_NETWORK
+
+    def has_withdrawal_limits(route: dict[str, Any]) -> bool:
+        minimum = route.get("min_withdraw")
+        if minimum in (None, ""):
+            minimum = (route.get("source_network") or {}).get("min_withdraw")
+        return route.get("withdraw_fee") not in (None, "") and minimum not in (None, "")
+
     selected = sorted(
         routes,
         key=lambda route: (
+            0 if not require_withdrawal_limits or has_withdrawal_limits(route) else 1,
             0 if requested_profile and route.get("network_profile") == requested_profile else 1,
             {"confirmed": 0, "unconfirmed": 1, "disabled": 2}.get(route.get("route_status"), 3),
             route.get("network_profile", ""),
@@ -126,3 +137,12 @@ def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
         "assumed_destination": bool(selected.get("destination_assumed")),
         "errors": result.get("errors") or {},
     }
+
+
+def check_transfer_network(signal: dict[str, Any]) -> dict[str, Any]:
+    """Check the asset route from the buy exchange to the sell exchange."""
+    return check_transfer_network_for_currency(
+        _currency_from_pair(signal["source_pair"]),
+        str(signal["buy"]["exchange"]),
+        str(signal["sell"]["exchange"]),
+    )

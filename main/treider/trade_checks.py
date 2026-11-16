@@ -46,6 +46,7 @@ class TradeEstimate:
     expected_profit_after_reserve_usd: Decimal
     shortfall_usd: Decimal
     available_balance_usd: Decimal
+    return_transfer_fee_usd: Decimal = Decimal(0)
     buy_book_snapshot: dict[str, Any] | None = None
     sell_book_snapshot: dict[str, Any] | None = None
 
@@ -123,7 +124,10 @@ def _risk_limited_stop_price(
     net_sell_factor = Decimal(1) - sell_fee_rate
     if sellable_quantity <= 0 or net_sell_factor <= 0:
         raise ValueError("Нельзя рассчитать ограничение убытка без объёма продажи и ставки комиссии")
-    buy_debit = estimate.buy_cost_usd + estimate.buy_fee_usd + estimate.transfer_fee_usd
+    buy_debit = (
+        estimate.buy_cost_usd + estimate.buy_fee_usd + estimate.transfer_fee_usd
+        + estimate.return_transfer_fee_usd
+    )
     risk_floor = (buy_debit - loss_budget) / (sellable_quantity * net_sell_factor)
     return max(calculate_stop_loss_price(buy_price), risk_floor, Decimal("0.000000000000000001"))
 
@@ -239,8 +243,26 @@ def _estimate_trade(
     expected_sell_proceeds = execution.proceeds
     expected_sell_fee = expected_sell_proceeds * sell_rate
     transfer_fee_usd = quote_transfer_fee
+    return_transfer_fee_usd = Decimal(0)
+    return_route = (transfer or {}).get("return_transfer")
+    if buy.exchange.lower() != sell.exchange.lower() and return_route is not None:
+        from main.treider.return_transfer import validate_return_route
+
+        return_route, return_error = validate_return_route(return_route)
+        if return_error:
+            raise ValueError(return_error)
+        if not return_route.get("same_exchange"):
+            return_transfer_fee_usd = Decimal(str(return_route["withdraw_fee"]))
+            return_minimum = Decimal(str(return_route["min_withdraw"]))
+            return_amount = expected_sell_proceeds - expected_sell_fee
+            if return_amount < return_minimum:
+                raise ValueError(
+                    f"Ожидаемая выручка {return_amount} USDT ниже минимума обратного вывода "
+                    f"{return_minimum} USDT"
+                )
     expected_profit_before_reserve = (
         expected_sell_proceeds - expected_sell_fee - buy_cost - buy_fee - transfer_fee_usd
+        - return_transfer_fee_usd
     )
     reserve = buy_cost * PRICE_MOVE_RESERVE_PERCENT / Decimal(100)
     expected_profit_after_reserve = expected_profit_before_reserve - reserve
@@ -257,6 +279,7 @@ def _estimate_trade(
         transfer_fee_amount=transfer_fee,
         transfer_fee_currency=transfer_fee_currency or "USDT",
         transfer_fee_usd=transfer_fee_usd,
+        return_transfer_fee_usd=return_transfer_fee_usd,
         expected_sell_fee_usd=expected_sell_fee,
         expected_profit_before_reserve_usd=expected_profit_before_reserve,
         price_reserve_usd=reserve,
@@ -284,7 +307,10 @@ def _should_enter_by_quality(
     min_route_trades: int = QUALITY_MIN_ROUTE_TRADES,
 ) -> EntryQualityAssessment:
     """Combine current net economics with route history without inventing certainty."""
-    debit = estimate.buy_cost_usd + estimate.buy_fee_usd + estimate.transfer_fee_usd
+    debit = (
+        estimate.buy_cost_usd + estimate.buy_fee_usd + estimate.transfer_fee_usd
+        + estimate.return_transfer_fee_usd
+    )
     roi = (
         estimate.expected_profit_after_reserve_usd / debit * Decimal(100)
         if debit > 0 else Decimal(0)
@@ -567,13 +593,14 @@ def _prepare_training_trade(
                 "buy_cost_usd, buy_fee_usd, expected_sell_fee_usd, expected_profit_usd, "
                 "balance_before_usd, settle_after_utc, status, route_status, route_assumptions, network_name, "
                 "transfer_seconds, buy_fee_source, sell_fee_source, buy_fee_currency, buy_fee_base_quantity, "
-                "transfer_fee_amount, transfer_fee_currency, transfer_fee_usd, bought_quantity, quantity_after_fees, transfer_dust_quantity, remaining_quantity, "
+                "transfer_fee_amount, transfer_fee_currency, transfer_fee_usd, return_transfer_fee_usd, "
+                "bought_quantity, quantity_after_fees, transfer_dust_quantity, remaining_quantity, "
                 "expected_sell_proceeds_usd, expected_profit_before_reserve_usd, price_reserve_usd, "
                 "expected_profit_after_reserve_usd, buy_debit_usd, purchase_model, position_status, asset_exchange, "
                 "planned_sell_at, retry_started_at"
                 ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', "
                 "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                "%s, 'marketable-limit-at-best-ask', 'pending_transfer', %s, %s, NULL)",
+                "%s, %s, 'marketable-limit-at-best-ask', 'pending_transfer', %s, %s, NULL)",
                 (
                     signal_id, signal["source_pair"], buy.exchange, buy.market_pair,
                     sell.exchange, sell.market_pair, estimate.quantity, estimate.buy_average_price, take_profit_price, stop_loss_price,
@@ -585,6 +612,7 @@ def _prepare_training_trade(
                     buy_fees.source, sell_fees.source,
                     BUY_FEE_CURRENCY[buy.exchange], estimate.buy_fee_base_quantity,
                     estimate.transfer_fee_amount, estimate.transfer_fee_currency, estimate.transfer_fee_usd,
+                    estimate.return_transfer_fee_usd,
                     estimate.quantity, estimate.quantity_after_fees, estimate.transfer_dust_quantity, estimate.quantity_after_fees,
                     estimate.expected_sell_proceeds_usd, estimate.expected_profit_before_reserve_usd,
                     estimate.price_reserve_usd, estimate.expected_profit_after_reserve_usd,

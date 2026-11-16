@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS trader_training_settlements (
     expected_profit_after_reserve_usd DECIMAL(38, 12) NOT NULL DEFAULT 0,
     sell_proceeds_accumulated_usd DECIMAL(38, 12) NOT NULL DEFAULT 0,
     sell_fees_accumulated_usd DECIMAL(38, 12) NOT NULL DEFAULT 0,
+    return_transfer_fee_usd DECIMAL(38, 12) NOT NULL DEFAULT 0,
+    return_transfer_fees_accumulated_usd DECIMAL(38, 12) NOT NULL DEFAULT 0,
     buy_debit_usd DECIMAL(38, 12) NOT NULL DEFAULT 0,
     purchase_model VARCHAR(64) NOT NULL DEFAULT 'legacy',
     position_status ENUM('legacy', 'pending_transfer', 'ready_to_sell', 'partial', 'stop_loss', 'closed', 'open') NOT NULL DEFAULT 'legacy',
@@ -136,6 +138,37 @@ CREATE TABLE IF NOT EXISTS trader_asset_transfers (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_trader_asset_transfer_settlement (settlement_id),
     CONSTRAINT fk_trader_asset_transfer_settlement
+        FOREIGN KEY (settlement_id) REFERENCES trader_training_settlements (settlement_id)
+        ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS trader_demo_return_transfers (
+    return_transfer_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    settlement_id BIGINT UNSIGNED NOT NULL,
+    signal_id BIGINT UNSIGNED NOT NULL,
+    run_id CHAR(36) NOT NULL,
+    sale_event_key VARCHAR(191) NOT NULL,
+    source_exchange VARCHAR(32) NOT NULL,
+    destination_exchange VARCHAR(32) NOT NULL,
+    amount_usdt DECIMAL(38, 12) NOT NULL,
+    fee_usdt DECIMAL(38, 12) NULL,
+    network_name VARCHAR(64) NULL,
+    network_profile VARCHAR(64) NULL,
+    route_status VARCHAR(24) NULL,
+    transfer_seconds DECIMAL(12, 3) NULL,
+    due_at_utc DATETIME(6) NULL,
+    status ENUM('pending', 'in_transit', 'completed', 'blocked') NOT NULL DEFAULT 'pending',
+    attempt_count INT UNSIGNED NOT NULL DEFAULT 0,
+    next_attempt_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    claimed_at_utc DATETIME(6) NULL,
+    claim_token CHAR(36) NULL,
+    last_error TEXT NULL,
+    created_at_utc DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    sent_at_utc DATETIME(6) NULL,
+    completed_at_utc DATETIME(6) NULL,
+    UNIQUE KEY uq_trader_demo_return_sale (sale_event_key),
+    INDEX idx_trader_demo_return_due (status, next_attempt_at_utc, due_at_utc),
+    CONSTRAINT fk_trader_demo_return_settlement
         FOREIGN KEY (settlement_id) REFERENCES trader_training_settlements (settlement_id)
         ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

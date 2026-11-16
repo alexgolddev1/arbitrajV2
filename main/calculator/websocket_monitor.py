@@ -33,6 +33,7 @@ from main.treider.tran_emulation import TransferTimeEmulator
 from main.treider.config import MIN_OPPORTUNITY_LIFETIME_SECONDS
 from main.treider.queue import enqueue as enqueue_trader_signal
 from main.treider.signals import build_opportunity_signal
+from main.market_units import get_market_unit_scale
 from .mexc_proto import PushDataV3ApiWrapper
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,10 @@ class Quote:
     ask: Decimal
     bid_size: Decimal
     ask_size: Decimal
+    native_bid: Decimal
+    native_ask: Decimal
+    native_bid_size: Decimal
+    native_ask_size: Decimal
     received_at: float
 
 
@@ -108,13 +113,27 @@ def _symbol_pair(market_pair: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
-def _unit_count(pair_base: str) -> Decimal:
-    match = re.match(r"^(\d+)(?=[A-Z])", pair_base)
-    if match:
-        count = Decimal(match.group(1))
-        if count > 0:
-            return count
-    return Decimal(1)
+def _normalized_quote(
+    instrument: Instrument,
+    bid: Decimal,
+    ask: Decimal,
+    bid_size: Decimal,
+    ask_size: Decimal,
+    received_at: float,
+) -> Quote:
+    if bid > 0 and ask > 0 and bid > ask:
+        bid_size = ask_size = Decimal(0)
+    return Quote(
+        bid / instrument.unit_count if bid > 0 else Decimal(0),
+        ask / instrument.unit_count if ask > 0 else Decimal(0),
+        max(Decimal(0), bid_size * instrument.unit_count),
+        max(Decimal(0), ask_size * instrument.unit_count),
+        bid,
+        ask,
+        max(Decimal(0), bid_size),
+        max(Decimal(0), ask_size),
+        received_at,
+    )
 
 
 def _load_instruments() -> list[Instrument]:
@@ -136,6 +155,17 @@ def _load_instruments() -> list[Instrument]:
             or SCREENER_QUOTE_SYMBOLS and quote_symbol not in SCREENER_QUOTE_SYMBOLS
         ):
             continue
+        unit_count = get_market_unit_scale(
+            exchange, str(row.get("source_base_currency_slug") or ""),
+            str(row["source_base_symbol"] or ""), base,
+        )
+        if unit_count is None:
+            logger.debug(
+                "WebSocket-рынок исключён до подтверждения единиц: биржа=%s, "
+                "исходная валюта=%s, рынок=%s",
+                exchange, row["source_base_symbol"], base,
+            )
+            continue
         symbol = f"{base}{quote_symbol}"
         if exchange == "okx":
             symbol = f"{base}-{quote_symbol}"
@@ -147,7 +177,7 @@ def _load_instruments() -> list[Instrument]:
             exchange_name=str(row["exchange_name"] or exchange.upper()),
             market_pair=market_pair,
             symbol=symbol,
-            unit_count=_unit_count(base),
+            unit_count=unit_count,
         ))
     return instruments
 
@@ -254,14 +284,8 @@ class OpportunityConfirmer:
         key = (exchange, symbol.upper())
         for instrument in self.by_exchange_symbol.get(key, ()):
             self._cycle_quote_updates[exchange] = self._cycle_quote_updates.get(exchange, 0) + 1
-            if bid_price > 0 and ask_price > 0 and bid_price > ask_price:
-                bid_quantity = ask_quantity = Decimal(0)
-            normalized = Quote(
-                bid_price / instrument.unit_count if bid_price > 0 else Decimal(0),
-                ask_price / instrument.unit_count if ask_price > 0 else Decimal(0),
-                max(Decimal(0), bid_quantity),
-                max(Decimal(0), ask_quantity),
-                time.monotonic(),
+            normalized = _normalized_quote(
+                instrument, bid_price, ask_price, bid_quantity, ask_quantity, time.monotonic(),
             )
             self.quotes[(instrument.source_id, instrument.exchange)] = normalized
             await self._evaluate(instrument.source_id)
@@ -411,10 +435,10 @@ class OpportunityConfirmer:
                             spread=spread,
                             buy_exchange=buy[0].exchange_name,
                             buy_market_pair=buy[0].market_pair,
-                            buy_price=buy[1].ask,
+                            buy_price=buy[1].native_ask,
                             sell_exchange=sell[0].exchange_name,
                             sell_market_pair=sell[0].market_pair,
-                            sell_price=sell[1].bid,
+                            sell_price=sell[1].native_bid,
                         )
                         self.pending[episode_key] = pending
                         episode_id = await asyncio.to_thread(
@@ -426,10 +450,10 @@ class OpportunityConfirmer:
                             max_spread_percent=spread,
                             buy_exchange=buy[0].exchange_name,
                             buy_market_pair=buy[0].market_pair,
-                            buy_price=buy[1].ask,
+                            buy_price=buy[1].native_ask,
                             sell_exchange=sell[0].exchange_name,
                             sell_market_pair=sell[0].market_pair,
-                            sell_price=sell[1].bid,
+                            sell_price=sell[1].native_bid,
                             started_at=now,
                             last_confirmed_at=now,
                             transfer_seconds=transfer_seconds,
@@ -437,8 +461,8 @@ class OpportunityConfirmer:
                         if episode_id is not None:
                             episode = Episode(
                                 episode_id, now, pending.started_monotonic, spread, now, now, spread,
-                                buy[0].exchange_name, buy[0].market_pair, buy[1].ask, buy[1].ask_size,
-                                sell[0].exchange_name, sell[0].market_pair, sell[1].bid, sell[1].bid_size,
+                                buy[0].exchange_name, buy[0].market_pair, buy[1].native_ask, buy[1].native_ask_size,
+                                sell[0].exchange_name, sell[0].market_pair, sell[1].native_bid, sell[1].native_bid_size,
                                 network, transfer_seconds,
                             )
                             self.episodes[episode_key] = episode
@@ -463,10 +487,10 @@ class OpportunityConfirmer:
                         pending.spread = spread
                         pending.buy_exchange = buy[0].exchange_name
                         pending.buy_market_pair = buy[0].market_pair
-                        pending.buy_price = buy[1].ask
+                        pending.buy_price = buy[1].native_ask
                         pending.sell_exchange = sell[0].exchange_name
                         pending.sell_market_pair = sell[0].market_pair
-                        pending.sell_price = sell[1].bid
+                        pending.sell_price = sell[1].native_bid
                         pending.below_entry_threshold = False
 
                     if time.monotonic() - pending.started_monotonic >= pending.transfer_seconds:
@@ -482,12 +506,12 @@ class OpportunityConfirmer:
                     episode.spread = spread
                     episode.buy_exchange = buy[0].exchange_name
                     episode.buy_market_pair = buy[0].market_pair
-                    episode.buy_price = buy[1].ask
-                    episode.buy_size = buy[1].ask_size
+                    episode.buy_price = buy[1].native_ask
+                    episode.buy_size = buy[1].native_ask_size
                     episode.sell_exchange = sell[0].exchange_name
                     episode.sell_market_pair = sell[0].market_pair
-                    episode.sell_price = sell[1].bid
-                    episode.sell_size = sell[1].bid_size
+                    episode.sell_price = sell[1].native_bid
+                    episode.sell_size = sell[1].native_bid_size
                     episode.below_entry_threshold = False
                     # Life is measured independently of the simulated transfer countdown.
                     elapsed_seconds = time.monotonic() - episode.started_monotonic
@@ -506,10 +530,12 @@ class OpportunityConfirmer:
                             buy_market_pair=episode.buy_market_pair,
                             buy_price=episode.buy_price,
                             buy_size=episode.buy_size,
+                            buy_unit_count=buy[0].unit_count,
                             sell_exchange=episode.sell_exchange,
                             sell_market_pair=episode.sell_market_pair,
                             sell_price=episode.sell_price,
                             sell_size=episode.sell_size,
+                            sell_unit_count=sell[0].unit_count,
                             network=episode.network,
                             estimated_transfer_seconds=episode.transfer_seconds,
                             started_at_utc=episode.started_at.isoformat(sep=" "),
@@ -533,10 +559,10 @@ class OpportunityConfirmer:
                     episode.last_confirmed_at = now
                     episode.spread = spread
                     episode.max_spread = max(episode.max_spread, spread)
-                    episode.buy_price = buy[1].ask
-                    episode.buy_size = buy[1].ask_size
-                    episode.sell_price = sell[1].bid
-                    episode.sell_size = sell[1].bid_size
+                    episode.buy_price = buy[1].native_ask
+                    episode.buy_size = buy[1].native_ask_size
+                    episode.sell_price = sell[1].native_bid
+                    episode.sell_size = sell[1].native_bid_size
                     elapsed_seconds = time.monotonic() - episode.started_monotonic
                     if first_hysteresis_tick:
                         logger.info(
@@ -552,8 +578,8 @@ class OpportunityConfirmer:
                     pending.last_confirmed_at = now
                     pending.spread = spread
                     pending.max_spread = max(pending.max_spread, spread)
-                    pending.buy_price = buy[1].ask
-                    pending.sell_price = sell[1].bid
+                    pending.buy_price = buy[1].native_ask
+                    pending.sell_price = sell[1].native_bid
                     if first_hysteresis_tick:
                         logger.info(
                             "Кандидат %s временно ниже порога %.4f%%, но спред %.4f%% не пересёк "
@@ -573,10 +599,10 @@ class OpportunityConfirmer:
                         max_spread_percent=episode.max_spread,
                         buy_exchange=buy[0].exchange_name,
                         buy_market_pair=buy[0].market_pair,
-                        buy_price=buy[1].ask,
+                        buy_price=buy[1].native_ask,
                         sell_exchange=sell[0].exchange_name,
                         sell_market_pair=sell[0].market_pair,
-                        sell_price=sell[1].bid,
+                        sell_price=sell[1].native_bid,
                         started_at=episode.started_at,
                         last_confirmed_at=episode.last_confirmed_at,
                         ended_at=now,
@@ -613,10 +639,10 @@ class OpportunityConfirmer:
                     max_spread_percent=episode.max_spread,
                     buy_exchange=buy[0].exchange_name,
                     buy_market_pair=buy[0].market_pair,
-                    buy_price=buy[1].ask,
+                    buy_price=buy[1].native_ask,
                     sell_exchange=sell[0].exchange_name,
                     sell_market_pair=sell[0].market_pair,
-                    sell_price=sell[1].bid,
+                    sell_price=sell[1].native_bid,
                     started_at=episode.started_at,
                     last_confirmed_at=episode.last_confirmed_at,
                     ended_at=now,

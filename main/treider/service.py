@@ -13,6 +13,7 @@ from main.treider.config import (
     SIGNAL_MAX_ATTEMPTS,
     SIGNAL_POLL_INTERVAL_SECONDS,
 )
+from main.treider.return_transfer import process_due_return_transfer
 from main.treider.logging_setup import configure_logging
 from main.treider.processor import TemporaryProcessingError, process_opportunity
 from main.treider.queue import (
@@ -84,6 +85,7 @@ def run() -> None:
         while True:
             try:
                 did_settle = process_due_training_trade()
+                did_return = process_due_return_transfer()
                 did_consume = _consume_one()
                 now = time.monotonic()
                 if now - last_equity_capture_at >= DEMO_EQUITY_INTERVAL_SECONDS:
@@ -100,7 +102,7 @@ def run() -> None:
                 elif now - last_signal_at >= ACTIVE_OPPORTUNITY_FALLBACK_SECONDS:
                     enqueue_active_opportunity_fallbacks()
                     last_signal_at = now
-                if not did_settle and not did_consume:
+                if not did_settle and not did_return and not did_consume:
                     time.sleep(SIGNAL_POLL_INTERVAL_SECONDS)
             except Exception:
                 logger.exception(

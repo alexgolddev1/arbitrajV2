@@ -8,6 +8,7 @@ import logging
 import os
 import csv
 import io
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,13 +17,20 @@ from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
 from config import (
-    BUY_PRICE_MUST_BE_LOWER,
+    CALCULATOR_MIN_SPREAD_PERCENT,
     CALCULATOR_SPREAD_LEVELS,
     MAX_VOLUME_USD,
     MIN_VOLUME_USD,
     SCREENER_QUOTE_SYMBOLS_CSV,
 )
-from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database, read_config
+from database import (
+    calculate_market_opportunities, connect_db, finalize_stale_opportunity_lifetimes,
+    initialize_database, read_config,
+)
+from main.market_units import (
+    load_market_unit_mappings, remove_market_unit_mapping,
+    save_market_unit_mapping, suggest_market_unit_scale,
+)
 from main.treider.exchange_networks import NETWORK_ALIASES
 from main.treider.market_data import fetch_market_sell_execution
 from main.treider.replay import replay_scenario
@@ -205,7 +213,6 @@ def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
     connection = connect_db()
     try:
         config = read_config(connection)
-        price_direction = "<" if BUY_PRICE_MUST_BE_LOWER else ">"
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
                 "SELECT source.market_id AS source_market_id, source.market_pair AS source_pair, "
@@ -220,7 +227,6 @@ def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
                 "JOIN market_pairs AS source ON source.market_id = life.source_market_id "
                 "WHERE life.is_active = 1 AND life.threshold_percent = %s "
                 "AND (%s = '' OR FIND_IN_SET(UPPER(source.quote_symbol), %s) > 0) "
-                f"AND life.buy_price {price_direction} life.sell_price "
                 "ORDER BY life.spread_percent DESC, source.market_id",
                 (CALCULATOR_SPREAD_LEVELS[0], SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
             )
@@ -232,6 +238,144 @@ def _load_opportunities() -> tuple[list[dict[str, Any]], int]:
         return rows, int(config["interval_minutes"])
     finally:
         connection.close()
+
+
+def _split_market_base(market_pair: Any, fallback: Any = "") -> str:
+    pair = str(market_pair or "").strip().upper()
+    parts = re.split(r"[/_-]", pair)
+    return parts[0] if len(parts) == 2 and parts[0] else str(fallback or "").strip().upper()
+
+
+def _load_market_unit_candidates() -> list[dict[str, Any]]:
+    connection = connect_db()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT venue.source_market_id, source.base_currency_slug AS source_slug, "
+                "source.base_symbol AS source_symbol, source.quote_symbol, "
+                "venue.exchange_slug, venue.exchange_name, venue.market_pair, venue.base_symbol "
+                "FROM calculator_market_pairs AS venue "
+                "JOIN market_pairs AS source ON source.market_id = venue.source_market_id "
+                "WHERE LOWER(venue.category) = 'spot' AND venue.price IS NOT NULL AND venue.price > 0 "
+                "ORDER BY source.base_symbol, venue.exchange_slug, venue.rank_no"
+            )
+            rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    mappings = load_market_unit_mappings()
+    by_key = {
+        (item["exchange"], item["source_slug"], item["source_symbol"], item["market_symbol"]): item
+        for item in mappings
+    }
+    candidates: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        source_symbol = str(row.get("source_symbol") or "").strip().upper()
+        market_symbol = _split_market_base(row.get("market_pair"), row.get("base_symbol"))
+        if not source_symbol or not market_symbol or market_symbol == source_symbol:
+            continue
+        exchange = str(row.get("exchange_slug") or "").strip().lower()
+        source_slug = str(row.get("source_slug") or "").strip().lower()
+        key = (exchange, source_slug, source_symbol, market_symbol)
+        candidate = candidates.get(key)
+        if candidate is None:
+            approved = by_key.get(key)
+            suggestion = suggest_market_unit_scale(source_symbol, market_symbol)
+            candidate = {
+                "exchange": exchange,
+                "exchange_name": str(row.get("exchange_name") or exchange.upper()),
+                "source_slug": source_slug,
+                "source_symbol": source_symbol,
+                "market_symbol": market_symbol,
+                "market_pair": str(row.get("market_pair") or ""),
+                "units_per_market_unit": (
+                    approved["units_per_market_unit"] if approved else str(suggestion or "")
+                ),
+                "approved": approved is not None,
+                "source_market_ids": set(),
+            }
+            candidates[key] = candidate
+        candidate["source_market_ids"].add(int(row["source_market_id"]))
+    return sorted(candidates.values(), key=lambda item: (
+        not item["approved"], item["source_symbol"], item["exchange"], item["market_symbol"]
+    ))
+
+
+def _market_unit_candidate_exists(exchange: str, source_slug: str, source_symbol: str, market_symbol: str) -> bool:
+    connection = connect_db()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT source.base_symbol AS source_symbol, source.base_currency_slug AS source_slug, "
+                "venue.exchange_slug, venue.market_pair, venue.base_symbol "
+                "FROM calculator_market_pairs AS venue "
+                "JOIN market_pairs AS source ON source.market_id = venue.source_market_id "
+                "WHERE LOWER(venue.category) = 'spot' AND venue.exchange_slug = %s "
+                "AND source.base_currency_slug = %s AND source.base_symbol = %s",
+                (exchange, source_slug, source_symbol),
+            )
+            rows = cursor.fetchall()
+        return any(
+            _split_market_base(row.get("market_pair"), row.get("base_symbol")) == market_symbol
+            for row in rows
+        )
+    finally:
+        connection.close()
+
+
+def _recalculate_market_unit_candidates(exchange: str, source_slug: str, source_symbol: str, market_symbol: str) -> None:
+    connection = connect_db()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT DISTINCT venue.source_market_id, venue.market_pair, venue.base_symbol "
+                "FROM calculator_market_pairs AS venue "
+                "JOIN market_pairs AS source ON source.market_id = venue.source_market_id "
+                "WHERE LOWER(venue.category) = 'spot' AND venue.exchange_slug = %s "
+                "AND source.base_currency_slug = %s AND source.base_symbol = %s",
+                (exchange, source_slug, source_symbol),
+            )
+            ids = [int(row["source_market_id"]) for row in cursor.fetchall()
+                   if _split_market_base(row.get("market_pair"), row.get("base_symbol")) == market_symbol]
+        if ids:
+            calculate_market_opportunities(connection, CALCULATOR_MIN_SPREAD_PERCENT, ids)
+    finally:
+        connection.close()
+
+
+def _render_market_units_page(candidates: list[dict[str, Any]], status: str = "") -> str:
+    rows = []
+    for item in candidates:
+        state = "Подтверждено" if item["approved"] else "Требует проверки"
+        ratio = html.escape(str(item["units_per_market_unit"]))
+        hidden = "".join(
+            f'<input type="hidden" name="{key}" value="{html.escape(str(item[value]), quote=True)}">'
+            for key, value in (("exchange", "exchange"), ("source_slug", "source_slug"),
+                               ("source_symbol", "source_symbol"), ("market_symbol", "market_symbol"))
+        )
+        remove_form = ""
+        if item["approved"]:
+            remove_form = (
+                '<form method="post" class="inline-form"><input type="hidden" name="action" value="remove">'
+                f'{hidden}<button type="submit">Удалить подтверждение</button></form>'
+            )
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(item['exchange_name'])}<small>{html.escape(item['exchange'])}</small></td>"
+            f"<td>{html.escape(item['source_symbol'])}<small>{html.escape(item['source_slug'] or 'без slug')}</small></td>"
+            f"<td>{html.escape(item['market_pair'])}</td><td>{html.escape(item['market_symbol'])}</td>"
+            f"<td>{html.escape(state)}</td><td><form method=\"post\" class=\"inline-form\">"
+            '<input type="hidden" name="action" value="save">' + hidden +
+            f'<label>Монет источника на 1 лот <input name="units_per_market_unit" value="{ratio}" required inputmode="decimal"></label>'
+            '<button type="submit">Подтвердить / сохранить</button></form>' + remove_form + "</td></tr>"
+        )
+    message = "Коэффициент сохранён и пересчёт обновлён." if status == "saved" else "Подтверждение удалено." if status == "removed" else ""
+    return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Единицы рынков</title><style>
+body{{margin:0;background:#0b1220;color:#e5e7eb;font:15px system-ui,sans-serif}}header,main{{padding:22px 4vw}}nav{{display:flex;gap:10px;flex-wrap:wrap}}nav a,button{{padding:8px 12px;border:1px solid #334155;border-radius:8px;background:#111b2e;color:#7dd3fc;text-decoration:none;cursor:pointer}}.note{{color:#9ca3af;max-width:1000px;line-height:1.5}}.ok{{color:#67e8a5}}.table-wrap{{overflow:auto;border:1px solid #26334a;border-radius:10px}}table{{width:100%;border-collapse:collapse;min-width:950px;background:#111b2e}}th,td{{padding:12px;text-align:left;border-bottom:1px solid #26334a;vertical-align:top}}th{{color:#9fb4d0}}small{{display:block;color:#9ca3af;margin-top:4px}}input{{display:block;width:170px;margin:5px 0;padding:8px;border:1px solid #475569;border-radius:6px;background:#0b1220;color:#e5e7eb}}.inline-form{{display:flex;align-items:end;gap:8px;flex-wrap:wrap}}.inline-form label{{color:#cbd5e1}}.empty{{padding:20px;color:#9ca3af}}
+</style></head><body><header><nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/trader">Трейдер</a><a href="/market-units">Единицы рынков</a></nav><h1>Подтверждение единиц рынка</h1>
+<p class="note">Биржа может показывать цену за лот из нескольких монет, например 1MBABYDOGE. Предложенное число — только подсказка. Проверьте его и подтвердите вручную. Неизвестные соответствия исключаются из сравнения; сохранённые правила применяются к спреду и WebSocket. Демотрейдер пока не открывает сделки для рынков с такими лотами.</p>
+<p class="ok">{html.escape(message)}</p></header><main><div class="table-wrap"><table><thead><tr><th>Биржа</th><th>Валюта скринера</th><th>Рынок биржи</th><th>Тикер рынка</th><th>Состояние</th><th>Коэффициент / действие</th></tr></thead><tbody>{''.join(rows) if rows else '<tr><td colspan="6" class="empty">Несовпадений базовой валюты не найдено.</td></tr>'}</tbody></table></div></main></body></html>"""
 
 
 def _load_worker_status() -> dict[str, str]:
@@ -278,7 +422,8 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
                 "SUM(route_status = 'confirmed') AS confirmed_routes, "
                 "SUM(route_status = 'unconfirmed') AS assumed_routes, "
                 "COALESCE(SUM(CASE WHEN status = 'settled' THEN realized_profit_usd ELSE 0 END), 0) AS net_profit, "
-                "COALESCE(SUM(CASE WHEN status = 'settled' THEN buy_fee_usd + COALESCE(sell_fee_usd, 0) ELSE 0 END), 0) AS total_fees "
+                "COALESCE(SUM(CASE WHEN status = 'settled' THEN buy_fee_usd + COALESCE(sell_fee_usd, 0) + "
+                "transfer_fee_usd + return_transfer_fees_accumulated_usd ELSE 0 END), 0) AS total_fees "
                 "FROM trader_training_settlements"
             )
             stats.update(cursor.fetchone() or {})
@@ -288,7 +433,8 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
                 "COUNT(*) AS total_count, SUM(status = 'settled') AS settled_count, "
                 "SUM(status IN ('pending','settling','partial')) AS pending_count, SUM(status = 'open') AS open_count, "
                 "COALESCE(SUM(CASE WHEN status IN ('settled','partial','open') THEN realized_profit_usd ELSE 0 END), 0) AS realized_profit, "
-                "COALESCE(SUM(CASE WHEN status IN ('settled','partial','open') THEN buy_fee_usd + COALESCE(sell_fee_usd, 0) ELSE 0 END), 0) AS fees "
+                "COALESCE(SUM(CASE WHEN status IN ('settled','partial','open') THEN buy_fee_usd + "
+                "COALESCE(sell_fee_usd, 0) + transfer_fee_usd + return_transfer_fees_accumulated_usd ELSE 0 END), 0) AS fees "
                 "FROM trader_training_settlements GROUP BY run_id, strategy"
             )
             stats["strategy_stats"] = cursor.fetchall()
@@ -297,6 +443,13 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
             stats["exchange_balances"] = exchange_balances
             stats["exchange_usdt"] = sum(
                 (Decimal(str(row["balance"])) for row in exchange_balances if row["asset"] == "USDT"), Decimal(0)
+            )
+            cursor.execute(
+                "SELECT COALESCE(SUM(amount_usdt), 0) AS amount_usdt FROM trader_demo_return_transfers "
+                "WHERE status = 'in_transit'"
+            )
+            stats["return_transfer_usdt_in_transit"] = Decimal(
+                str((cursor.fetchone() or {}).get("amount_usdt") or 0)
             )
             cursor.execute(
                 "SELECT COALESCE(SUM(CASE WHEN movement_type = 'deposit' THEN amount_usd ELSE 0 END), 0) AS deposits_usd, "
@@ -309,6 +462,7 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
                 "SELECT settlement_id, source_pair, buy_exchange, buy_market_pair, buy_price, "
                 "sell_exchange, sell_market_pair, expected_sell_price, stop_loss_price, final_sell_price, quantity, "
                 "buy_cost_usd, realized_sell_proceeds_usd, buy_fee_usd, sell_fee_usd, "
+                "return_transfer_fee_usd, return_transfer_fees_accumulated_usd, "
                 "sold_quantity, sell_proceeds_accumulated_usd, "
                 "expected_profit_usd, realized_profit_usd, status, created_at, settle_after_utc, settled_at, "
                 "planned_sell_at, actual_sell_at, "
@@ -319,6 +473,20 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
                 "FROM trader_training_settlements ORDER BY created_at DESC, settlement_id DESC LIMIT 500"
             )
             trades = cursor.fetchall()
+            cursor.execute(
+                "SELECT settlement_id, sale_event_key, source_exchange, destination_exchange, amount_usdt, "
+                "fee_usdt, network_name, transfer_seconds, due_at_utc, status, last_error "
+                "FROM trader_demo_return_transfers ORDER BY created_at_utc, return_transfer_id"
+            )
+            return_transfers_by_settlement: dict[int, list[dict[str, Any]]] = {}
+            for transfer in cursor.fetchall():
+                return_transfers_by_settlement.setdefault(int(transfer["settlement_id"]), []).append(transfer)
+            for trade in trades:
+                rows = return_transfers_by_settlement.get(int(trade["settlement_id"]), [])
+                trade["return_transfers"] = rows
+                trade["actual_return_transfer_fees_usd"] = sum(
+                    (Decimal(str(row.get("fee_usdt") or 0)) for row in rows), Decimal(0)
+                )
             cursor.execute(
                 "SELECT buy_exchange, buy_market_pair, sell_exchange, sell_market_pair, remaining_quantity, "
                 "expected_sell_taker_fee_rate, position_status, asset_exchange, valuation_usd, "
@@ -344,9 +512,16 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
                     **position, "remaining_quantity": sale_dust, "position_status": "dust",
                 })
         stats.update(_value_trader_positions(valuation_positions))
+        stats["transfer_value_usd"] = (
+            Decimal(str(stats.get("transfer_value_usd") or 0))
+            + Decimal(str(stats.get("return_transfer_usdt_in_transit") or 0))
+        )
         if account:
             balance = Decimal(str(account["balance_usd"])) + stats["exchange_usdt"]
-            equity = balance + Decimal(str(stats["position_value_usd"]))
+            equity = (
+                balance + Decimal(str(stats["position_value_usd"]))
+                + Decimal(str(stats.get("return_transfer_usdt_in_transit") or 0))
+            )
             initial_capital = Decimal(str(account.get("initial_capital_usd") or 0))
             net_flows = Decimal(str(stats.get("net_capital_movements") or 0))
             stats["equity_usd"] = equity
@@ -741,6 +916,12 @@ def _render_trader_page(
         "open": "Остаток сохранён",
         "expired": "Истёк срок оценки",
     }
+    return_status_labels = {
+        "pending": "ожидает возврата",
+        "in_transit": "USDT в пути",
+        "completed": "возвращено",
+        "blocked": "возврат заблокирован",
+    }
     for trade in trades:
         settled = trade["status"] == "settled"
         realized = trade["status"] in {"settled", "partial", "open"}
@@ -762,6 +943,32 @@ def _render_trader_page(
                     '<span>' + html.escape(str(trade.get("network_name") or "Сеть не указана")) + '</span>'
                     '<b data-countdown-value>—</b></div>'
                 )
+        return_transfers = trade.get("return_transfers") or []
+        for return_transfer in return_transfers:
+            if return_transfer.get("status") == "in_transit":
+                deadline_ms = _epoch_milliseconds(return_transfer.get("due_at_utc"))
+                if deadline_ms is not None:
+                    transfer_countdown_rows.append(
+                        '<div class="transfer-countdown-item" data-transfer-deadline="' + str(deadline_ms) + '">'
+                        '<strong>Возврат USDT · ' + html.escape(str(trade.get("source_pair") or "Пара не указана")) + '</strong>'
+                        '<span>' + html.escape(str(return_transfer.get("network_name") or "Сеть не указана")) + '</span>'
+                        '<b data-countdown-value>—</b></div>'
+                    )
+        expected_return_fee = Decimal(str(trade.get("return_transfer_fee_usd") or 0))
+        actual_return_fee = Decimal(str(trade.get("actual_return_transfer_fees_usd") or 0))
+        return_fee_charged = any(
+            item.get("status") in {"in_transit", "completed"} for item in return_transfers
+        )
+        shown_return_fee = actual_return_fee if return_fee_charged else expected_return_fee
+        return_details = "".join(
+            '<small>Возврат USDT ' + html.escape(return_status_labels.get(
+                str(item.get("status")), str(item.get("status"))
+            )) + ': ' + _fmt_fixed(item.get("amount_usdt"), 3) + ' · '
+            + html.escape(str(item.get("network_name") or item.get("last_error") or "маршрут проверяется"))
+            + (" · комиссия " + _fmt_fixed(item.get("fee_usdt"), 3) + " USDT" if item.get("fee_usdt") is not None else "")
+            + '</small>'
+            for item in return_transfers
+        )
         route_label = {"confirmed": "Подтверждён", "unconfirmed": "Предполагаемый", "legacy": "Старая запись"}.get(
             trade["route_status"], html.escape(str(trade["route_status"]))
         )
@@ -778,11 +985,13 @@ def _render_trader_page(
             f"<td>{_fmt_fixed(trade['quantity'], 8)}</td>"
             f"<td>{_fmt_fixed(trade['buy_cost_usd'], 3)}</td>"
             f"<td>{_fmt_fixed(trade['realized_sell_proceeds_usd'] if realized else None, 3)}</td>"
-            f"<td>{_fmt_fixed(trade['buy_fee_usd'], 3)} + {_fmt_fixed(trade['sell_fee_usd'] if realized else None, 3)}</td>"
+            f"<td>{_fmt_fixed(trade['buy_fee_usd'], 3)} + {_fmt_fixed(trade['sell_fee_usd'] if realized else None, 3)} + {_fmt_fixed(shown_return_fee, 3)}</td>"
             f'<td class="{profit_class}">{_fmt_fixed(profit, 3)} USD'
             f'{"<small>накопленная, позиция открыта</small>" if realized and not settled else ""}'
             f'{"<small>ожидаемая до резерва; после резерва " + _fmt_fixed(trade["expected_profit_after_reserve_usd"], 3) + " USDT</small>" if not realized else ""}</td>'
             f"<td>{route_label}<small>Перевод: {_fmt(trade['transfer_fee_amount'])} {html.escape(str(trade['transfer_fee_currency']))}</small>"
+            f"{('<small>Ожидаемая комиссия возврата: ' + _fmt_fixed(expected_return_fee, 3) + ' USDT</small>') if expected_return_fee > 0 and not return_fee_charged else ''}"
+            f"{return_details}"
             f"{'<small>Пыль на buy: ' + _fmt_fixed(trade.get('transfer_dust_quantity') or 0, 8) + ' монет</small>' if Decimal(str(trade.get('transfer_dust_quantity') or 0)) > 0 else ''}"
             f"{'<small>Биржа старого остатка не распределена</small>' if remaining_quantity > 0 and not trade.get('asset_exchange') else ''}</td>"
             f"<td>{_fmt_fixed(remaining_quantity, 8)}</td>"
@@ -933,21 +1142,22 @@ body {{ padding-bottom:92px; }} .transfer-countdown-bar {{ position:fixed; z-ind
 .transfer-countdown-item span {{ color:#9ca3af; }} .transfer-countdown-item b {{ color:#fbbf24; font-variant-numeric:tabular-nums; }} .transfer-countdown-empty {{ color:#9ca3af; }}
 </style></head><body>
 <header><h1>Трейдер</h1><div class="muted">Состояние счёта и сделки · страница обновляется каждые 30 секунд · баланс на {last_update}</div>
-<nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a class="active" href="/trader">Трейдер</a><a href="/trader/export/demo-operations.csv">Экспорт демоопераций CSV</a>{replay_link}</nav></header>
+<nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/market-units">Единицы рынков</a><a class="active" href="/trader">Трейдер</a><a href="/trader/export/demo-operations.csv">Экспорт демоопераций CSV</a>{replay_link}</nav></header>
 <main><section class="cards">
 <div class="card"><span>Доступный USDT на биржах</span><strong>{balance} USD</strong></div>
 <div class="card"><span>Демобалансы USDT по биржам</span><strong>{html.escape('; '.join(f"{row['exchange_slug']}: {_fmt_fixed(row['balance'], 8)} USDT" for row in exchange_usdt_balances) or 'пока пусто')}</strong></div>
+<div class="card"><span>USDT в обратном переводе</span><strong>{_fmt_fixed(stats.get('return_transfer_usdt_in_transit') or 0, 3)} USDT</strong><small>Уже включены в Equity; после комиссии сети</small></div>
 <div class="card"><span>Общий Equity</span><strong>{equity} USD</strong><small>USDT + чистая оценка монет · {html.escape(valuation_status)}</small></div>
 <div class="card"><span>Общий PnL с начала</span><strong class="{equity_pnl_class}">{_fmt_fixed(equity_pnl, 3)} USD</strong><small>Старт {_fmt_fixed(stats.get('initial_capital_usd'), 3)} · пополнения {_fmt_fixed(stats.get('deposits_usd') or 0, 3)} · снятия {_fmt_fixed(stats.get('withdrawals_usd') or 0, 3)}</small></div>
 <div class="card"><span>Чистая стоимость монет</span><strong>{_fmt_fixed(stats.get('position_value_usd') or 0, 3)} USD</strong></div>
-<div class="card"><span>В переводе · включено в Equity</span><strong>{_fmt_fixed(stats.get('transfer_quantity') or 0, 8)} монет</strong><small>Оценка {_fmt_fixed(stats.get('transfer_value_usd') or 0, 3)} USD</small></div>
+<div class="card"><span>В переводе · включено в Equity</span><strong>{_fmt_fixed(stats.get('transfer_quantity') or 0, 8)} монет</strong><small>Общая оценка {_fmt_fixed(stats.get('transfer_value_usd') or 0, 3)} USD · USDT в пути {_fmt_fixed(stats.get('return_transfer_usdt_in_transit') or 0, 3)}</small></div>
 <div class="card"><span>Режим</span><strong>{mode}</strong></div>
 <div class="card"><span>Подтверждённые маршруты</span><strong>{_fmt(stats.get('confirmed_routes') or 0)}</strong></div>
 <div class="card"><span>Предполагаемые маршруты</span><strong>{_fmt(stats.get('assumed_routes') or 0)}</strong></div>
 </section><h2>Демопрогон</h2><section class="cards">{run_details}</section><h2>Статистика по стратегиям и прогонам</h2><section class="cards">{strategy_cards}</section>
 <h2>Дневной отчёт · Europe/Kyiv</h2><div class="table-wrap"><table><thead><tr><th>День</th><th>Прогон / commit</th><th>Equity</th><th>PnL за день</th><th>PnL с начала</th><th>Комиссии</th><th>Сделок / закрыто</th><th>Текущая / максимальная просадка</th><th>В позициях / переводе</th><th>Оценка</th></tr></thead><tbody>{''.join(daily_report_rows)}</tbody></table></div>
 {capital_form}<h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
-<th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
+<th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell + возврат</th><th>Результат</th><th>Маршруты и комиссии</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
 </tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div>
 <h2>Ориентировочное время по сетям</h2><p class="muted">Средняя оценка из публичных источников, используемая таймером демосделки. Это оценка подтверждения/финальности в блокчейне, а не гарантия зачисления биржей. Биржи могут ждать другое число подтверждений и добавлять время обработки. Для сетей без надёжной оценки таймер не подставляется.</p><div class="table-wrap"><table><thead><tr><th>Сеть</th><th>Среднее, сек.</th><th>Основание / источник</th></tr></thead><tbody>{''.join(transfer_time_rows)}</tbody></table></div>
 <div id="trade-detail-modal" role="tooltip" aria-hidden="true"><strong data-detail="pair"></strong>
@@ -1151,7 +1361,6 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
         finalize_stale_opportunity_lifetimes(180)
     connection = connect_db()
     try:
-        price_direction = "<" if BUY_PRICE_MUST_BE_LOWER else ">"
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
                 "SELECT lifetime_id, source_market_id, source_pair, threshold_percent, spread_percent, max_spread_percent, "
@@ -1160,7 +1369,6 @@ def _load_lifetimes(is_active: bool = False) -> list[dict[str, Any]]:
                 "FROM opportunity_lifetimes AS life "
                 "JOIN market_pairs AS source ON source.market_id = life.source_market_id "
                 "WHERE life.is_active = %s AND (%s = '' OR FIND_IN_SET(UPPER(source.quote_symbol), %s) > 0) "
-                f"AND (is_active = 0 OR buy_price {price_direction} sell_price) "
                 "ORDER BY started_at DESC, lifetime_id DESC LIMIT 500",
                 (int(is_active), SCREENER_QUOTE_SYMBOLS_CSV, SCREENER_QUOTE_SYMBOLS_CSV),
             )
@@ -1277,7 +1485,7 @@ def _render_history(
   .live-card p {{ color: #9fb4d0; }} .live-card strong {{ color: #e5e7eb; }} .live-status {{ color: #fbbf24; }} .live-status.connected {{ color: #67e8a5; }} .live-status.error {{ color: #f87171; }}
 </style></head><body>
 <header><h1>{page_title}</h1><div class="muted">{('Текущие подтверждённые ситуации · список обновляется автоматически' if active_view else f'Последние 500 наблюдений · данные хранятся 30 дней · обновлено {refreshed_at}')}</div>
-<nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a><a href="/trader">Трейдер</a></nav></header>
+<nav><a href="/">Возможности</a><a class="{'active' if active_view else ''}" href="/situations">Активные ситуации</a><a class="{'active' if not active_view else ''}" href="/history">История</a><a href="/market-units">Единицы рынков</a><a href="/trader">Трейдер</a></nav></header>
 <main class="{'active-view' if active_view else ''}"><section class="counter-section"><h2>Подтверждённые возможности за период</h2><div class="muted counter-note">Считаются только позиции, созданные трейдером в тренировочном режиме; период определяется временем открытия позиции.</div><div class="table-wrap"><table><thead><tr><th>Порог спреда</th><th>1 час</th><th>12 часов</th><th>24 часа</th></tr></thead>
 <tbody>{counter_rows}</tbody></table></div>
 </section><h2>{'Активные ситуации и время жизни' if active_view else 'Время жизни подтверждённых возможностей'}</h2><div class="table-wrap"><table><thead><tr><th>Пара</th><th>Порог</th><th>Текущий спред</th><th>Купить</th><th>Продать</th><th>Подтверждена с (Киев)</th><th>Состояние / завершена (Киев)</th><th>Длительность эпизода</th><th>Суммарное подтверждённое время</th></tr></thead>
@@ -1476,7 +1684,7 @@ def _render_page(rows: list[dict[str, Any]], interval_minutes: int) -> str:
   </style>
 </head>
 <body>
-  <nav><a class="active" href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/trader">Трейдер</a></nav>
+  <nav><a class="active" href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/market-units">Единицы рынков</a><a href="/trader">Трейдер</a></nav>
   <header><h1>Арбитражный скринер</h1>
   <div id="worker-status" class="worker-status"><strong>Проверяю обновление…</strong><small></small></div>
   <div class="muted">Объём торгов за 24 ч: {_fmt(MIN_VOLUME_USD)}–{_fmt(MAX_VOLUME_USD)} USD · длительность активных возможностей обновляется каждую секунду · данные пересчитываются по расписанию</div></header>
@@ -1780,7 +1988,8 @@ def _load_demo_operation_csv() -> bytes:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/trader/capital":
+        path = urlparse(self.path).path
+        if path not in ("/trader/capital", "/market-units/confirm"):
             self.send_error(404)
             return
         origin = urlparse(self.headers.get("Origin", "")).netloc
@@ -1793,6 +2002,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if content_length <= 0 or content_length > 2048:
                 raise ValueError("Некорректный размер запроса")
             form = parse_qs(self.rfile.read(content_length).decode("utf-8"), strict_parsing=True)
+            if path == "/market-units/confirm":
+                action = form.get("action", [""])[0]
+                exchange = form.get("exchange", [""])[0].strip().lower()
+                source_slug = form.get("source_slug", [""])[0].strip().lower()
+                source_symbol = form.get("source_symbol", [""])[0].strip().upper()
+                market_symbol = form.get("market_symbol", [""])[0].strip().upper()
+                if not _market_unit_candidate_exists(exchange, source_slug, source_symbol, market_symbol):
+                    raise ValueError("Рынок для этого соответствия больше не найден")
+                if action == "save":
+                    save_market_unit_mapping(
+                        exchange=exchange, source_slug=source_slug,
+                        source_symbol=source_symbol, market_symbol=market_symbol,
+                        units_per_market_unit=form.get("units_per_market_unit", [""])[0],
+                    )
+                    _recalculate_market_unit_candidates(exchange, source_slug, source_symbol, market_symbol)
+                    location = "/market-units?status=saved"
+                elif action == "remove":
+                    remove_market_unit_mapping(
+                        exchange=exchange, source_slug=source_slug,
+                        source_symbol=source_symbol, market_symbol=market_symbol,
+                    )
+                    _recalculate_market_unit_candidates(exchange, source_slug, source_symbol, market_symbol)
+                    location = "/market-units?status=removed"
+                else:
+                    raise ValueError("Неизвестное действие")
+                self.send_response(303)
+                self.send_header("Location", location)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
             movement_type = form.get("movement_type", [""])[0]
             amount = Decimal(form.get("amount", [""])[0])
             exchange = form.get("exchange", ["binance"])[0]
@@ -1809,6 +2048,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/market-units":
+            try:
+                query = parse_qs(urlparse(self.path).query)
+                status = query.get("status", [""])[0]
+                body = _render_market_units_page(_load_market_unit_candidates(), status).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                logger.exception("Не удалось загрузить подтверждения единиц рынка")
+                self.send_error(500)
+            return
         if path == "/trader/replay":
             try:
                 query = parse_qs(urlparse(self.path).query)

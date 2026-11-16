@@ -281,7 +281,10 @@ def replay_scenario(run: dict[str, Any], events: list[dict[str, Any]], snapshots
                 if balances.get(in_transit, Decimal(0)) < transit_amount:
                     gaps.append(f"{event.get('event_key')}: received more {asset} than was sent")
                 balances[in_transit] = max(Decimal(0), balances.get(in_transit, Decimal(0)) - transit_amount)
-        elif kind == "commission" and ":commission:transfer" in str(event.get("event_key", "")):
+        elif kind == "commission" and (
+            ":commission:transfer" in str(event.get("event_key", ""))
+            or ":commission:return_transfer" in str(event.get("event_key", ""))
+        ):
             fee_asset = str(event.get("fee_asset") or asset or "USDT").upper()
             fee = Decimal(str(event.get("fee_amount") or 0))
             key = (exchange, fee_asset)

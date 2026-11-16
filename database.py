@@ -24,6 +24,7 @@ from config import (
     DEFAULT_CONFIG,
     SCREENER_QUOTE_SYMBOLS_CSV,
 )
+from main.market_units import get_market_unit_scale
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,8 @@ def initialize_database(connection: MySQLConnection) -> None:
                 "expected_profit_after_reserve_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "sell_proceeds_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "sell_fees_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "return_transfer_fee_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
+                "return_transfer_fees_accumulated_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "buy_debit_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "cost_basis_sold_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
                 "cost_basis_remaining_usd": "DECIMAL(38, 12) NOT NULL DEFAULT 0",
@@ -342,6 +345,7 @@ def get_websocket_markets(connection: MySQLConnection) -> list[dict[str, Any]]:
         cursor.execute(
             "SELECT venue.source_market_id, source.market_pair AS source_pair, "
             "source.base_symbol AS source_base_symbol, source.quote_symbol AS source_quote_symbol, "
+            "source.base_currency_slug AS source_base_currency_slug, "
             "venue.exchange_slug, venue.exchange_name, venue.market_pair, venue.base_symbol, "
             "venue.quote_symbol, venue.rank_no, venue.category "
             "FROM calculator_market_pairs AS venue "
@@ -526,7 +530,8 @@ def calculate_market_opportunities(
     with connection.cursor() as cursor:
         query = (
             "SELECT venue.source_market_id, venue.exchange_slug, venue.price, venue.rank_no, "
-            "venue.base_symbol, venue.market_pair, venue.exchange_name, source.market_pair "
+            "venue.base_symbol, venue.market_pair, venue.exchange_name, source.market_pair, "
+            "source.base_symbol, source.base_currency_slug "
             "FROM calculator_market_pairs AS venue "
             "JOIN market_pairs AS source ON source.market_id = venue.source_market_id "
             f"WHERE venue.source_market_id IN ({placeholders}) "
@@ -535,20 +540,26 @@ def calculate_market_opportunities(
         )
         cursor.execute(query, tuple(source_market_ids))
         for (source_market_id, exchange_slug, price, rank_no, base_symbol, market_pair,
-             exchange_name, source_pair) in cursor.fetchall():
+             exchange_name, source_pair, source_base_symbol, source_slug) in cursor.fetchall():
             if not exchange_slug:
                 continue
             source_market_id = int(source_market_id)
             source_pairs[source_market_id] = str(source_pair or "")
             source_prices = best_prices.setdefault(source_market_id, {})
-            # Биржи могут котировать лот из N токенов (например, 1000CHEEMS),
-            # тогда как другие указывают цену одного токена (CHEEMS).
-            pair_base = str(market_pair or "").split("/", 1)[0]
+            pair_parts = re.split(r"[/_-]", str(market_pair or "").upper())
+            pair_base = pair_parts[0] if len(pair_parts) == 2 else ""
             symbol_for_units = pair_base or str(base_symbol or "")
-            match = re.match(r"^(\d+)(?=[A-Z])", symbol_for_units.upper())
-            unit_count = Decimal(match.group(1)) if match else Decimal("1")
-            if unit_count <= 0:
-                unit_count = Decimal("1")
+            unit_count = get_market_unit_scale(
+                str(exchange_slug), str(source_slug or ""),
+                str(source_base_symbol or ""), symbol_for_units,
+            )
+            if unit_count is None:
+                logger.debug(
+                    "Рынок исключён из сравнения: нет подтверждённого коэффициента единиц; "
+                    "биржа=%s, исходная валюта=%s (%s), рынок=%s",
+                    exchange_slug, source_base_symbol, source_slug, symbol_for_units,
+                )
+                continue
             normalized_price = Decimal(str(price)) / unit_count
             rank = int(rank_no) if rank_no is not None else 2**31
             current = source_prices.get(exchange_slug)
