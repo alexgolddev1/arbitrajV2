@@ -8,7 +8,7 @@ services:
       MYSQL_PASSWORD: ${DB_PASSWORD:-${MYSQL_PASSWORD:-ArbBot_26!x7Qp2L}}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-RootDB_26!v9Ks4N}
     ports:
-      - "${MYSQL_PORT:-4321}:3306"
+      - "${MYSQL_PORT:-53587}:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -152,7 +152,7 @@ services:
       CALCULATOR_SPREAD_LEVELS: ${CALCULATOR_SPREAD_LEVELS:-0.85,1,1.5}
       BUY_PRICE_MUST_BE_LOWER: ${BUY_PRICE_MUST_BE_LOWER:-true}
     ports:
-      - "${WEB_PORT:-8080}:8080"
+      - "${WEB_PORT:-36093}:8080"
 
   phpmyadmin:
     image: phpmyadmin:5.2-apache
@@ -165,7 +165,7 @@ services:
       PMA_PORT: 3306
       UPLOAD_LIMIT: 64M
     ports:
-      - "${PHPMYADMIN_PORT:-8081}:80"
+      - "${PHPMYADMIN_PORT:-24760}:80"
 
 volumes:
   mysql_data:

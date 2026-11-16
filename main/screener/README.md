@@ -57,7 +57,7 @@ docker compose run --rm --build app python -m main.calculator.fetch_prices
 docker compose up --build
 ```
 
-phpMyAdmin доступен на `http://localhost:8081`. Для разового обновления выполните:
+phpMyAdmin доступен на `http://localhost:24760`. Для разового обновления выполните:
 
 ```powershell
 docker compose run --rm app python -m main.screener.fetch_markets
