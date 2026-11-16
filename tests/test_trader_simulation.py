@@ -316,6 +316,8 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["network_profile"], "POLYGON")
         self.assertEqual(routes[0]["route_status"], "unconfirmed")
+        self.assertEqual(routes[0]["estimated_seconds"], 3.5)
+        self.assertEqual(routes[0]["time_model"], "network_average")
 
     @patch.object(exchange_networks, "ALLOW_UNCONFIRMED_ROUTE_DEMO", True)
     @patch.object(exchange_networks, "ALLOW_DISABLED_ROUTE_DEMO", False)
@@ -340,6 +342,7 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["network_profile"], "POLYMESH")
         self.assertEqual(routes[0]["route_status"], "unconfirmed")
+        self.assertEqual(routes[0]["estimated_seconds"], 15.0)
 
     def test_compound_ethereum_labels_match_but_mixed_chain_labels_do_not(self) -> None:
         self.assertEqual(
@@ -430,13 +433,13 @@ class MarketAndRouteTests(unittest.TestCase):
     @patch.object(exchange_networks, "ALLOW_DISABLED_ROUTE_DEMO", True)
     def test_explicitly_allowed_disabled_route_stays_marked_disabled(self) -> None:
         disabled = {
-            "network_code": "ARBITRUM", "network_name": "Arbitrum",
+            "network_code": "MATIC", "network_name": "Polygon POS",
             "withdraw_enabled": False, "deposit_enabled": True,
         }
         routes = exchange_networks.build_transfer_routes(
             "ABC", "binance", "mexc",
             {"networks": {"binance": [disabled], "mexc": []}},
-            configured_profile="ARBITRUM",
+            configured_profile="POLYGON",
         )
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["route_status"], "disabled")
@@ -445,14 +448,14 @@ class MarketAndRouteTests(unittest.TestCase):
     @patch.object(exchange_networks, "ALLOW_DISABLED_ROUTE_DEMO", False)
     def test_assumed_route_is_explicitly_marked_when_one_exchange_lacks_data(self) -> None:
         source = {
-            "network_code": "ARBITRUM", "network_name": "Arbitrum One",
+            "network_code": "MATIC", "network_name": "Polygon POS",
             "withdraw_enabled": True, "deposit_enabled": True,
             "withdraw_fee": "0.01", "contract_address": "0xabc",
         }
         routes = exchange_networks.build_transfer_routes(
             "ABC", "binance", "mexc",
             {"networks": {"binance": [source], "mexc": []}},
-            configured_profile="ARBITRUM",
+            configured_profile="POLYGON",
         )
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["route_status"], "unconfirmed")
@@ -460,12 +463,25 @@ class MarketAndRouteTests(unittest.TestCase):
         self.assertTrue(routes[0]["destination_assumed"])
         self.assertEqual(routes[0]["withdraw_fee"], "0.01")
 
-    def test_fixed_delay_is_reproducible_and_random_seed_repeats(self) -> None:
-        with patch.object(tran_emulation, "FIXED_TRANSFER_SECONDS", Decimal("42")):
-            self.assertEqual(tran_emulation.TransferTimeEmulator().get_emulated_duration("ETHEREUM"), 42.0)
+    def test_network_average_replaces_fixed_delay_and_random_seed_repeats(self) -> None:
+        emulator = tran_emulation.TransferTimeEmulator()
+        self.assertEqual(emulator.get_emulated_duration("ETHEREUM"), 384.0)
+        self.assertEqual(emulator.get_emulated_duration("TRON"), 57.0)
+        self.assertEqual(emulator.get_emulated_duration("POLYMESH"), 15.0)
         first = tran_emulation.TransferTimeEmulator(random_mode=True, seed=7)
         second = tran_emulation.TransferTimeEmulator(random_mode=True, seed=7)
-        self.assertEqual(first.get_emulated_duration("ARBITRUM"), second.get_emulated_duration("ARBITRUM"))
+        self.assertEqual(first.get_emulated_duration("TRON"), second.get_emulated_duration("TRON"))
+
+    def test_route_without_sourced_time_estimate_is_not_given_a_static_fallback(self) -> None:
+        row = {
+            "network_code": "Arbitrum One", "network_name": "Arbitrum",
+            "withdraw_enabled": True, "deposit_enabled": True,
+        }
+        routes = exchange_networks.build_transfer_routes(
+            "ABC", "binance", "mexc",
+            {"networks": {"binance": [row], "mexc": [row]}},
+        )
+        self.assertEqual(routes, [])
 
 
 class TradeCalculationTests(unittest.TestCase):

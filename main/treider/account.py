@@ -16,11 +16,12 @@ from main.treider.config import (
     BUY_FEE_CURRENCY, DEMO_STRATEGY, INITIAL_BALANCE_USD, INITIAL_EXCHANGE_SLUG,
     MAX_LOSS_BALANCE_PERCENT, MAX_LOSS_PROFIT_RATIO, MIN_NET_PROFIT_USDT,
     PRICE_MOVE_RESERVE_PERCENT, CONFIGURED_TAKER_FEES, ALLOW_DISABLED_ROUTE_DEMO,
-    ALLOW_UNCONFIRMED_ROUTE_DEMO, FIXED_TRANSFER_SECONDS, RANDOM_TRANSFER_TIME,
+    ALLOW_UNCONFIRMED_ROUTE_DEMO, RANDOM_TRANSFER_TIME,
     SAME_ROUTE_REENTRY_COOLDOWN_SECONDS, SETTLEMENT_MAX_WAIT_SECONDS, SETTLEMENT_RETRY_SECONDS,
     SIGNAL_MAX_AGE_SECONDS, SIGNAL_MAX_ATTEMPTS, STOP_LOSS_PERCENT, TRADE_SIZE_CANDIDATES_USDT,
     TRAINING_MODE, TRANSFER_FEE_AMOUNT, TRANSFER_FEE_CURRENCY, TRANSFER_NETWORK, TRANSFER_RANDOM_SEED,
 )
+from main.treider.tran_emulation import TransferTimeEmulator
 
 
 def _demo_config_snapshot() -> dict[str, Any]:
@@ -39,7 +40,7 @@ def _demo_config_snapshot() -> dict[str, Any]:
         "transfer_fee_amount": str(TRANSFER_FEE_AMOUNT) if TRANSFER_FEE_AMOUNT is not None else None,
         "transfer_fee_currency": TRANSFER_FEE_CURRENCY,
         "transfer_network": TRANSFER_NETWORK,
-        "fixed_transfer_seconds": str(FIXED_TRANSFER_SECONDS),
+        "transfer_time_profile_version": TransferTimeEmulator.PROFILE_VERSION,
         "random_transfer_time": RANDOM_TRANSFER_TIME,
         "transfer_random_seed_sha256": hashlib.sha256(TRANSFER_RANDOM_SEED.encode("utf-8")).hexdigest()
         if TRANSFER_RANDOM_SEED else None,

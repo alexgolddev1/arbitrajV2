@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import re
 import time
 from datetime import datetime, timezone
@@ -34,7 +35,6 @@ from config import (
 from main.treider.config import (
     ALLOW_DISABLED_ROUTE_DEMO,
     ALLOW_UNCONFIRMED_ROUTE_DEMO,
-    FIXED_TRANSFER_SECONDS,
     TRANSFER_FEE_AMOUNT,
     TRANSFER_FEE_CURRENCY,
     TRANSFER_NETWORK,
@@ -42,6 +42,7 @@ from main.treider.config import (
 from main.treider.tran_emulation import TransferTimeEmulator
 
 TIMEOUT_SECONDS = 20
+logger = logging.getLogger(__name__)
 EXCHANGES = ("binance", "bybit", "okx", "mexc")
 NETWORK_ALIASES = {
     "TRON": ("TRON", "TRC20", "TRC-20", "TRX", "TRON NETWORK"),
@@ -396,6 +397,11 @@ def build_transfer_routes(
     routes = []
     profiles = sorted(set(source_by_profile) & set(destination_by_profile))
     for profile in profiles:
+        try:
+            estimated_seconds = time_emulator.get_emulated_duration(profile)
+        except ValueError as error:
+            logger.warning("Демо-маршрут %s пропущен: %s", profile, error)
+            continue
         source_record = _enabled_record(source_by_profile.get(profile, []), "withdraw_enabled")
         destination_record = _enabled_record(destination_by_profile.get(profile, []), "deposit_enabled")
         unavailable = bool(
@@ -433,10 +439,12 @@ def build_transfer_routes(
             "min_withdraw": (source_record or {}).get("min_withdraw"),
             "withdraw_step": (source_record or {}).get("withdraw_step"),
             "fee_required": (source_record or {}).get("withdraw_fee") is not None,
-            "estimated_seconds": time_emulator.get_emulated_duration(profile),
-            "time_model": "seeded_random" if time_emulator.random_mode else "fixed",
+            "estimated_seconds": estimated_seconds,
+            "average_seconds": str(time_emulator.NETWORK_PROFILES[profile]["avg"]),
+            "time_source": time_emulator.NETWORK_PROFILES[profile]["source_url"],
+            "time_basis": time_emulator.NETWORK_PROFILES[profile]["basis"],
+            "time_model": "seeded_random" if time_emulator.random_mode else "network_average",
             "random_seed": time_emulator.seed,
-            "fixed_delay_seconds": str(FIXED_TRANSFER_SECONDS),
             "source_network": source_record,
             "destination_network": destination_record,
         })
@@ -455,6 +463,11 @@ def build_transfer_routes(
             explicit_disabled and ALLOW_DISABLED_ROUTE_DEMO
             or not explicit_disabled and ALLOW_UNCONFIRMED_ROUTE_DEMO
         ):
+            try:
+                estimated_seconds = time_emulator.get_emulated_duration(requested_profile)
+            except ValueError as error:
+                logger.warning("Настроенный демо-маршрут %s пропущен: %s", requested_profile, error)
+                return []
             source_record = _enabled_record(source_by_profile.get(requested_profile, []), "withdraw_enabled")
             destination_record = _enabled_record(destination_by_profile.get(requested_profile, []), "deposit_enabled")
             source_contract = str((source_record or {}).get("contract_address") or "").strip().lower()
@@ -481,10 +494,12 @@ def build_transfer_routes(
                 "fee_required": actual_fee is not None or configured_fee is not None,
                 "min_withdraw": (source_record or {}).get("min_withdraw"),
                 "withdraw_step": (source_record or {}).get("withdraw_step"),
-                "estimated_seconds": time_emulator.get_emulated_duration(requested_profile),
-                "time_model": "seeded_random" if time_emulator.random_mode else "fixed",
+                "estimated_seconds": estimated_seconds,
+                "average_seconds": str(time_emulator.NETWORK_PROFILES[requested_profile]["avg"]),
+                "time_source": time_emulator.NETWORK_PROFILES[requested_profile]["source_url"],
+                "time_basis": time_emulator.NETWORK_PROFILES[requested_profile]["basis"],
+                "time_model": "seeded_random" if time_emulator.random_mode else "network_average",
                 "random_seed": time_emulator.seed,
-                "fixed_delay_seconds": str(FIXED_TRANSFER_SECONDS),
                 "source_network": source_record, "destination_network": destination_record,
             })
     return routes

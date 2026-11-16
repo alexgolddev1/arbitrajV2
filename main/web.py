@@ -23,8 +23,10 @@ from config import (
     SCREENER_QUOTE_SYMBOLS_CSV,
 )
 from database import connect_db, finalize_stale_opportunity_lifetimes, initialize_database, read_config
+from main.treider.exchange_networks import NETWORK_ALIASES
 from main.treider.market_data import fetch_market_sell_execution
 from main.treider.replay import replay_scenario
+from main.treider.tran_emulation import TransferTimeEmulator
 
 logger = logging.getLogger(__name__)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -57,6 +59,19 @@ def _fmt_time(value: datetime | None) -> str:
         else value.astimezone(timezone.utc)
     )
     return html.escape(utc_value.astimezone(KYIV_TZ).strftime("%Y-%m-%d %H:%M:%S "))
+
+
+def _epoch_milliseconds(value: Any) -> int | None:
+    """Convert a database UTC deadline into a browser-safe Unix timestamp."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    utc_value = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return round(utc_value.timestamp() * 1000)
 
 
 def _spot_market_url(exchange: Any, market_pair: Any) -> str | None:
@@ -299,6 +314,7 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
                 "planned_sell_at, actual_sell_at, "
                 "route_status, asset_exchange, remaining_quantity, transfer_fee_amount, transfer_fee_currency, "
                 "transfer_dust_quantity, sale_dust_quantity, "
+                "position_status, network_name, transfer_seconds, "
                 "expected_profit_before_reserve_usd, expected_profit_after_reserve_usd, price_reserve_usd "
                 "FROM trader_training_settlements ORDER BY created_at DESC, settlement_id DESC LIMIT 500"
             )
@@ -716,6 +732,7 @@ def _render_trader_page(
     account: dict[str, Any] | None, stats: dict[str, Any], trades: list[dict[str, Any]]
 ) -> str:
     trade_rows = []
+    transfer_countdown_rows = []
     status_labels = {
         "pending": "Ожидает перевода",
         "settling": "Проверяется продажа",
@@ -736,6 +753,15 @@ def _render_trader_page(
         profit = trade["realized_profit_usd"] if realized else trade["expected_profit_usd"]
         profit_class = "positive" if profit is not None and Decimal(str(profit)) >= 0 else "negative"
         sale_price = trade["final_sell_price"] if realized else trade["expected_sell_price"]
+        if trade.get("status") == "pending" and trade.get("position_status") == "pending_transfer":
+            deadline_ms = _epoch_milliseconds(trade.get("settle_after_utc"))
+            if deadline_ms is not None:
+                transfer_countdown_rows.append(
+                    '<div class="transfer-countdown-item" data-transfer-deadline="' + str(deadline_ms) + '">'
+                    '<strong>' + html.escape(str(trade.get("source_pair") or "Пара не указана")) + '</strong>'
+                    '<span>' + html.escape(str(trade.get("network_name") or "Сеть не указана")) + '</span>'
+                    '<b data-countdown-value>—</b></div>'
+                )
         route_label = {"confirmed": "Подтверждён", "unconfirmed": "Предполагаемый", "legacy": "Старая запись"}.get(
             trade["route_status"], html.escape(str(trade["route_status"]))
         )
@@ -770,6 +796,29 @@ def _render_trader_page(
         )
     if not trade_rows:
         trade_rows.append('<tr><td colspan="13">Трейдер ещё не входил в сделки.</td></tr>')
+    if not transfer_countdown_rows:
+        transfer_countdown_rows.append('<div class="transfer-countdown-empty">Нет переводов, ожидающих обработки</div>')
+
+    transfer_time_rows = []
+    for network_profile in sorted(NETWORK_ALIASES):
+        profile = TransferTimeEmulator.NETWORK_PROFILES.get(network_profile)
+        if profile is None:
+            transfer_time_rows.append(
+                '<tr><td>' + html.escape(network_profile) + '</td><td>&mdash;</td>'
+                + '<td>Оценка не задана; таймер для маршрута не подставляется</td></tr>'
+            )
+            continue
+        source_link = ' · '.join(
+            '<a href="' + html.escape(source_url, quote=True)
+            + '" target="_blank" rel="noopener">Источник</a>'
+            for source_url in (profile.get("source_url"), profile.get("source_url_secondary"))
+            if source_url
+        )
+        transfer_time_rows.append(
+            '<tr><td>' + html.escape(network_profile) + '</td>'
+            + '<td>' + _fmt_fixed(profile["avg"], 3) + '</td>'
+            + '<td>' + html.escape(profile["basis"]) + ' &middot; ' + source_link + '</td></tr>'
+        )
 
     balance = _fmt_fixed(stats.get("exchange_usdt", account["balance_usd"] if account else None), 3)
     exchange_usdt_balances = [
@@ -878,6 +927,10 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 .live-card {{ padding:14px; border:1px solid #26334a; border-radius:10px; background:#0b1220; }} .live-card p {{ color:#9fb4d0; }}
 .live-status {{ color:#fbbf24; }} .live-status.connected {{ color:#67e8a5; }} .live-status.error {{ color:#f87171; }}
 .trade-row {{ cursor:help; }} .trade-row:focus {{ outline:2px solid #38bdf8; outline-offset:-2px; }}
+body {{ padding-bottom:92px; }} .transfer-countdown-bar {{ position:fixed; z-index:900; left:0; right:0; bottom:0; display:flex; align-items:center; gap:14px; padding:10px 4vw; border-top:1px solid #334155; background:#0f172aee; box-shadow:0 -8px 24px #0005; }}
+.transfer-countdown-title {{ color:#9fb4d0; font-size:.85rem; white-space:nowrap; }} .transfer-countdown-list {{ display:flex; gap:10px; overflow-x:auto; }}
+.transfer-countdown-item {{ display:flex; align-items:center; gap:8px; padding:6px 10px; border:1px solid #334155; border-radius:8px; white-space:nowrap; }}
+.transfer-countdown-item span {{ color:#9ca3af; }} .transfer-countdown-item b {{ color:#fbbf24; font-variant-numeric:tabular-nums; }} .transfer-countdown-empty {{ color:#9ca3af; }}
 </style></head><body>
 <header><h1>Трейдер</h1><div class="muted">Состояние счёта и сделки · страница обновляется каждые 30 секунд · баланс на {last_update}</div>
 <nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a class="active" href="/trader">Трейдер</a><a href="/trader/export/demo-operations.csv">Экспорт демоопераций CSV</a>{replay_link}</nav></header>
@@ -896,6 +949,7 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
 {capital_form}<h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
 <th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell</th><th>Результат</th><th>Маршрут и комиссия перевода</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
 </tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div>
+<h2>Ориентировочное время по сетям</h2><p class="muted">Средняя оценка из публичных источников, используемая таймером демосделки. Это оценка подтверждения/финальности в блокчейне, а не гарантия зачисления биржей. Биржи могут ждать другое число подтверждений и добавлять время обработки. Для сетей без надёжной оценки таймер не подставляется.</p><div class="table-wrap"><table><thead><tr><th>Сеть</th><th>Среднее, сек.</th><th>Основание / источник</th></tr></thead><tbody>{''.join(transfer_time_rows)}</tbody></table></div>
 <div id="trade-detail-modal" role="tooltip" aria-hidden="true"><strong data-detail="pair"></strong>
 <div>Средняя цена исполнения: <span data-detail="average"></span></div>
 <div>Продано монет: <span data-detail="sold"></span></div>
@@ -904,8 +958,21 @@ a.market-link {{ color:inherit; text-decoration:none; }} a.market-link:hover {{ 
   <div class="live-grid"><article class="live-card"><h3 id="trader-live-buy-title"></h3><p>Bid: <strong id="trader-live-buy-bid">—</strong></p><p>Ask: <strong id="trader-live-buy-ask">—</strong></p><div id="trader-live-buy-status" class="live-status">Подключение…</div></article>
   <article class="live-card"><h3 id="trader-live-sell-title"></h3><p>Bid: <strong id="trader-live-sell-bid">—</strong></p><p>Ask: <strong id="trader-live-sell-ask">—</strong></p><div id="trader-live-sell-status" class="live-status">Подключение…</div></article></div><h3 id="trader-live-spread">Спред: ожидаем котировки</h3>
 </section></div></main>
+<aside class="transfer-countdown-bar" aria-live="polite"><strong class="transfer-countdown-title">До перевода</strong><div class="transfer-countdown-list">{''.join(transfer_countdown_rows)}</div></aside>
 <script>
 const tradeDetail = document.getElementById('trade-detail-modal');
+function updateTransferCountdowns() {{
+  document.querySelectorAll('[data-transfer-deadline]').forEach(item => {{
+    const remaining = Math.max(0, Math.ceil((Number(item.dataset.transferDeadline) - Date.now()) / 1000));
+    const hours = Math.floor(remaining / 3600), minutes = Math.floor((remaining % 3600) / 60), seconds = remaining % 60;
+    const value = hours > 0
+      ? String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0')
+      : String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+    item.querySelector('[data-countdown-value]').textContent = remaining === 0 ? 'ожидается' : value;
+  }});
+}}
+updateTransferCountdowns();
+setInterval(updateTransferCountdowns, 1000);
 function positionTradeDetail(event) {{
   const offset = 14, margin = 8;
   const box = tradeDetail.getBoundingClientRect();

@@ -46,7 +46,9 @@ class TraderHistoryTests(unittest.TestCase):
             "transfer_fee_currency": "POLYX", "transfer_dust_quantity": Decimal("0"),
             "asset_exchange": "binance", "created_at": datetime(2026, 10, 25),
             "planned_sell_at": None, "actual_sell_at": None, "settled_at": None,
-            "settle_after_utc": None,
+            "settle_after_utc": datetime(2026, 10, 25, 12, 5),
+            "position_status": "pending_transfer", "network_name": "POLYGON",
+            "transfer_seconds": Decimal("300"),
         }
 
         page = _render_trader_page(
@@ -60,6 +62,14 @@ class TraderHistoryTests(unittest.TestCase):
         self.assertIn('data-sell-exchange="mexc"', page)
         self.assertIn('id="trader-live-modal"', page)
         self.assertIn("traderConnectLive('buy'", page)
+        self.assertIn('class="transfer-countdown-bar"', page)
+        self.assertIn('data-transfer-deadline="1792929900000"', page)
+        self.assertIn("updateTransferCountdowns", page)
+        self.assertIn("<h2>", page)
+        self.assertIn("POLYGON", page)
+        self.assertIn("3.500", page)
+        self.assertIn("https://agentic-docs.polygon.technology/general/stablecoins/offramps/", page)
+        self.assertIn(">ARBITRUM</td><td>", page)
 
     @patch("main.web.read_config", return_value={"interval_minutes": 1})
     @patch("main.web.connect_db")

@@ -89,7 +89,6 @@ for _exchange in ("BINANCE", "BYBIT", "OKX", "MEXC"):
 # Исследовательский деморежим допускает предполагаемый маршрут без подтверждения API.
 ALLOW_UNCONFIRMED_ROUTE_DEMO = os.getenv("TRADER_ALLOW_UNCONFIRMED_ROUTE_DEMO", "1").strip() == "1"
 ALLOW_DISABLED_ROUTE_DEMO = os.getenv("TRADER_ALLOW_DISABLED_ROUTE_DEMO", "0").strip() == "1"
-FIXED_TRANSFER_SECONDS = _decimal_setting("TRADER_FIXED_TRANSFER_SECONDS", "300")
 RANDOM_TRANSFER_TIME = os.getenv("TRADER_RANDOM_TRANSFER_TIME", "0").strip() == "1"
 TRANSFER_RANDOM_SEED = os.getenv("TRADER_TRANSFER_RANDOM_SEED", "").strip()
 TRANSFER_NETWORK = os.getenv("TRADER_TRANSFER_NETWORK", "").strip().upper()
