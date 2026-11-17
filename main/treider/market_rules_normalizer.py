@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from math import lcm
 from typing import Any
 
 
@@ -72,6 +73,18 @@ def normalize_market_rules(
         lot = filters.get("MARKET_LOT_SIZE" if market_order else "LOT_SIZE")
         if not lot:
             raise UnknownMarketRules(f"Binance не вернул применимое ограничение количества для {symbol}")
+        step = _decimal(lot.get("stepSize"), "quantity_step", allow_zero=market_order)
+        minimum = _decimal(lot.get("minQty"), "min_quantity", allow_zero=True)
+        if market_order and filters.get("LOT_SIZE"):
+            # LOT_SIZE applies to all quantities, MARKET_LOT_SIZE adds market constraints.
+            base_lot = filters["LOT_SIZE"]
+            base_step = _decimal(base_lot.get("stepSize"), "quantity_step")
+            minimum = max(minimum, _decimal(base_lot.get("minQty"), "min_quantity", allow_zero=True))
+            scale = Decimal(10) ** max(-base_step.as_tuple().exponent, -step.as_tuple().exponent, 0)
+            if step:
+                step = Decimal(lcm(int(base_step * scale), int(step * scale))) / scale
+            else:
+                step = base_step
         notionals = []
         for name in ("NOTIONAL", "MIN_NOTIONAL"):
             item = filters.get(name)
@@ -84,7 +97,7 @@ def normalize_market_rules(
                         continue
                 notionals.append(item.get("minNotional"))
         notional = max((_decimal(value, "minNotional", allow_zero=True) for value in notionals), default=None)
-        return _rule(lot.get("stepSize"), lot.get("minQty"), notional, "binance exchangeInfo")
+        return _rule(step, minimum, notional, "binance exchangeInfo")
 
     if slug == "bybit":
         if str(payload.get("retCode")) != "0":
