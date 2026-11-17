@@ -14,7 +14,7 @@ from typing import Any
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "market_unit_mappings.json"
 _WRITE_LOCK = threading.Lock()
-_SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,40}$")
+_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9()]{0,39}$")
 
 
 def _mapping_key(

@@ -31,6 +31,7 @@ from main.market_units import (
     load_market_unit_mappings, remove_market_unit_mapping,
     save_market_unit_mapping, suggest_market_unit_scale,
 )
+from main.market_unit_proposals import load_proposals, propose_market_unit
 from main.treider.exchange_networks import NETWORK_ALIASES
 from main.treider.market_data import fetch_market_sell_execution
 from main.treider.replay import replay_scenario
@@ -265,6 +266,7 @@ def _load_market_unit_candidates() -> list[dict[str, Any]]:
         connection.close()
 
     mappings = load_market_unit_mappings()
+    proposals = load_proposals()
     by_key = {
         (item["exchange"], item["source_slug"], item["source_symbol"], item["market_symbol"]): item
         for item in mappings
@@ -281,7 +283,8 @@ def _load_market_unit_candidates() -> list[dict[str, Any]]:
         candidate = candidates.get(key)
         if candidate is None:
             approved = by_key.get(key)
-            suggestion = suggest_market_unit_scale(source_symbol, market_symbol)
+            proposal = propose_market_unit(exchange, source_slug, source_symbol, market_symbol, proposals)
+            suggestion = proposal["units_per_market_unit"] if proposal.get("api_status") != "conflict" else ""
             candidate = {
                 "exchange": exchange,
                 "exchange_name": str(row.get("exchange_name") or exchange.upper()),
@@ -293,8 +296,9 @@ def _load_market_unit_candidates() -> list[dict[str, Any]]:
                 "market_quote": row.get("market_quote"),
                 "price_updated_at": row.get("price_updated_at"),
                 "suggestion": str(suggestion) if suggestion else None,
+                "proposal": proposal,
                 "units_per_market_unit": (
-                    approved["units_per_market_unit"] if approved else str(suggestion or "1")
+                    approved["units_per_market_unit"] if approved else str(suggestion or "")
                 ),
                 "approved": approved is not None,
                 "source_market_ids": set(),
@@ -360,6 +364,33 @@ def _render_market_units_page(candidates: list[dict[str, Any]], status: str = ""
             f"По названию: {html.escape(str(proposal))}" if proposal else
             "Предположение: 1 (возможное другое имя; проверьте актив)"
         )
+        evidence = item.get("proposal")
+        if evidence:
+            proposal_text = html.escape(str(evidence.get("reason") or ""))
+            statuses = {
+                "matched": "Контракт и сеть рынка совпали со справочником",
+                "conflict": "КОНФЛИКТ: контракт рынка отличается от справочника",
+                "metadata_only": "Метаданные API получены; полного сравнения контракта нет",
+                "unavailable": "Метаданные API недоступны; соответствие не подтверждено API",
+                "stale": "Проверка API устарела",
+                "unverified": "Проверки API нет",
+            }
+            proposal_text += "<small>" + html.escape(statuses.get(evidence.get("api_status"), "Проверка API ещё не выполнена")) + "</small>"
+            if evidence.get("requires_identity_check"):
+                proposal_text += "<small>Нужна ручная сверка исходного актива</small>"
+            if evidence.get("checked_on"):
+                proposal_text += f"<small>Источники проверены: {html.escape(evidence['checked_on'])}</small>"
+            if evidence.get("api_checked_at_utc"):
+                proposal_text += f"<small>API: {html.escape(evidence['api_checked_at_utc'])} (UTC)</small>"
+            for network in evidence.get("networks") or []:
+                proposal_text += "<small>" + html.escape(str(network.get("network") or "Сеть неизвестна"))
+                proposal_text += ": " + html.escape(str(network.get("contract") or "Контракт не указан")) + "</small>"
+            for index, url in enumerate(evidence.get("sources") or [], 1):
+                parsed = urlparse(url)
+                if parsed.scheme == "https" and parsed.hostname in {
+                    "www.mexc.com", "www.binance.com", "www.okx.com", "www.bybit.com", "announcements.bybit.com",
+                }:
+                    proposal_text += f'<small><a href="{html.escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">Источник {index}: {html.escape(parsed.hostname)}</a></small>'
         example = f"1 {market} = {ratio} {source}"
         price_text = "Нет цены"
         normalized_text = "Нет оценки"
@@ -367,7 +398,7 @@ def _render_market_units_page(candidates: list[dict[str, Any]], status: str = ""
             price = Decimal(str(item["market_price"]))
             quote = html.escape(str(item.get("market_quote") or item["market_pair"].rsplit("/", 1)[-1]))
             price_text = f"{format(price, 'f')} {quote} за 1 {market}"
-            scale = Decimal(str(item["units_per_market_unit"]))
+            scale = Decimal(str(item["units_per_market_unit"] or "0"))
             if scale > 0:
                 normalized_text = f"{format(price / scale, 'f')} {quote} за 1 {source}"
         hidden = "".join(
@@ -398,7 +429,7 @@ def _render_market_units_page(candidates: list[dict[str, Any]], status: str = ""
 <title>Единицы рынков</title><style>
 body{{margin:0;background:#0b1220;color:#e5e7eb;font:15px system-ui,sans-serif}}header,main{{padding:22px 4vw}}nav{{display:flex;gap:10px;flex-wrap:wrap}}nav a,button{{padding:8px 12px;border:1px solid #334155;border-radius:8px;background:#111b2e;color:#7dd3fc;text-decoration:none;cursor:pointer}}.note{{color:#9ca3af;max-width:1000px;line-height:1.5}}.ok{{color:#67e8a5}}.table-wrap{{overflow:auto;border:1px solid #26334a;border-radius:10px}}table{{width:100%;border-collapse:collapse;min-width:950px;background:#111b2e}}th,td{{padding:12px;text-align:left;border-bottom:1px solid #26334a;vertical-align:top}}th{{color:#9fb4d0}}small{{display:block;color:#9ca3af;margin-top:4px}}input{{display:block;width:170px;margin:5px 0;padding:8px;border:1px solid #475569;border-radius:6px;background:#0b1220;color:#e5e7eb}}.inline-form{{display:flex;align-items:end;gap:8px;flex-wrap:wrap}}.inline-form label{{color:#cbd5e1}}.empty{{padding:20px;color:#9ca3af}}
 </style></head><body><header><nav><a href="/">Возможности</a><a href="/situations">Активные ситуации</a><a href="/history">История</a><a href="/trader">Трейдер</a><a href="/market-units">Единицы рынков</a></nav><h1>Подтверждение единиц рынка</h1>
-<p class="note">Биржа может показывать цену за лот из нескольких монет, например 1MBABYDOGE. Коэффициент означает количество единиц валюты скринера в одной единице рынка биржи. Например, для скринера 1000SATS и рынка SATS: 1 SATS = 0.001 1000SATS. Цена пересчитывается делением на коэффициент. Для другого имени без числового префикса предлагается 1 — это предположение, а не проверенное соответствие. Цены взяты из сохранённого снимка, это не котировки в реальном времени. Предложенное число — только подсказка. Проверьте его и подтвердите вручную. Неизвестные соответствия исключаются из сравнения; сохранённые правила применяются к спреду и WebSocket. Демотрейдер пока не открывает сделки для рынков с такими лотами.</p>
+<p class="note">Биржа может показывать цену за лот из нескольких монет, например 1MBABYDOGE. Коэффициент означает количество единиц валюты скринера в одной единице рынка биржи. Например, для скринера 1000SATS и рынка SATS: 1 SATS = 0.001 1000SATS. Цена пересчитывается делением на коэффициент. Для известных соответствий число заполняется из справочника с официальными источниками. Неизвестное другое имя остаётся без коэффициента. Метаданные API проверяются фоновым обновлением с интервалом не менее 6 часов. Совпадение контракта рынка со справочником не заменяет ручную сверку исходного актива. Цены взяты из сохранённого снимка, это не котировки в реальном времени. Предложенное число — только подсказка. Проверьте его и подтвердите вручную. Неизвестные соответствия исключаются из сравнения; сохранённые правила применяются к спреду и WebSocket. Демотрейдер пока не открывает сделки для рынков с такими лотами.</p>
 <p class="ok">{html.escape(message)}</p></header><main><div class="table-wrap"><table><thead><tr><th>Биржа</th><th>Валюта скринера</th><th>Рынок биржи</th><th>Тикер рынка</th><th>Цена рынка / время снимка</th><th>Предложение программы / пересчёт</th><th>Состояние</th><th>Коэффициент / действие</th></tr></thead><tbody>{''.join(rows) if rows else '<tr><td colspan="8" class="empty">Несовпадений базовой валюты не найдено.</td></tr>'}</tbody></table></div></main></body></html>"""
 
 

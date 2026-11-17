@@ -22,5 +22,6 @@ __pycache__/
 /tmp/
 *.tmp
 *.bak
+/config/market_unit_proposals.json
 Thumbs.db
 Desktop.ini

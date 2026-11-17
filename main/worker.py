@@ -71,6 +71,11 @@ def _refresh_cycle() -> int:
         update_market_data()
         _set_status("running", "Пересчитываются цены и разница")
         update_calculator_prices()
+        try:
+            from main.market_unit_proposals import refresh_market_unit_proposals
+            refresh_market_unit_proposals()
+        except Exception:
+            logger.exception("Не удалось обновить предложения единиц рынка")
     except Exception:
         cycle_error = True
         logger.exception("Цикл обновления завершился с ошибкой")
