@@ -30,6 +30,7 @@ from database import (
     touch_opportunity_lifetimes,
 )
 from main.treider.tran_emulation import TransferTimeEmulator
+from main.transfer_network_resolver import resolve_transfer_network
 from main.treider.config import MIN_OPPORTUNITY_LIFETIME_SECONDS
 from main.treider.queue import enqueue as enqueue_trader_signal
 from main.treider.signals import build_opportunity_signal
@@ -426,8 +427,21 @@ class OpportunityConfirmer:
                             buy[0].source_base_symbol, "UNKNOWN"
                         )
                         try:
-                            transfer_seconds = self.transfer_emulator.get_emulated_duration(network)
-                        except ValueError as error:
+                            if network == "UNKNOWN":
+                                detected = await asyncio.to_thread(
+                                    resolve_transfer_network, buy[0].source_base_symbol,
+                                    buy[0].exchange, sell[0].exchange,
+                                )
+                                if not detected["available"]:
+                                    raise ValueError(detected["reason"])
+                                network = detected["network"]
+                                transfer_seconds = detected["estimated_seconds"]
+                                # За время запроса котировки могли устареть: не создаём ложный эпизод.
+                                if any(time.monotonic() - quote.received_at > STALE_SECONDS for _, quote in (buy, sell)):
+                                    return
+                            else:
+                                transfer_seconds = self.transfer_emulator.get_emulated_duration(network)
+                        except (ValueError, OSError) as error:
                             profile_key = (source_id, network)
                             if profile_key not in self._missing_transfer_profiles:
                                 logger.warning(

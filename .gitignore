@@ -23,5 +23,6 @@ __pycache__/
 *.tmp
 *.bak
 /config/market_unit_proposals.json
+/config/detected_transfer_networks.json
 Thumbs.db
 Desktop.ini

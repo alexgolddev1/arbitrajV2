@@ -6,6 +6,24 @@ from main.calculator.websocket_monitor import Instrument, OpportunityConfirmer
 
 
 class MissingTransferProfileTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_manual_rule_uses_api_route_for_episode(self):
+        instruments = [
+            Instrument(3, "AMP/USDT", "AMP", exchange, exchange, "AMP/USDT", "AMPUSDT", Decimal(1))
+            for exchange in ("binance", "mexc")
+        ]
+        confirmer = OpportunityConfirmer(instruments)
+        with patch("main.calculator.websocket_monitor.TRANSFER_NETWORK_MAP", {}), \
+                patch("main.calculator.websocket_monitor.CALCULATOR_SPREAD_LEVELS", [Decimal(1)]), \
+                patch("main.calculator.websocket_monitor.resolve_transfer_network", return_value={
+                    "available": True, "network": "ETHEREUM", "estimated_seconds": 384,
+                }) as resolve, \
+                patch("main.calculator.websocket_monitor.record_opportunity_lifetime", return_value=8):
+            await confirmer.quote("binance", "AMPUSDT", "9", "10", "100", "100")
+            await confirmer.quote("mexc", "AMPUSDT", "11", "12", "100", "100")
+        resolve.assert_called_once_with("AMP", "binance", "mexc")
+        self.assertEqual(confirmer.episodes[(3, Decimal(1))].network, "ETHEREUM")
+        self.assertEqual(confirmer.episodes[(3, Decimal(1))].transfer_seconds, 384)
+
     async def test_missing_profile_keeps_quotes_alive_and_known_profile_recovers(self):
         instruments = [
             Instrument(1, "ABC/USDT", "ABC", exchange, exchange, "ABC/USDT", "ABCUSDT", Decimal(1))
@@ -13,6 +31,7 @@ class MissingTransferProfileTests(unittest.IsolatedAsyncioTestCase):
         ]
         confirmer = OpportunityConfirmer(instruments)
         with patch("main.calculator.websocket_monitor.TRANSFER_NETWORK_MAP", {}), \
+                patch("main.calculator.websocket_monitor.resolve_transfer_network", return_value={"available": False, "reason": "UNKNOWN: нет маршрута"}), \
                 patch("main.calculator.websocket_monitor.CALCULATOR_SPREAD_LEVELS", [Decimal(1)]), \
                 patch("main.calculator.websocket_monitor.record_opportunity_lifetime", return_value=7) as record:
             with self.assertLogs("main.calculator.websocket_monitor", level="WARNING") as logs:
