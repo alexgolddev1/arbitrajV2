@@ -1069,7 +1069,9 @@ def _render_trader_page(
         if profile is None:
             transfer_time_rows.append(
                 '<tr><td>' + html.escape(network_profile) + '</td><td>&mdash;</td>'
-                + '<td>Оценка не задана; таймер для маршрута не подставляется</td></tr>'
+                + '<td>' + html.escape(TransferTimeEmulator.MISSING_PROFILE_REASONS.get(
+                    network_profile, "Достоверная оценка не найдена; таймер для маршрута не подставляется",
+                )) + '</td></tr>'
             )
             continue
         source_link = ' · '.join(
@@ -1081,7 +1083,10 @@ def _render_trader_page(
         transfer_time_rows.append(
             '<tr><td>' + html.escape(network_profile) + '</td>'
             + '<td>' + _fmt_fixed(profile["avg"], 3) + '</td>'
-            + '<td>' + html.escape(profile["basis"]) + ' &middot; ' + source_link + '</td></tr>'
+            + '<td>' + html.escape(profile["basis"]) + ' &middot; ' + source_link
+            + '<small>Диапазон модели: ' + _fmt(profile["min"]) + '–' + _fmt(profile["max"]) + ' сек.'
+            + ((' Проверено: ' + html.escape(profile["checked_on"])) if profile.get("checked_on") else '')
+            + '</small></td></tr>'
         )
 
     balance = _fmt_fixed(stats.get("exchange_usdt", account["balance_usd"] if account else None), 3)
@@ -1214,7 +1219,7 @@ body {{ padding-bottom:92px; }} .transfer-countdown-bar {{ position:fixed; z-ind
 {capital_form}<h2>Сделки трейдера</h2><div class="table-wrap"><table><thead><tr>
 <th>Пара</th><th>Купил</th><th>Продал / цена TP</th><th>Уровни TP / SL</th><th>Количество</th><th>Затраты на покупку</th><th>Выручка</th><th>Комиссии buy + sell + возврат</th><th>Результат</th><th>Маршруты и комиссии</th><th>Остаток монет</th><th>Статус</th><th>Время (Киев)</th>
 </tr></thead><tbody>{''.join(trade_rows)}</tbody></table></div>
-<h2>Ориентировочное время по сетям</h2><p class="muted">Средняя оценка из публичных источников, используемая таймером демосделки. Это оценка подтверждения/финальности в блокчейне, а не гарантия зачисления биржей. Биржи могут ждать другое число подтверждений и добавлять время обработки. Для сетей без надёжной оценки таймер не подставляется.</p><div class="table-wrap"><table><thead><tr><th>Сеть</th><th>Среднее, сек.</th><th>Основание / источник</th></tr></thead><tbody>{''.join(transfer_time_rows)}</tbody></table></div>
+<h2>Ориентировочное время по сетям</h2><p class="muted">Ориентир из официальных источников, используемый таймером демосделки. Если источник даёт диапазон, оценка — его середина; это модель, а не измеренное среднее. В основании указано: один блок, подтверждения биржи или полная финальность. Это оценка подтверждения/финальности в блокчейне, а не гарантия зачисления биржей. Биржи могут ждать другое число подтверждений и добавлять время обработки. Для сетей без надёжной оценки таймер не подставляется.</p><div class="table-wrap"><table><thead><tr><th>Сеть</th><th>Оценка, сек.</th><th>Основание / источник</th></tr></thead><tbody>{''.join(transfer_time_rows)}</tbody></table></div>
 <div id="trade-detail-modal" role="tooltip" aria-hidden="true"><strong data-detail="pair"></strong>
 <div>Средняя цена исполнения: <span data-detail="average"></span></div>
 <div>Продано монет: <span data-detail="sold"></span></div>

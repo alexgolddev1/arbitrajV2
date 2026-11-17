@@ -472,6 +472,7 @@ class MarketAndRouteTests(unittest.TestCase):
         second = tran_emulation.TransferTimeEmulator(random_mode=True, seed=7)
         self.assertEqual(first.get_emulated_duration("TRON"), second.get_emulated_duration("TRON"))
 
+    @patch.dict(tran_emulation.TransferTimeEmulator.NETWORK_PROFILES, {}, clear=True)
     def test_route_without_sourced_time_estimate_is_not_given_a_static_fallback(self) -> None:
         row = {
             "network_code": "Arbitrum One", "network_name": "Arbitrum",
