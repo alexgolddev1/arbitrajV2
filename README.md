@@ -69,3 +69,25 @@ docker compose run --rm app python -m main.screener.fetch_markets
 ```powershell
 docker compose run --rm app python -m main.calculator.fetch_prices
 ```
+
+## Диагностический API
+
+В `.env` задайте `MAINTENANCE_API_TOKEN` случайной строкой не короче 32 символов. Например, сгенерируйте значение командой `openssl rand -hex 32` и сохраните его только на сервере. Без токена API отключён. После настройки пересоздайте сервисы: `docker compose up -d --build app trader web`.
+
+Все запросы требуют заголовок `Authorization: Bearer <токен>` и работают через порт веба. Параметр `service` принимает только `app`, `trader` или `web`:
+
+- `GET /api/maintenance/logs?service=app&lines=200` — последние строки `updates.log`.
+- `GET /api/maintenance/logs?service=trader&lines=200` — последние строки `trader.log`.
+- `GET /api/maintenance/logs?service=web&lines=200` — последние строки `web.log`.
+- `GET /api/maintenance/processes?service=trader` — PID, имя, состояние, родительский PID, память и число потоков внутри контейнера. Аналогично для `app` и `web`.
+
+Пример через SSH-туннель на локальный порт 1024 (переменную `MAINTENANCE_API_TOKEN` задайте локально):
+
+```bash
+curl -H "Authorization: Bearer $MAINTENANCE_API_TOKEN" \
+  'http://127.0.0.1:1024/api/maintenance/logs?service=trader&lines=200'
+```
+
+Для удалённого подключения используйте SSH-туннель или HTTPS. Токен не передавайте в URL. Внутренние агенты `app` и `trader` слушают порт 9197 только внутри Docker без публикации на хост; веб запрашивает их с тем же токеном. Инвентаризация использует `/proc` своего контейнера, не получает окружение и аргументы запуска и не является проверкой здоровья торгового цикла. На системах без `/proc` возвращается `process_inventory_available=false`.
+
+Логи ограничены 2000 строками и последними 256 КиБ файла. Из выдачи скрываются известные значения секретных переменных окружения и значения типовых параметров ключей, паролей и подписей. Это дополнительная фильтрация, а не гарантия обнаружения произвольного секрета в тексте. Произвольные пути, команды, перезапуски, операции с балансами и Docker socket через API недоступны. Если контейнер недоступен, веб вернёт 502; если файл ещё не создан — 404. Перезапуск контейнера этим API не выполняется.

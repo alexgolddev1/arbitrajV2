@@ -2043,6 +2043,9 @@ def _load_demo_operation_csv() -> bytes:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
+        from main.maintenance import handle_request
+        if handle_request(self):
+            return
         path = urlparse(self.path).path
         if path not in ("/trader/capital", "/market-units/confirm"):
             self.send_error(404)
@@ -2102,6 +2105,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_error(500)
 
     def do_GET(self) -> None:
+        from main.maintenance import handle_request
+        if handle_request(self):
+            return
         path = urlparse(self.path).path
         if path == "/market-units":
             try:
@@ -2241,9 +2247,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    from pathlib import Path
+    from logging.handlers import RotatingFileHandler
+    log_directory = Path(os.getenv("MAINTENANCE_LOG_DIR", "/app/log"))
+    log_directory.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(), RotatingFileHandler(
+            log_directory / "web.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+        )],
     )
     connection = connect_db()
     try:

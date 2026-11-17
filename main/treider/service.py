@@ -76,6 +76,8 @@ def _consume_one() -> bool:
 
 def run() -> None:
     configure_logging()
+    from main.maintenance import start_agent
+    start_agent("trader")
     _initialize()
     logger.info("Трейдер ожидает JSON-сообщения от скринера")
     last_signal_at = time.monotonic()

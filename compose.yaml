@@ -28,6 +28,7 @@ services:
       mysql:
         condition: service_healthy
     environment:
+      MAINTENANCE_API_TOKEN: ${MAINTENANCE_API_TOKEN:-}
       DB_HOST: ${DB_HOST:-mysql}
       DB_PORT: ${DB_PORT:-3306}
       DB_NAME: ${DB_NAME:-${MYSQL_DATABASE:-arbitraj}}
@@ -72,6 +73,7 @@ services:
       mysql:
         condition: service_healthy
     environment:
+      MAINTENANCE_API_TOKEN: ${MAINTENANCE_API_TOKEN:-}
       DB_HOST: ${DB_HOST:-mysql}
       DB_PORT: ${DB_PORT:-3306}
       DB_NAME: ${DB_NAME:-${MYSQL_DATABASE:-arbitraj}}
@@ -138,7 +140,9 @@ services:
         condition: service_healthy
     volumes:
       - ./config:/app/config
+      - ./log:/app/log
     environment:
+      MAINTENANCE_API_TOKEN: ${MAINTENANCE_API_TOKEN:-}
       DB_HOST: ${DB_HOST:-mysql}
       DB_PORT: ${DB_PORT:-3306}
       DB_NAME: ${DB_NAME:-${MYSQL_DATABASE:-arbitraj}}

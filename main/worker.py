@@ -106,6 +106,8 @@ def _refresh_cycle() -> int:
 def run() -> None:
     """Refresh REST data on schedule while WebSocket monitoring stays connected."""
     _configure_logging()
+    from main.maintenance import start_agent
+    start_agent("app")
     connection = connect_db()
     try:
         initialize_database(connection)
