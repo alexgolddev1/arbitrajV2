@@ -1,4 +1,131 @@
 {
   "version": 1,
-  "mappings": []
+  "mappings": [
+    {
+      "exchange": "mexc",
+      "source_slug": "cheems-pet",
+      "source_symbol": "1000CHEEMS",
+      "market_symbol": "CHEEMS",
+      "units_per_market_unit": "0.001"
+    },
+    {
+      "exchange": "bybit",
+      "source_slug": "sats-ordinals",
+      "source_symbol": "1000SATS",
+      "market_symbol": "SATS",
+      "units_per_market_unit": "0.001"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "sats-ordinals",
+      "source_symbol": "1000SATS",
+      "market_symbol": "SATS",
+      "units_per_market_unit": "0.001"
+    },
+    {
+      "exchange": "okx",
+      "source_slug": "sats-ordinals",
+      "source_symbol": "1000SATS",
+      "market_symbol": "SATS",
+      "units_per_market_unit": "0.001"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "gensyn",
+      "source_symbol": "AIGENSYN",
+      "market_symbol": "AI",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "okx",
+      "source_slug": "gensyn",
+      "source_symbol": "AIGENSYN",
+      "market_symbol": "AI",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "bybit",
+      "source_slug": "babylon",
+      "source_symbol": "BABY",
+      "market_symbol": "BABY1",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "broccoli-714",
+      "source_symbol": "BROCCOLI714",
+      "market_symbol": "BROCCOLI",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "bittorrent-new",
+      "source_symbol": "BTTC",
+      "market_symbol": "BTT",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "bybit",
+      "source_slug": "bittorrent-new",
+      "source_symbol": "BTTC",
+      "market_symbol": "BTT",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "green-metaverse-token",
+      "source_symbol": "GMT",
+      "market_symbol": "STEPN",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "neiro",
+      "source_symbol": "NEIRO",
+      "market_symbol": "NEIROCTO",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "bybit",
+      "source_slug": "neiro",
+      "source_symbol": "NEIRO",
+      "market_symbol": "NEIROCTO",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "pax-gold",
+      "source_symbol": "PAXG",
+      "market_symbol": "GOLD(PAXG)",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "benqi",
+      "source_symbol": "QI",
+      "market_symbol": "BENQI",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "ronin",
+      "source_symbol": "RONIN",
+      "market_symbol": "RON",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "okx",
+      "source_slug": "ronin",
+      "source_symbol": "RONIN",
+      "market_symbol": "RON",
+      "units_per_market_unit": "1"
+    },
+    {
+      "exchange": "mexc",
+      "source_slug": "altlayer",
+      "source_symbol": "ALT",
+      "market_symbol": "ALTLAYER",
+      "units_per_market_unit": "1"
+    }
+  ]
 }
