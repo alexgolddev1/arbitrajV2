@@ -23,6 +23,7 @@ NUMERIC_FIELDS = (
     "application_realized_profit_usd", "application_buy_debit_usd",
     "application_sell_proceeds_accumulated_usd", "application_sell_fees_accumulated_usd",
     "application_remaining_quantity",
+    "application_transfer_dust_quantity", "application_sale_dust_quantity",
 )
 
 
@@ -105,6 +106,24 @@ def _equal_balance(left: Decimal, right: Decimal, asset: str) -> bool:
 
 
 def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    # Capital movements are exported as run metadata, independently of trade events.
+    rows = list(rows)
+    seen_flows = set()
+    for row in list(rows):
+        raw = row.get("run_capital_movements")
+        try:
+            flows = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            flows = None
+        for flow in flows if isinstance(flows, list) else []:
+            key = (row["run_id"], str(flow["movement_id"]))
+            if key in seen_flows:
+                continue
+            seen_flows.add(key)
+            rows.append({"run_id": key[0], "settlement_id": "", "event_id": f"capital:{key[1]}",
+                         "event_key": f"capital:{key[1]}", "event_type": "balance_change",
+                         "event_at_utc": str(flow["created_at"]), "exchange_slug": flow["exchange_slug"],
+                         "asset": "USDT", "quantity": decimal_value(flow.get("amount_usd"))})
     events, duplicate_keys, duplicate_ids = deduplicate(rows)
     gaps: list[dict[str, Any]] = []
     discrepancies: list[dict[str, Any]] = []
@@ -118,10 +137,30 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
                             "note": "ID gaps may also result from rolled-back inserts"})
 
     balances: dict[tuple[str, str, str], dict[str, Any]] = {}
+    complete_baselines: set[str] = set()
+    for row in events:
+        raw = row.get("run_starting_balances")
+        try:
+            starting = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(starting, list):
+            continue
+        if str(row.get("run_baseline_complete", "")).lower() in {"1", "true"}:
+            complete_baselines.add(row["run_id"])
+        for item in starting:
+            amount = decimal_value(item.get("balance"))
+            exchange = item.get("exchange")
+            if amount is None or not exchange:
+                continue
+            balances.setdefault((row["run_id"], exchange.lower(), item["asset"].upper()), {
+                "opening": amount, "net_change": Decimal(0), "current": amount,
+                "application_balance": None, "known": True,
+            })
     settlements: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {
         "buy": None, "buy_fees": [], "transfer_fees": [], "sells": [], "sell_fees": [],
         "coin_credit": Decimal(0), "coin_credit_known": True,
-        "application": {},
+        "application": {}, "return_fees": [],
     })
     transfer_events: dict[tuple[str, str], set[str]] = defaultdict(set)
 
@@ -132,7 +171,8 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
         record = settlements[settlement_key]
         for name in ("application_realized_profit_usd", "application_buy_debit_usd",
                      "application_sell_proceeds_accumulated_usd", "application_sell_fees_accumulated_usd",
-                     "application_remaining_quantity", "application_status"):
+                     "application_remaining_quantity", "application_status",
+                     "application_transfer_dust_quantity", "application_sale_dust_quantity"):
             value = row.get(name)
             if value not in (None, ""):
                 record["application"][name] = value
@@ -155,6 +195,8 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 record["transfer_fees"].append(row)
             elif ":commission:sell:" in key:
                 record["sell_fees"].append(row)
+            elif ":commission:return_transfer" in key:
+                record["return_fees"].append(row)
             if row.get("fee_amount") is None:
                 gaps.append({"event_key": key, "issue": "commission amount is missing"})
             if row.get("fee_amount") not in (None, Decimal(0)) and _fee_quote_value(row) is None:
@@ -166,9 +208,10 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
             exchange = str(row.get("exchange_slug") or "").lower()
             asset = str(row.get("asset") or "").upper()
             balance_key = (run_id, exchange, asset)
+            opening = Decimal(0) if run_id in complete_baselines else None
             state = balances.setdefault(balance_key, {
-                "opening": None, "net_change": Decimal(0), "current": None,
-                "application_balance": None, "known": False,
+                "opening": opening, "net_change": Decimal(0), "current": opening,
+                "application_balance": None, "known": opening is not None,
             })
             before, after, quantity = row.get("balance_before"), row.get("balance_after"), row.get("quantity")
             if before is not None:
@@ -223,8 +266,15 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if buy is None:
             continue
         buy_cost = buy.get("quote_amount")
-        buy_fee_values = [_fee_quote_value(fee) for fee in record["buy_fees"]]
-        transfer_fee_values = [_fee_quote_value(fee) for fee in record["transfer_fees"]]
+        # Fees deducted in the purchased asset are already paid by the gross buy cost
+        # and reflected in the net coin credit. Adding their value repeats the debit.
+        coin = str(buy.get("asset") or "").upper()
+        buy_fee_values = [Decimal(0) if str(fee.get("fee_asset") or "").upper() == coin
+                          else _fee_quote_value(fee) for fee in record["buy_fees"]]
+        transfer_fee_values = [Decimal(0) if str(fee.get("fee_asset") or "").upper() == coin
+                               else _fee_quote_value(fee) for fee in record["transfer_fees"]]
+        return_values = [_fee_quote_value(fee) for fee in record["return_fees"]]
+        return_fees = sum(return_values, Decimal(0)) if all(v is not None for v in return_values) else None
         sell_proceeds_values = [sale.get("quote_amount") for sale in record["sells"]]
         sell_fee_values = [_fee_quote_value(fee) for fee in record["sell_fees"]]
         all_cost_values = [buy_cost, *buy_fee_values, *transfer_fee_values]
@@ -238,6 +288,10 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
         bought_quantity = record["coin_credit"]
         reconstructed_remaining = bought_quantity - sold_quantity
         app_remaining = record["application"].get("application_remaining_quantity")
+        dust = sum((record["application"].get(name) or Decimal(0) for name in (
+            "application_transfer_dust_quantity", "application_sale_dust_quantity")), Decimal(0))
+        if app_remaining is not None:
+            app_remaining += dust
         if reconstructed_remaining < 0:
             gaps.append({"settlement_id": sid, "issue": "sold quantity exceeds journaled coin credit",
                          "excess": _amount(-reconstructed_remaining)})
@@ -248,7 +302,8 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
                                   "difference": _amount(reconstructed_remaining - app_remaining)})
         cost_sold = (total_cost * min(Decimal(1), sold_quantity / bought_quantity)
                      if total_cost is not None and bought_quantity > 0 else None)
-        independent_realized = net_sales - cost_sold if net_sales is not None and cost_sold is not None else None
+        independent_realized = (net_sales - cost_sold - return_fees
+                                if net_sales is not None and cost_sold is not None and return_fees is not None else None)
         app = record["application"]
         app_value = app.get("application_realized_profit_usd")
         app_buy_debit = app.get("application_buy_debit_usd")
@@ -286,6 +341,8 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "quantity_acquired_from_balance_log": _amount(bought_quantity),
             "quantity_sold": _amount(sold_quantity),
             "quantity_remaining_from_journal": _amount(reconstructed_remaining) if reconstructed_remaining >= 0 else None,
+            "application_dust_quantity": _amount(dust),
+            "return_fees_usd": _amount(return_fees),
             "cost_basis_sold_usd": _amount(cost_sold),
             "gross_sales_usd": _amount(gross_sales),
             "sell_fees_usd": _amount(sell_fees),
@@ -309,12 +366,25 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
         trade_reports.append(trade_report)
 
     balance_reports = []
+    exported_balances = {}
+    for row in events:
+        raw = row.get("application_balances")
+        try:
+            current_rows = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            current_rows = None
+        for current in current_rows if isinstance(current_rows, list) else []:
+            exported_balances[(row["run_id"], current["exchange"].lower(), current["asset"].upper())] = decimal_value(current.get("balance"))
+    for key in exported_balances:
+        opening = Decimal(0) if key[0] in complete_baselines else None
+        balances.setdefault(key, {"opening": opening, "net_change": Decimal(0), "current": opening,
+                                  "application_balance": None, "known": opening is not None})
     for (run_id, exchange, asset), state in sorted(balances.items()):
         if not state["known"]:
             final_value = None
         else:
             final_value = state["opening"] + state["net_change"]
-        app_value = state["application_balance"]
+        app_value = exported_balances.get((run_id, exchange, asset), state["application_balance"])
         delta = final_value - app_value if final_value is not None and app_value is not None else None
         if delta is not None and not _equal_balance(final_value, app_value, asset):
             discrepancies.append({"run_id": run_id, "exchange": exchange, "asset": asset, "kind": "final balance",
@@ -324,6 +394,7 @@ def reconcile(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "run_id": run_id, "exchange": exchange, "asset": asset, "opening_balance": _amount(state["opening"]),
             "net_change": _amount(state["net_change"]), "reconstructed_final_balance": _amount(final_value),
             "application_last_balance_after": _amount(app_value), "difference": _amount(delta),
+            "compared_with_current_balance": (run_id, exchange, asset) in exported_balances,
             "complete": state["known"],
         })
 

@@ -460,7 +460,7 @@ def _settle_training_trade(trade: dict[str, Any]) -> None:
                     cursor, settlement_id=trade_id, signal_id=int(trade["signal_id"]),
                     run_id=str(event_run_id or DEMO_RUN_ID), sale_event_key=sale_event_key,
                     source_exchange=location, destination_exchange=buy_exchange,
-                    amount_usdt=proceeds - sell_fee,
+                    amount_usdt=accumulated_proceeds - accumulated_sell_fees,
                 )
             exceeded_wait = False
             if remaining > 0:

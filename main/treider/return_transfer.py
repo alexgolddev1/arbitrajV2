@@ -68,16 +68,26 @@ def record_pending_return_transfer(
     sale_event_key: str, source_exchange: str, destination_exchange: str,
     amount_usdt: Decimal,
 ) -> None:
-    """Queue one idempotent return for the net proceeds of a sale execution."""
+    """Keep one cumulative return per settlement, released after the position closes."""
     if source_exchange.strip().lower() == destination_exchange.strip().lower() or amount_usdt <= 0:
+        return
+    combined_key = f"{settlement_id}:return:combined"
+    cursor.execute(
+        "SELECT COALESCE(SUM(amount_usdt), 0) AS queued_amount FROM trader_demo_return_transfers "
+        "WHERE settlement_id = %s AND sale_event_key <> %s",
+        (settlement_id, combined_key),
+    )
+    queued = cursor.fetchone() or {}
+    amount_usdt -= Decimal(str(queued.get("queued_amount") or 0))
+    if amount_usdt <= 0:
         return
     cursor.execute(
         "INSERT INTO trader_demo_return_transfers "
         "(settlement_id, signal_id, run_id, sale_event_key, source_exchange, destination_exchange, "
         "amount_usdt, status, next_attempt_at_utc) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', UTC_TIMESTAMP(6)) "
-        "ON DUPLICATE KEY UPDATE sale_event_key = VALUES(sale_event_key)",
-        (settlement_id, signal_id, run_id, sale_event_key, source_exchange.strip().lower(),
+        "ON DUPLICATE KEY UPDATE amount_usdt = IF(status = 'pending', VALUES(amount_usdt), amount_usdt)",
+        (settlement_id, signal_id, run_id, combined_key, source_exchange.strip().lower(),
          destination_exchange.strip().lower(), amount_usdt),
     )
 
@@ -89,7 +99,10 @@ def _claim_due_return() -> dict[str, Any] | None:
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
                 "SELECT * FROM trader_demo_return_transfers "
-                "WHERE ((status = 'pending' AND next_attempt_at_utc <= UTC_TIMESTAMP(6)) "
+                "WHERE ((status = 'pending' AND next_attempt_at_utc <= UTC_TIMESTAMP(6) "
+                "AND EXISTS (SELECT 1 FROM trader_training_settlements AS settlement "
+                "WHERE settlement.settlement_id = trader_demo_return_transfers.settlement_id "
+                "AND settlement.remaining_quantity = 0 AND settlement.status = 'settled')) "
                 "OR (status = 'in_transit' AND due_at_utc <= UTC_TIMESTAMP(6))) "
                 "AND (claim_token IS NULL OR claimed_at_utc < UTC_TIMESTAMP(6) - INTERVAL %s SECOND) "
                 "ORDER BY COALESCE(due_at_utc, next_attempt_at_utc), return_transfer_id "
@@ -153,7 +166,10 @@ def _start_return_transfer(row: dict[str, Any]) -> None:
     if amount <= 0:
         _release_return_claim(row, "сумма возврата USDT не положительна", blocked=True)
         return
-    send_amount = max(amount, minimum)
+    send_amount = amount - fee
+    if send_amount <= 0 or send_amount < minimum:
+        _release_return_claim(row, "выручка после комиссии ниже минимума обратного вывода")
+        return
 
     connection = connect_db()
     try:

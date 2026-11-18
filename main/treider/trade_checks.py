@@ -254,7 +254,7 @@ def _estimate_trade(
         if not return_route.get("same_exchange"):
             return_transfer_fee_usd = Decimal(str(return_route["withdraw_fee"]))
             return_minimum = Decimal(str(return_route["min_withdraw"]))
-            return_amount = expected_sell_proceeds - expected_sell_fee
+            return_amount = expected_sell_proceeds - expected_sell_fee - return_transfer_fee_usd
             if return_amount < return_minimum:
                 raise ValueError(
                     f"Ожидаемая выручка {return_amount} USDT ниже минимума обратного вывода "
@@ -506,12 +506,15 @@ def _prepare_training_trade(
                     )
 
             cursor.execute(
-                "SELECT balance FROM trader_balances WHERE exchange_slug = %s AND asset = 'USDT' FOR UPDATE",
+                "SELECT balance, (SELECT COALESCE(SUM(amount_usdt), 0) FROM trader_demo_return_transfers "
+                "WHERE source_exchange = trader_balances.exchange_slug AND status = 'pending') AS reserved_returns "
+                "FROM trader_balances WHERE exchange_slug = %s AND asset = 'USDT' FOR UPDATE",
                 (buy.exchange.lower(),),
             )
             exchange_balance = cursor.fetchone()
             balance = Decimal(str(exchange_balance["balance"])) if exchange_balance else Decimal(0)
-            available = balance
+            reserved_returns = Decimal(str((exchange_balance or {}).get("reserved_returns") or 0))
+            available = max(Decimal(0), balance - reserved_returns)
             take_profit_price = Decimal(str(signal["sell"]["price"]))
             estimate, stop_loss_price, loss_budget, loss_budget_source, sizing_error = _select_trade_estimate(
                 cursor, signal_id, buy, sell, buy_fees, sell_fees, available, transfer, take_profit_price,

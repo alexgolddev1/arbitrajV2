@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import uuid
 from decimal import Decimal
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from mysql.connector import MySQLConnection
+from config import TRANSFER_NETWORK_MAP
+from main.market_units import load_market_unit_mappings
 
 from main.treider.config import (
     BUY_FEE_CURRENCY, DEMO_STRATEGY, INITIAL_BALANCE_USD, INITIAL_EXCHANGE_SLUG,
@@ -20,6 +23,8 @@ from main.treider.config import (
     SAME_ROUTE_REENTRY_COOLDOWN_SECONDS, SETTLEMENT_MAX_WAIT_SECONDS, SETTLEMENT_RETRY_SECONDS,
     SIGNAL_MAX_AGE_SECONDS, SIGNAL_MAX_ATTEMPTS, STOP_LOSS_PERCENT, TRADE_SIZE_CANDIDATES_USDT,
     TRAINING_MODE, TRANSFER_FEE_AMOUNT, TRANSFER_FEE_CURRENCY, TRANSFER_NETWORK, TRANSFER_RANDOM_SEED,
+    QUALITY_MIN_ROUTE_TRADES, QUALITY_MAX_BOOK_AGE_SECONDS, MARKET_DATA_TIMEOUT_SECONDS,
+    NETWORK_CACHE_TTL_SECONDS, FEE_CACHE_TTL_SECONDS, MIN_OPPORTUNITY_LIFETIME_SECONDS,
 )
 from main.treider.tran_emulation import TransferTimeEmulator
 
@@ -56,20 +61,42 @@ def _demo_config_snapshot() -> dict[str, Any]:
         "signal_max_age_seconds": SIGNAL_MAX_AGE_SECONDS,
         "signal_max_attempts": SIGNAL_MAX_ATTEMPTS,
         "same_route_reentry_cooldown_seconds": SAME_ROUTE_REENTRY_COOLDOWN_SECONDS,
+        "quality_min_route_trades": QUALITY_MIN_ROUTE_TRADES,
+        "quality_max_book_age_seconds": QUALITY_MAX_BOOK_AGE_SECONDS,
+        "market_data_timeout_seconds": MARKET_DATA_TIMEOUT_SECONDS,
+        "network_cache_ttl_seconds": NETWORK_CACHE_TTL_SECONDS,
+        "fee_cache_ttl_seconds": FEE_CACHE_TTL_SECONDS,
+        "min_opportunity_lifetime_seconds": MIN_OPPORTUNITY_LIFETIME_SECONDS,
+        "return_transfer_policy": "combined_after_close_fee_from_proceeds_v1",
+        "transfer_network_map": dict(sorted(TRANSFER_NETWORK_MAP.items())),
+        "market_unit_mappings": load_market_unit_mappings(),
     }
 
 
 def _git_commit() -> str:
     repo_root = Path(__file__).resolve().parents[2]
+    revision = os.getenv("GIT_COMMIT", "").strip()
+    if len(revision) == 40 and all(char in "0123456789abcdefABCDEF" for char in revision):
+        return revision.lower()
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True,
             text=True, timeout=2, check=False,
         )
         value = result.stdout.strip()
-        return value[:40] if result.returncode == 0 and value else "unknown"
+        if result.returncode == 0 and value:
+            return value[:40]
     except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        pass
+    # A container without Git still has a reproducible identity of its actual code.
+    digest = hashlib.sha256()
+    sources = sorted((repo_root / "main").rglob("*.py"))
+    sources += [repo_root / name for name in ("config.py", "database.py", "schema.sql")]
+    for path in sources:
+        if path.is_file():
+            digest.update(path.relative_to(repo_root).as_posix().encode())
+            digest.update(path.read_bytes())
+    return "source:" + digest.hexdigest()[:32]
 
 
 def _ensure_demo_run(connection: MySQLConnection) -> str | None:

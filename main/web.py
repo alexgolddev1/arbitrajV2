@@ -560,11 +560,13 @@ def _load_trader_dashboard(*, capture_equity: bool = False) -> tuple[dict[str, A
                     "sell_market_pair": position["buy_market_pair"],
                     "remaining_quantity": dust, "position_status": "dust",
                     "asset_exchange": position["buy_exchange"],
+                    "valuation_usd": None,
                 })
             sale_dust = Decimal(str(position.get("sale_dust_quantity") or 0))
             if sale_dust > 0:
                 valuation_positions.append({
                     **position, "remaining_quantity": sale_dust, "position_status": "dust",
+                    "valuation_usd": None,
                 })
         stats.update(_value_trader_positions(valuation_positions))
         stats["transfer_value_usd"] = (
@@ -2003,6 +2005,9 @@ DEMO_LOG_EXPORT_COLUMNS = (
     "application_realized_profit_usd", "application_buy_debit_usd",
     "application_sell_proceeds_accumulated_usd", "application_sell_fees_accumulated_usd",
     "application_remaining_quantity", "application_status",
+    "application_transfer_dust_quantity", "application_sale_dust_quantity",
+    "run_git_commit", "run_config_hash", "run_config", "run_starting_balances", "run_baseline_complete",
+    "run_capital_movements", "application_balances",
 )
 
 
@@ -2012,9 +2017,10 @@ def _demo_operation_csv(rows: list[dict[str, Any]]) -> bytes:
     writer.writeheader()
     for row in rows:
         values = {column: row.get(column) for column in DEMO_LOG_EXPORT_COLUMNS}
-        snapshot = values.get("book_snapshot")
-        if isinstance(snapshot, (dict, list)):
-            values["book_snapshot"] = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        for column in ("book_snapshot", "run_config", "run_starting_balances", "run_capital_movements", "application_balances"):
+            snapshot = values.get(column)
+            if isinstance(snapshot, (dict, list)):
+                values[column] = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), default=str)
         for column in ("event_key", "run_id", "event_type", "exchange_slug", "market_pair", "asset", "fee_asset"):
             value = values.get(column)
             if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
@@ -2026,6 +2032,7 @@ def _demo_operation_csv(rows: list[dict[str, Any]]) -> bytes:
 def _load_demo_operation_csv() -> bytes:
     connection = connect_db()
     try:
+        connection.start_transaction(consistent_snapshot=True, readonly=True)
         with connection.cursor(dictionary=True) as cursor:
             cursor.execute(
                 "SELECT log.event_id, log.event_key, log.run_id, log.settlement_id, log.signal_id, log.event_type, log.event_at_utc, "
@@ -2036,11 +2043,34 @@ def _load_demo_operation_csv() -> bytes:
                 "settlement.sell_proceeds_accumulated_usd AS application_sell_proceeds_accumulated_usd, "
                 "settlement.sell_fees_accumulated_usd AS application_sell_fees_accumulated_usd, "
                 "settlement.remaining_quantity AS application_remaining_quantity, "
-                "settlement.status AS application_status "
+                "settlement.status AS application_status, "
+                "settlement.transfer_dust_quantity AS application_transfer_dust_quantity, "
+                "settlement.sale_dust_quantity AS application_sale_dust_quantity, "
+                "run.git_commit AS run_git_commit, run.config_hash AS run_config_hash, run.config AS run_config, "
+                "run.starting_balances AS run_starting_balances, run.baseline_complete AS run_baseline_complete, "
+                "run.started_at_utc AS run_started_at_utc, run.ended_at_utc AS run_ended_at_utc, run.status AS run_status "
                 "FROM trader_demo_operation_log AS log LEFT JOIN trader_training_settlements AS settlement "
-                "ON settlement.settlement_id = log.settlement_id ORDER BY log.event_id"
+                "ON settlement.settlement_id = log.settlement_id "
+                "LEFT JOIN trader_demo_runs AS run ON run.run_id = log.run_id ORDER BY log.event_id"
             )
             rows = cursor.fetchall()
+            cursor.execute("SELECT exchange_slug AS exchange, asset, balance FROM trader_balances ORDER BY exchange_slug, asset")
+            balances = cursor.fetchall()
+            cursor.execute(
+                "SELECT movement_id, exchange_slug, amount_usd, created_at FROM trader_capital_movements "
+                "WHERE movement_type IN ('deposit','withdrawal') ORDER BY created_at, movement_id"
+            )
+            movements = cursor.fetchall()
+        run_movements = {}
+        for row in rows:
+            run_id = row["run_id"]
+            if run_id not in run_movements:
+                started, ended = row.get("run_started_at_utc"), row.get("run_ended_at_utc")
+                run_movements[run_id] = [movement for movement in movements
+                                         if started is not None and movement["created_at"] >= started
+                                         and (ended is None or movement["created_at"] < ended)]
+            row["run_capital_movements"] = run_movements[run_id]
+            row["application_balances"] = balances if row.get("run_status") == "active" else None
         return _demo_operation_csv(rows)
     finally:
         connection.close()

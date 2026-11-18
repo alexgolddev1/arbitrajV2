@@ -71,13 +71,13 @@ class DemoReturnSettlementTests(unittest.TestCase):
 
         debit = next(call for call in cursor.execute.call_args_list
                      if "UPDATE trader_balances SET balance = balance - %s" in call.args[0])
-        self.assertEqual(debit.args[1], (Decimal("25.75"), "mexc", Decimal("25.75")))
+        self.assertEqual(debit.args[1], (Decimal("25.00"), "mexc", Decimal("25.00")))
         fee_event = next(call for call in cursor.execute.call_args_list
                          if "commission:return_transfer" in repr(call.args[1]))
         self.assertIn(Decimal("0.75"), fee_event.args[1])
         transfer_update = next(call for call in cursor.execute.call_args_list
                                if "SET status = 'in_transit'" in call.args[0])
-        self.assertEqual(transfer_update.args[1][0], Decimal("25"))
+        self.assertEqual(transfer_update.args[1][0], Decimal("24.25"))
         self.assertEqual(transfer_update.args[1][1], Decimal("0.75"))
         self.assertEqual(transfer_update.args[1][5], Decimal("90"))
         connection.commit.assert_called_once()
